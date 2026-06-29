@@ -18,6 +18,7 @@
 #include "esp_system.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "lwip/inet.h"
 #include "lwip/sockets.h"
@@ -138,6 +139,7 @@ static rmt_channel_handle_t rgb_led_channel;
 static rmt_encoder_handle_t rgb_led_encoder;
 static bool rgb_led_ready;
 static bool lora_ready;
+static SemaphoreHandle_t lora_dio0_semaphore;
 
 static void copy_field(char *destination, size_t destination_size, const char *source);
 
@@ -251,6 +253,7 @@ static const char SETUP_HTML[] =
     "<label>Node ID<input name=node_id maxlength=31 placeholder='Example: BRGY001, HH023, RELAY04' required></label>"
     "<label>Node Name<input name=node_name maxlength=31 placeholder='Example: Barangay Hall or House 23' required></label>"
     "<label>Location<input name=location maxlength=31 placeholder='Example: Purok 3, Chapel Roof' required></label>"
+    "<label>Default Destination<input name=default_destination maxlength=31 value='BRGY001' placeholder='Example: ALL or BRGY001'></label>"
     "<label><input name=relay_enabled type=checkbox value=1 checked> Relay messages for the mesh</label>"
     "<button type=submit>Save Setup and Reboot</button></form>"
     "<p class=muted>Factory reset later by holding BOOT for 10 seconds during startup.</p></section></main></body></html>";
@@ -322,6 +325,19 @@ static void lora_receive_mode(void)
     lora_write_reg(REG_DIO_MAPPING_1, 0x00);
     lora_write_reg(REG_IRQ_FLAGS, 0xFF);
     lora_set_mode(MODE_RX_CONTINUOUS);
+}
+
+static void IRAM_ATTR lora_dio0_isr_handler(void *arg)
+{
+    BaseType_t high_priority_task_woken = pdFALSE;
+
+    if (lora_dio0_semaphore != NULL) {
+        xSemaphoreGiveFromISR(lora_dio0_semaphore, &high_priority_task_woken);
+    }
+
+    if (high_priority_task_woken == pdTRUE) {
+        portYIELD_FROM_ISR();
+    }
 }
 
 static emergency_message_t *next_message_slot(void)
@@ -477,6 +493,10 @@ static void lora_rx_task(void *parameter)
     uint8_t payload[LORA_MAX_PAYLOAD + 1];
 
     while (true) {
+        if (lora_dio0_semaphore != NULL) {
+            xSemaphoreTake(lora_dio0_semaphore, portMAX_DELAY);
+        }
+
         if (lora_ready && (lora_read_reg(REG_IRQ_FLAGS) & IRQ_RX_DONE_MASK) != 0) {
             uint8_t flags = lora_read_reg(REG_IRQ_FLAGS);
             lora_write_reg(REG_IRQ_FLAGS, 0xFF);
@@ -519,8 +539,6 @@ static void lora_rx_task(void *parameter)
                 }
             }
         }
-
-        vTaskDelay(pdMS_TO_TICKS(25));
     }
 }
 
@@ -550,10 +568,25 @@ static void lora_init(void)
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_POSEDGE,
     };
 
     ESP_ERROR_CHECK(gpio_config(&reset_config));
     ESP_ERROR_CHECK(gpio_config(&dio0_config));
+
+    lora_dio0_semaphore = xSemaphoreCreateBinary();
+    if (lora_dio0_semaphore == NULL) {
+        ESP_LOGE(TAG, "Failed to create LoRa DIO0 semaphore");
+        return;
+    }
+
+    esp_err_t isr_result = gpio_install_isr_service(0);
+    if (isr_result != ESP_OK && isr_result != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "Failed to install GPIO ISR service: %s", esp_err_to_name(isr_result));
+        return;
+    }
+
+    ESP_ERROR_CHECK(gpio_isr_handler_add(LORA_DIO0_GPIO, lora_dio0_isr_handler, NULL));
 
     gpio_set_level(LORA_RST_GPIO, 0);
     vTaskDelay(pdMS_TO_TICKS(10));
@@ -860,6 +893,7 @@ static void queue_message(const char *destination, const char *type, const char 
 
     message->id = ++packet_counter;
     copy_field(message->direction, sizeof(message->direction), "TX");
+    copy_field(message->source, sizeof(message->source), node_id);
     copy_field(message->destination, sizeof(message->destination), destination);
     copy_field(message->type, sizeof(message->type), type);
     copy_field(message->priority, sizeof(message->priority), priority);
@@ -1001,10 +1035,11 @@ static esp_err_t messages_handler(httpd_req_t *request)
     for (size_t i = 0; i < message_count && offset < sizeof(response); i++) {
         emergency_message_t *message = &messages[message_count - 1 - i];
         offset += snprintf(response + offset, sizeof(response) - offset,
-                           "%s{\"id\":%lu,\"direction\":\"%s\",\"destination\":\"%s\",\"type\":\"%s\",\"priority\":\"%s\",\"payload\":\"%s\",\"packet\":\"%s\"}",
+                           "%s{\"id\":%lu,\"direction\":\"%s\",\"source\":\"%s\",\"destination\":\"%s\",\"type\":\"%s\",\"priority\":\"%s\",\"payload\":\"%s\",\"packet\":\"%s\"}",
                            i == 0 ? "" : ",",
                            (unsigned long)message->id,
                            message->direction,
+                           message->source,
                            message->destination,
                            message->type,
                            message->priority,
