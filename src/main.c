@@ -42,6 +42,7 @@
 #define RESET_WARNING_MS 5000
 #define CONFIG_NAMESPACE "bems_config"
 #define PACKET_COUNTER_KEY "packet_ctr"
+#define HIGHEST_SEEN_ID_KEY "highest_seen"
 #define DEFAULT_WEB_PIN "1234"
 #define DEFAULT_NETWORK_KEY "CHANGEME1234567"
 #define SESSION_COOKIE_NAME "BMESH_SESSION"
@@ -165,6 +166,7 @@ static seen_packet_t seen_packets[MAX_SEEN_PACKETS];
 static size_t message_count;
 static size_t seen_packet_count;
 static uint32_t packet_counter;
+static uint32_t highest_seen_id;
 static httpd_handle_t http_server;
 static spi_device_handle_t lora_spi;
 static rmt_channel_handle_t rgb_led_channel;
@@ -178,6 +180,7 @@ static SemaphoreHandle_t data_mutex;
 
 static void copy_field(char *destination, size_t destination_size, const char *source);
 static void save_packet_counter(void);
+static void update_highest_seen_id(uint32_t id);
 static bool lora_transmit(const char *packet);
 
 static void data_lock(void)
@@ -282,6 +285,7 @@ static const char INDEX_HTML[] =
     "<button type=submit>Queue / Transmit Message</button></form><p class=muted>The portal sends through the SX1278 using GPIO 5/7/6/8/4/16 at 433 MHz.</p></section>"
     "<section class=card><h3>Recent Messages</h3><div id=messages class=muted>No messages yet.</div></section>"
     "<section class=card><h3>Portal</h3><p class=muted>Connect to this Wi-Fi when offline, then open http://192.168.4.1. Android/iOS captive checks are redirected here automatically.</p>"
+    "<form method=post action=/sync><button type=submit>Sync Messages from Mesh</button></form>"
     "<form method=post action=/reset onsubmit='return confirm(\"Factory reset this node and run setup again?\")'><button type=submit>Factory Reset Node</button></form></section>"
     "</main><script>"
     "async function load(){let s=await fetch('/api/status').then(r=>r.json());"
@@ -523,8 +527,11 @@ static bool hmac_sha256(const uint8_t *data, size_t data_len, uint8_t tag[32])
 static bool bems_encrypt_packet(const char *plain_packet, uint8_t *frame, size_t frame_size, size_t *frame_len)
 {
     uint8_t full_tag[32];
-    size_t plain_len = MIN(strlen(plain_packet), (size_t)BEMS_MAX_PLAINTEXT);
+    size_t plain_len = strlen(plain_packet);
 
+    if (plain_len > BEMS_MAX_PLAINTEXT) {
+        return false;
+    }
     if (frame_size < BEMS_FRAME_HEADER_LEN + plain_len + BEMS_HMAC_TAG_LEN) {
         return false;
     }
@@ -716,6 +723,10 @@ static bool parse_mesh_packet(const char *packet, mesh_packet_t *parsed)
 
     while (field_count < sizeof(fields) / sizeof(fields[0]) && cursor != NULL) {
         fields[field_count++] = cursor;
+        if (field_count == sizeof(fields) / sizeof(fields[0])) {
+            break;
+        }
+
         cursor = strchr(cursor, '|');
         if (cursor != NULL) {
             *cursor = '\0';
@@ -782,6 +793,127 @@ static void send_ack_packet(const mesh_packet_t *parsed)
     lora_transmit(ack_packet);
 }
 
+static uint32_t sync_last_id_from_payload(const char *payload)
+{
+    if (strncmp(payload, "last_id=", 8) == 0) {
+        return (uint32_t)strtoul(payload + 8, NULL, 10);
+    }
+
+    return 0;
+}
+
+static bool is_control_packet_type(const char *type)
+{
+    return strcmp(type, "ACK") == 0 || strcmp(type, "SYNC_REQ") == 0 || strcmp(type, "SYNC_RESP") == 0;
+}
+
+static bool is_private_destination_for_other_node(const char *destination, const char *requester)
+{
+    return strcmp(destination, "ALL") != 0 && strcmp(destination, requester) != 0;
+}
+
+static void send_sync_responses(const mesh_packet_t *request)
+{
+    emergency_message_t snapshot[MAX_MESSAGES];
+    size_t snapshot_count = 0;
+    uint32_t last_id = sync_last_id_from_payload(request->payload);
+
+    data_lock();
+    for (size_t i = 0; i < message_count && snapshot_count < MAX_MESSAGES; i++) {
+        const emergency_message_t *message = &messages[i];
+
+        if (strcmp(message->direction, "RX") != 0 && strcmp(message->direction, "TX") != 0) {
+            continue;
+        }
+        if (message->id <= last_id) {
+            continue;
+        }
+        if (strcmp(message->destination, "ALL") != 0 && strcmp(message->destination, request->source) != 0) {
+            continue;
+        }
+        if (is_private_destination_for_other_node(message->destination, request->source)) {
+            continue;
+        }
+
+        snapshot[snapshot_count++] = *message;
+    }
+    data_unlock();
+
+    for (size_t i = 0; i < snapshot_count; i++) {
+        char sync_response[PACKET_LEN];
+        const char *original_packet = strstr(snapshot[i].packet, "BEMS|");
+        int prefix_len;
+        size_t original_len;
+
+        vTaskDelay(pdMS_TO_TICKS(200 + (esp_random() % 1001)));
+        if (original_packet == NULL) {
+            original_packet = snapshot[i].packet;
+        }
+
+        prefix_len = snprintf(sync_response, sizeof(sync_response), "BEMS|%lu|%.*s|%.*s|SYNC_RESP|NORMAL|HOPS=0|RELAY=0|LOC=%.*s|",
+                              (unsigned long)snapshot[i].id,
+                              31,
+                              node_id,
+                              31,
+                              request->source,
+                              31,
+                              node_config.location);
+        original_len = strlen(original_packet);
+
+        if (prefix_len < 0 || (size_t)prefix_len >= sizeof(sync_response) || (size_t)prefix_len + original_len > BEMS_MAX_PLAINTEXT) {
+            ESP_LOGW(TAG, "Skipping oversized SYNC_RESP for packet %lu", (unsigned long)snapshot[i].id);
+            continue;
+        }
+        copy_field(sync_response + prefix_len, sizeof(sync_response) - (size_t)prefix_len, original_packet);
+
+        ESP_LOGI(TAG, "SYNC_RESP to %s for packet %lu", request->source, (unsigned long)snapshot[i].id);
+        lora_transmit(sync_response);
+    }
+}
+
+static void send_sync_request(uint32_t last_id)
+{
+    char sync_request[PACKET_LEN];
+    uint32_t request_id;
+
+    data_lock();
+    request_id = ++packet_counter;
+    save_packet_counter();
+    data_unlock();
+
+    snprintf(sync_request, sizeof(sync_request), "BEMS|%lu|%.*s|ALL|SYNC_REQ|NORMAL|HOPS=1|RELAY=0|LOC=%.*s|last_id=%lu",
+             (unsigned long)request_id,
+             31,
+             node_id,
+             31,
+             node_config.location,
+             (unsigned long)last_id);
+
+    ESP_LOGI(TAG, "Broadcasting SYNC_REQ with last_id=%lu", (unsigned long)last_id);
+    lora_transmit(sync_request);
+}
+
+static void send_boot_sync_request(void)
+{
+    send_sync_request(highest_seen_id);
+}
+
+static void send_manual_sync_request(void)
+{
+    send_sync_request(0);
+}
+
+static void boot_sync_task(void *parameter)
+{
+    vTaskDelay(pdMS_TO_TICKS(1500));
+
+    if (node_config.configured && lora_ready) {
+        send_boot_sync_request();
+    }
+
+    vTaskDelete(NULL);
+}
+
 static void store_received_packet(const char *packet, const mesh_packet_t *parsed, int rssi, int snr)
 {
     data_lock();
@@ -801,6 +933,9 @@ static void store_received_packet(const char *packet, const mesh_packet_t *parse
     copy_field(message->priority, sizeof(message->priority), parsed->valid ? parsed->priority : "NORMAL");
     copy_field(message->payload, sizeof(message->payload), parsed->valid ? parsed->payload : packet);
     snprintf(message->packet, sizeof(message->packet), "RSSI=%d SNR=%d | %.*s", rssi, snr, 250, packet);
+    if (parsed->valid && !is_control_packet_type(parsed->type)) {
+        update_highest_seen_id(message->id);
+    }
     if (counter_changed) {
         save_packet_counter();
     }
@@ -889,9 +1024,26 @@ static void lora_rx_task(void *parameter)
                     bool is_broadcast = strcmp(parsed.destination, "ALL") == 0;
                     bool is_for_me = strcmp(parsed.destination, node_id) == 0;
                     bool is_ack = strcmp(parsed.type, "ACK") == 0;
+                    bool is_sync_req = strcmp(parsed.type, "SYNC_REQ") == 0;
+                    bool is_sync_resp = strcmp(parsed.type, "SYNC_RESP") == 0;
 
                     if (!from_self && !is_duplicate) {
                         remember_packet(parsed.source, parsed.id);
+
+                        if (is_sync_req) {
+                            send_sync_responses(&parsed);
+                            continue;
+                        }
+
+                        if (is_sync_resp) {
+                            mesh_packet_t synced_packet;
+
+                            if (is_for_me && parse_mesh_packet(parsed.payload, &synced_packet) && !packet_seen(synced_packet.source, synced_packet.id)) {
+                                remember_packet(synced_packet.source, synced_packet.id);
+                                store_received_packet(parsed.payload, &synced_packet, rssi, snr);
+                            }
+                            continue;
+                        }
 
                         if (is_broadcast || is_for_me) {
                             store_received_packet(decrypted_packet, &parsed, rssi, snr);
@@ -1089,6 +1241,56 @@ static void save_packet_counter(void)
     }
 
     nvs_close(handle);
+}
+
+static void load_highest_seen_id(void)
+{
+    nvs_handle_t handle;
+    uint32_t stored_id = 0;
+
+    if (nvs_open(CONFIG_NAMESPACE, NVS_READONLY, &handle) != ESP_OK) {
+        ESP_LOGI(TAG, "No saved highest seen ID; starting at 0");
+        return;
+    }
+
+    if (nvs_get_u32(handle, HIGHEST_SEEN_ID_KEY, &stored_id) == ESP_OK) {
+        highest_seen_id = stored_id;
+        ESP_LOGI(TAG, "Highest seen ID restored: %lu", (unsigned long)highest_seen_id);
+    } else {
+        ESP_LOGI(TAG, "No saved highest seen ID; starting at 0");
+    }
+
+    nvs_close(handle);
+}
+
+static void save_highest_seen_id(void)
+{
+    nvs_handle_t handle;
+    esp_err_t result = nvs_open(CONFIG_NAMESPACE, NVS_READWRITE, &handle);
+
+    if (result != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to open NVS for highest seen ID: %s", esp_err_to_name(result));
+        return;
+    }
+
+    result = nvs_set_u32(handle, HIGHEST_SEEN_ID_KEY, highest_seen_id);
+    if (result == ESP_OK) {
+        result = nvs_commit(handle);
+    }
+
+    if (result != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to save highest seen ID: %s", esp_err_to_name(result));
+    }
+
+    nvs_close(handle);
+}
+
+static void update_highest_seen_id(uint32_t id)
+{
+    if (id > highest_seen_id) {
+        highest_seen_id = id;
+        save_highest_seen_id();
+    }
 }
 
 static void config_set_defaults(void)
@@ -1562,6 +1764,18 @@ static esp_err_t send_handler(httpd_req_t *request)
     return send_redirect(request, "/");
 }
 
+static esp_err_t sync_handler(httpd_req_t *request)
+{
+    esp_err_t session_result = require_session(request);
+
+    if (session_result != ESP_OK) {
+        return session_result;
+    }
+
+    send_manual_sync_request();
+    return send_redirect(request, "/");
+}
+
 static esp_err_t status_handler(httpd_req_t *request)
 {
     wifi_sta_list_t clients = {0};
@@ -1648,7 +1862,7 @@ static void start_http_server(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = HTTP_PORT;
-    config.max_uri_handlers = 12;
+    config.max_uri_handlers = 16;
     config.uri_match_fn = httpd_uri_match_wildcard;
 
     const httpd_uri_t routes[] = {
@@ -1657,6 +1871,7 @@ static void start_http_server(void)
         {.uri = "/setup", .method = HTTP_POST, .handler = setup_handler},
         {.uri = "/reset", .method = HTTP_POST, .handler = reset_handler},
         {.uri = "/send", .method = HTTP_POST, .handler = send_handler},
+        {.uri = "/sync", .method = HTTP_POST, .handler = sync_handler},
         {.uri = "/api/status", .method = HTTP_GET, .handler = status_handler},
         {.uri = "/api/messages", .method = HTTP_GET, .handler = messages_handler},
         {.uri = "/generate_204", .method = HTTP_GET, .handler = captive_handler},
@@ -1797,10 +2012,12 @@ void app_main(void)
     init_identity();
     init_session_token();
     load_packet_counter();
+    load_highest_seen_id();
     rgb_led_init();
     init_factory_reset_button();
     load_node_config();
     lora_init();
+    xTaskCreate(boot_sync_task, "boot_sync_task", 4096, NULL, 4, NULL);
     start_wifi_ap();
     start_http_server();
     xTaskCreate(factory_reset_button_task, "factory_reset_button_task", 3072, NULL, 7, NULL);

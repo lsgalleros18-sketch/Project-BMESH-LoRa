@@ -64,6 +64,10 @@ static bool parse_mesh_packet(const char *packet, mesh_packet_t *parsed)
 
     while (field_count < sizeof(fields) / sizeof(fields[0]) && cursor != NULL) {
         fields[field_count++] = cursor;
+        if (field_count == sizeof(fields) / sizeof(fields[0])) {
+            break;
+        }
+
         cursor = strchr(cursor, '|');
         if (cursor != NULL) {
             *cursor = '\0';
