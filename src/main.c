@@ -31,6 +31,8 @@
 #define DNS_PORT 53
 #define HTTP_PORT 80
 #define MAX_MESSAGES 16
+#define MAX_SEEN_PACKETS 64
+#define SEEN_PACKET_TTL_MS 60000
 #define FIELD_LEN 32
 #define PAYLOAD_LEN 160
 #define PACKET_LEN 320
@@ -39,6 +41,7 @@
 #define FACTORY_RESET_HOLD_MS 10000
 #define RESET_WARNING_MS 5000
 #define CONFIG_NAMESPACE "bems_config"
+#define PACKET_COUNTER_KEY "packet_ctr"
 #define BEMS_NETWORK_KEY "CHANGEME1234567"
 #define BEMS_CRYPTO_VERSION 1
 #define BEMS_FRAME_PREFIX_0 'B'
@@ -116,6 +119,7 @@ typedef struct {
 
 typedef struct {
     uint32_t id;
+    TickType_t seen_tick;
     char source[FIELD_LEN];
 } seen_packet_t;
 
@@ -139,7 +143,7 @@ static char node_id[FIELD_LEN];
 static char ap_ssid[FIELD_LEN];
 static node_config_t node_config;
 static emergency_message_t messages[MAX_MESSAGES];
-static seen_packet_t seen_packets[MAX_MESSAGES];
+static seen_packet_t seen_packets[MAX_SEEN_PACKETS];
 static size_t message_count;
 static size_t seen_packet_count;
 static uint32_t packet_counter;
@@ -149,10 +153,13 @@ static rmt_channel_handle_t rgb_led_channel;
 static rmt_encoder_handle_t rgb_led_encoder;
 static bool rgb_led_ready;
 static bool lora_ready;
+static volatile bool radio_in_tx;
 static SemaphoreHandle_t lora_dio0_semaphore;
+static SemaphoreHandle_t lora_tx_done_semaphore;
 static SemaphoreHandle_t data_mutex;
 
 static void copy_field(char *destination, size_t destination_size, const char *source);
+static void save_packet_counter(void);
 
 static void data_lock(void)
 {
@@ -569,9 +576,10 @@ static void lora_receive_mode(void)
 static void IRAM_ATTR lora_dio0_isr_handler(void *arg)
 {
     BaseType_t high_priority_task_woken = pdFALSE;
+    SemaphoreHandle_t semaphore = radio_in_tx ? lora_tx_done_semaphore : lora_dio0_semaphore;
 
-    if (lora_dio0_semaphore != NULL) {
-        xSemaphoreGiveFromISR(lora_dio0_semaphore, &high_priority_task_woken);
+    if (semaphore != NULL) {
+        xSemaphoreGiveFromISR(semaphore, &high_priority_task_woken);
     }
 
     if (high_priority_task_woken == pdTRUE) {
@@ -597,13 +605,23 @@ static emergency_message_t *next_message_slot(void)
 static bool packet_seen(const char *source, uint32_t id)
 {
     bool seen = false;
+    TickType_t now = xTaskGetTickCount();
+    TickType_t ttl_ticks = pdMS_TO_TICKS(SEEN_PACKET_TTL_MS);
 
     data_lock();
-    for (size_t i = 0; i < seen_packet_count; i++) {
+    for (size_t i = 0; i < seen_packet_count;) {
+        if ((now - seen_packets[i].seen_tick) > ttl_ticks) {
+            seen_packets[i] = seen_packets[seen_packet_count - 1];
+            seen_packet_count--;
+            continue;
+        }
+
         if (seen_packets[i].id == id && strcmp(seen_packets[i].source, source) == 0) {
             seen = true;
             break;
         }
+
+        i++;
     }
 
     data_unlock();
@@ -613,16 +631,34 @@ static bool packet_seen(const char *source, uint32_t id)
 static void remember_packet(const char *source, uint32_t id)
 {
     seen_packet_t *seen_packet;
+    TickType_t now = xTaskGetTickCount();
+    TickType_t ttl_ticks = pdMS_TO_TICKS(SEEN_PACKET_TTL_MS);
+    size_t slot_index = 0;
 
     data_lock();
-    if (seen_packet_count < MAX_MESSAGES) {
+    for (size_t i = 0; i < seen_packet_count;) {
+        if ((now - seen_packets[i].seen_tick) > ttl_ticks) {
+            seen_packets[i] = seen_packets[seen_packet_count - 1];
+            seen_packet_count--;
+            continue;
+        }
+
+        i++;
+    }
+
+    if (seen_packet_count < MAX_SEEN_PACKETS) {
         seen_packet = &seen_packets[seen_packet_count++];
     } else {
-        memmove(&seen_packets[0], &seen_packets[1], sizeof(seen_packets[0]) * (MAX_MESSAGES - 1));
-        seen_packet = &seen_packets[MAX_MESSAGES - 1];
+        for (size_t i = 1; i < seen_packet_count; i++) {
+            if ((now - seen_packets[i].seen_tick) > (now - seen_packets[slot_index].seen_tick)) {
+                slot_index = i;
+            }
+        }
+        seen_packet = &seen_packets[slot_index];
     }
 
     seen_packet->id = id;
+    seen_packet->seen_tick = now;
     copy_field(seen_packet->source, sizeof(seen_packet->source), source);
     data_unlock();
 }
@@ -690,8 +726,14 @@ static void store_received_packet(const char *packet, const mesh_packet_t *parse
 {
     data_lock();
     emergency_message_t *message = next_message_slot();
+    bool counter_changed = false;
 
-    message->id = parsed->valid ? parsed->id : ++packet_counter;
+    if (parsed->valid) {
+        message->id = parsed->id;
+    } else {
+        message->id = ++packet_counter;
+        counter_changed = true;
+    }
     copy_field(message->direction, sizeof(message->direction), "RX");
     copy_field(message->source, sizeof(message->source), parsed->valid ? parsed->source : "UNKNOWN");
     copy_field(message->destination, sizeof(message->destination), parsed->valid ? parsed->destination : "UNKNOWN");
@@ -699,6 +741,9 @@ static void store_received_packet(const char *packet, const mesh_packet_t *parse
     copy_field(message->priority, sizeof(message->priority), parsed->valid ? parsed->priority : "NORMAL");
     copy_field(message->payload, sizeof(message->payload), parsed->valid ? parsed->payload : packet);
     snprintf(message->packet, sizeof(message->packet), "RSSI=%d SNR=%d | %.*s", rssi, snr, 250, packet);
+    if (counter_changed) {
+        save_packet_counter();
+    }
     data_unlock();
 }
 
@@ -706,7 +751,6 @@ static bool lora_transmit(const char *packet)
 {
     uint8_t frame[LORA_MAX_PAYLOAD];
     size_t length = 0;
-    uint32_t start_tick = xTaskGetTickCount();
 
     if (!lora_ready) {
         ESP_LOGW(TAG, "SX1278 is not ready; packet kept in local log only");
@@ -718,24 +762,30 @@ static bool lora_transmit(const char *packet)
         return false;
     }
 
+    if (lora_tx_done_semaphore == NULL) {
+        ESP_LOGW(TAG, "LoRa TX done semaphore is not ready");
+        return false;
+    }
+
+    xSemaphoreTake(lora_tx_done_semaphore, 0);
     lora_set_mode(MODE_STDBY);
     lora_write_reg(REG_DIO_MAPPING_1, 0x40);
     lora_write_reg(REG_IRQ_FLAGS, 0xFF);
     lora_write_reg(REG_FIFO_ADDR_PTR, 0x00);
     lora_write_fifo(frame, length);
     lora_write_reg(REG_PAYLOAD_LENGTH, length);
+    radio_in_tx = true;
     lora_set_mode(MODE_TX);
 
-    while ((xTaskGetTickCount() - start_tick) < pdMS_TO_TICKS(5000)) {
-        if ((lora_read_reg(REG_IRQ_FLAGS) & IRQ_TX_DONE_MASK) != 0) {
-            lora_write_reg(REG_IRQ_FLAGS, 0xFF);
-            lora_receive_mode();
-            ESP_LOGI(TAG, "SX1278 encrypted TX done: %u bytes", (unsigned int)length);
-            return true;
-        }
-        vTaskDelay(pdMS_TO_TICKS(10));
+    if (xSemaphoreTake(lora_tx_done_semaphore, pdMS_TO_TICKS(5000)) == pdTRUE) {
+        radio_in_tx = false;
+        lora_write_reg(REG_IRQ_FLAGS, 0xFF);
+        lora_receive_mode();
+        ESP_LOGI(TAG, "SX1278 encrypted TX done: %u bytes", (unsigned int)length);
+        return true;
     }
 
+    radio_in_tx = false;
     lora_write_reg(REG_IRQ_FLAGS, 0xFF);
     lora_receive_mode();
     ESP_LOGW(TAG, "SX1278 TX timeout");
@@ -840,6 +890,12 @@ static void lora_init(void)
         return;
     }
 
+    lora_tx_done_semaphore = xSemaphoreCreateBinary();
+    if (lora_tx_done_semaphore == NULL) {
+        ESP_LOGE(TAG, "Failed to create LoRa TX done semaphore");
+        return;
+    }
+
     esp_err_t isr_result = gpio_install_isr_service(0);
     if (isr_result != ESP_OK && isr_result != ESP_ERR_INVALID_STATE) {
         ESP_LOGE(TAG, "Failed to install GPIO ISR service: %s", esp_err_to_name(isr_result));
@@ -926,6 +982,48 @@ static void nvs_get_string_or_default(nvs_handle_t handle, const char *key, char
     if (result != ESP_OK || value[0] == '\0') {
         copy_field(value, value_size, fallback);
     }
+}
+
+static void load_packet_counter(void)
+{
+    nvs_handle_t handle;
+    uint32_t stored_counter = 0;
+
+    if (nvs_open(CONFIG_NAMESPACE, NVS_READONLY, &handle) != ESP_OK) {
+        ESP_LOGI(TAG, "No saved packet counter; starting at %lu", (unsigned long)packet_counter);
+        return;
+    }
+
+    if (nvs_get_u32(handle, PACKET_COUNTER_KEY, &stored_counter) == ESP_OK) {
+        packet_counter = stored_counter;
+        ESP_LOGI(TAG, "Packet counter restored: %lu", (unsigned long)packet_counter);
+    } else {
+        ESP_LOGI(TAG, "No saved packet counter; starting at %lu", (unsigned long)packet_counter);
+    }
+
+    nvs_close(handle);
+}
+
+static void save_packet_counter(void)
+{
+    nvs_handle_t handle;
+    esp_err_t result = nvs_open(CONFIG_NAMESPACE, NVS_READWRITE, &handle);
+
+    if (result != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to open NVS for packet counter: %s", esp_err_to_name(result));
+        return;
+    }
+
+    result = nvs_set_u32(handle, PACKET_COUNTER_KEY, packet_counter);
+    if (result == ESP_OK) {
+        result = nvs_commit(handle);
+    }
+
+    if (result != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to save packet counter: %s", esp_err_to_name(result));
+    }
+
+    nvs_close(handle);
 }
 
 static void config_set_defaults(void)
@@ -1128,6 +1226,30 @@ static bool form_value(const char *body, const char *key, char *output, size_t o
     return false;
 }
 
+static void json_escape_string(char *destination, size_t destination_size, const char *source)
+{
+    size_t write_index = 0;
+
+    if (destination_size == 0) {
+        return;
+    }
+
+    while (*source != '\0' && write_index < destination_size - 1) {
+        char character = *source++;
+
+        if ((character == '"' || character == '\\') && write_index < destination_size - 2) {
+            destination[write_index++] = '\\';
+            destination[write_index++] = character;
+        } else if (character != '"' && character != '\\') {
+            destination[write_index++] = character;
+        } else {
+            break;
+        }
+    }
+
+    destination[write_index] = '\0';
+}
+
 static void build_packet(emergency_message_t *message)
 {
     snprintf(message->packet, sizeof(message->packet), "BEMS|%lu|%.*s|%.*s|%.*s|%.*s|HOPS=5|RELAY=%u|LOC=%.*s|%.*s",
@@ -1163,6 +1285,7 @@ static void queue_message(const char *destination, const char *type, const char 
     copy_field(message->payload, sizeof(message->payload), payload);
     build_packet(message);
     copy_field(packet, sizeof(packet), message->packet);
+    save_packet_counter();
     data_unlock();
 
     ESP_LOGI(TAG, "LoRa TX pending: %s", packet);
@@ -1273,6 +1396,11 @@ static esp_err_t status_handler(httpd_req_t *request)
 {
     wifi_sta_list_t clients = {0};
     char response[384];
+    char escaped_node[FIELD_LEN * 2];
+    char escaped_name[FIELD_LEN * 2];
+    char escaped_location[FIELD_LEN * 2];
+    char escaped_ssid[FIELD_LEN * 2];
+    char escaped_relay[8];
     size_t current_message_count;
 
     esp_wifi_ap_get_sta_list(&clients);
@@ -1280,16 +1408,22 @@ static esp_err_t status_handler(httpd_req_t *request)
     current_message_count = message_count;
     data_unlock();
 
+    json_escape_string(escaped_node, sizeof(escaped_node), node_id);
+    json_escape_string(escaped_name, sizeof(escaped_name), node_config.node_name);
+    json_escape_string(escaped_location, sizeof(escaped_location), node_config.location);
+    json_escape_string(escaped_ssid, sizeof(escaped_ssid), ap_ssid);
+    json_escape_string(escaped_relay, sizeof(escaped_relay), node_config.relay_enabled ? "true" : "false");
+
     snprintf(response, sizeof(response),
-             "{\"node\":\"%s\",\"name\":\"%s\",\"location\":\"%s\",\"ssid\":\"%s\",\"clients\":%u,\"messages\":%u,\"configured\":%s,\"relay\":%s}",
-             node_id,
-             node_config.node_name,
-             node_config.location,
-             ap_ssid,
+             "{\"node\":\"%s\",\"name\":\"%s\",\"location\":\"%s\",\"ssid\":\"%s\",\"clients\":%u,\"messages\":%u,\"configured\":%s,\"relay\":\"%s\"}",
+             escaped_node,
+             escaped_name,
+             escaped_location,
+             escaped_ssid,
              clients.num,
              (unsigned int)current_message_count,
              node_config.configured ? "true" : "false",
-             node_config.relay_enabled ? "true" : "false");
+             escaped_relay);
 
     httpd_resp_set_type(request, "application/json");
     return httpd_resp_send(request, response, HTTPD_RESP_USE_STRLEN);
@@ -1480,6 +1614,7 @@ void app_main(void)
     ESP_ERROR_CHECK(data_mutex == NULL ? ESP_ERR_NO_MEM : ESP_OK);
 
     init_identity();
+    load_packet_counter();
     rgb_led_init();
     init_factory_reset_button();
     load_node_config();
