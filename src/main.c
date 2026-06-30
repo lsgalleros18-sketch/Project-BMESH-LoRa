@@ -42,7 +42,10 @@
 #define RESET_WARNING_MS 5000
 #define CONFIG_NAMESPACE "bems_config"
 #define PACKET_COUNTER_KEY "packet_ctr"
-#define BEMS_NETWORK_KEY "CHANGEME1234567"
+#define DEFAULT_WEB_PIN "1234"
+#define DEFAULT_NETWORK_KEY "CHANGEME1234567"
+#define SESSION_COOKIE_NAME "BMESH_SESSION"
+#define SESSION_TOKEN_LEN 17
 #define BEMS_CRYPTO_VERSION 1
 #define BEMS_FRAME_PREFIX_0 'B'
 #define BEMS_FRAME_PREFIX_1 'M'
@@ -97,6 +100,18 @@
 #define IRQ_PAYLOAD_CRC_ERROR_MASK 0x20
 #define IRQ_RX_DONE_MASK 0x40
 
+#define LORA_BW_125_KHZ 0x70
+#define LORA_CR_4_5 0x02
+#define LORA_EXPLICIT_HEADER_MODE 0x00
+#define LORA_SPREADING_FACTOR 7
+#define LORA_TX_CONTINUOUS_MODE 0x00
+#define LORA_RX_PAYLOAD_CRC_ON 0x04
+#define LORA_LOW_DATA_RATE_OPTIMIZE_OFF 0x00
+#define LORA_AGC_AUTO_ON 0x04
+#define LORA_MODEM_CONFIG_1 (LORA_BW_125_KHZ | LORA_CR_4_5 | LORA_EXPLICIT_HEADER_MODE)
+#define LORA_MODEM_CONFIG_2 ((LORA_SPREADING_FACTOR << 4) | LORA_TX_CONTINUOUS_MODE | LORA_RX_PAYLOAD_CRC_ON)
+#define LORA_MODEM_CONFIG_3 (LORA_LOW_DATA_RATE_OPTIMIZE_OFF | LORA_AGC_AUTO_ON)
+
 typedef struct {
     uint32_t id;
     char direction[8];
@@ -115,6 +130,8 @@ typedef struct {
     char node_name[FIELD_LEN];
     char location[FIELD_LEN];
     char default_destination[FIELD_LEN];
+    char web_pin[FIELD_LEN];
+    char network_key[FIELD_LEN];
 } node_config_t;
 
 typedef struct {
@@ -141,6 +158,7 @@ static const char *AP_PASSWORD = "";
 
 static char node_id[FIELD_LEN];
 static char ap_ssid[FIELD_LEN];
+static char session_token[SESSION_TOKEN_LEN];
 static node_config_t node_config;
 static emergency_message_t messages[MAX_MESSAGES];
 static seen_packet_t seen_packets[MAX_SEEN_PACKETS];
@@ -160,6 +178,7 @@ static SemaphoreHandle_t data_mutex;
 
 static void copy_field(char *destination, size_t destination_size, const char *source);
 static void save_packet_counter(void);
+static bool lora_transmit(const char *packet);
 
 static void data_lock(void)
 {
@@ -286,9 +305,24 @@ static const char SETUP_HTML[] =
     "<label>Node Name<input name=node_name maxlength=31 placeholder='Example: Barangay Hall or House 23' required></label>"
     "<label>Location<input name=location maxlength=31 placeholder='Example: Purok 3, Chapel Roof' required></label>"
     "<label>Default Destination<input name=default_destination maxlength=31 value='BRGY001' placeholder='Example: ALL or BRGY001'></label>"
+    "<label>Web PIN<input name=web_pin maxlength=31 value='1234' placeholder='Shared portal PIN' required></label>"
+    "<label>Network Key<input name=network_key maxlength=31 value='CHANGEME1234567' placeholder='Shared mesh encryption key' required></label>"
     "<label><input name=relay_enabled type=checkbox value=1 checked> Relay messages for the mesh</label>"
     "<button type=submit>Save Setup and Reboot</button></form>"
     "<p class=muted>Factory reset later by holding BOOT for 10 seconds during startup.</p></section></main></body></html>";
+
+static const char LOGIN_HTML[] =
+    "<!doctype html><html><head><meta name=viewport content='width=device-width,initial-scale=1'>"
+    "<title>Barangay Mesh Login</title><style>"
+    ":root{font-family:Arial,sans-serif;color:#17202a;background:#f5f7f9}"
+    "body{margin:0}.top{background:#b91c1c;color:white;padding:16px}.wrap{max-width:420px;margin:auto;padding:16px}"
+    ".card{background:white;border:1px solid #d8dee4;border-radius:8px;padding:16px;margin:12px 0}"
+    "label{display:block;font-weight:700;margin-top:12px}input,button{box-sizing:border-box;width:100%;font:inherit;padding:12px;margin-top:6px;border-radius:6px;border:1px solid #b8c0cc}"
+    "button{background:#b91c1c;color:white;border:0;font-weight:700;margin-top:16px}.muted{color:#5f6b7a;font-size:14px}"
+    "</style></head><body><div class=top><div class=wrap><h2>Barangay Emergency Mesh</h2></div></div>"
+    "<main class=wrap><section class=card><form method=post action=/login>"
+    "<label>Portal PIN<input name=pin maxlength=31 type=password required></label>"
+    "<button type=submit>Unlock Portal</button></form><p class=muted>Use the shared PIN configured for this node.</p></section></main></body></html>";
 
 static esp_err_t lora_transfer(uint8_t address, const uint8_t *tx_data, uint8_t *rx_data, size_t length)
 {
@@ -372,8 +406,9 @@ static bool crypto_init_once(void)
 
 static bool derive_crypto_keys(uint8_t aes_key[16], uint8_t hmac_key[32])
 {
-    uint8_t material[sizeof(BEMS_NETWORK_KEY) + 32];
+    uint8_t material[FIELD_LEN + 32];
     uint8_t digest[32];
+    size_t key_len = strlen(node_config.network_key);
     size_t hash_length = 0;
     psa_status_t status;
 
@@ -381,9 +416,15 @@ static bool derive_crypto_keys(uint8_t aes_key[16], uint8_t hmac_key[32])
         return false;
     }
 
-    memcpy(material, BEMS_NETWORK_KEY, sizeof(BEMS_NETWORK_KEY) - 1);
-    memcpy(&material[sizeof(BEMS_NETWORK_KEY) - 1], "BMESH AES-128", 13);
-    status = psa_hash_compute(PSA_ALG_SHA_256, material, sizeof(BEMS_NETWORK_KEY) - 1 + 13, digest, sizeof(digest), &hash_length);
+    if (key_len == 0) {
+        key_len = strlen(DEFAULT_NETWORK_KEY);
+        memcpy(material, DEFAULT_NETWORK_KEY, key_len);
+    } else {
+        memcpy(material, node_config.network_key, key_len);
+    }
+
+    memcpy(&material[key_len], "BMESH AES-128", 13);
+    status = psa_hash_compute(PSA_ALG_SHA_256, material, key_len + 13, digest, sizeof(digest), &hash_length);
     if (status != PSA_SUCCESS || hash_length < sizeof(digest)) {
         secure_zero(material, sizeof(material));
         secure_zero(digest, sizeof(digest));
@@ -391,8 +432,8 @@ static bool derive_crypto_keys(uint8_t aes_key[16], uint8_t hmac_key[32])
     }
     memcpy(aes_key, digest, 16);
 
-    memcpy(&material[sizeof(BEMS_NETWORK_KEY) - 1], "BMESH HMAC-SHA256", 17);
-    status = psa_hash_compute(PSA_ALG_SHA_256, material, sizeof(BEMS_NETWORK_KEY) - 1 + 17, hmac_key, 32, &hash_length);
+    memcpy(&material[key_len], "BMESH HMAC-SHA256", 17);
+    status = psa_hash_compute(PSA_ALG_SHA_256, material, key_len + 17, hmac_key, 32, &hash_length);
     secure_zero(material, sizeof(material));
     secure_zero(digest, sizeof(digest));
 
@@ -722,6 +763,25 @@ static void build_forward_packet(const mesh_packet_t *parsed, char *packet, size
              parsed->payload);
 }
 
+static void send_ack_packet(const mesh_packet_t *parsed)
+{
+    char ack_packet[PACKET_LEN];
+
+    snprintf(ack_packet, sizeof(ack_packet), "BEMS|%lu|%.*s|%.*s|ACK|NORMAL|HOPS=0|RELAY=%u|LOC=%.*s|ACK for %lu",
+             (unsigned long)parsed->id,
+             31,
+             node_id,
+             31,
+             parsed->source,
+             node_config.relay_enabled ? 1 : 0,
+             31,
+             node_config.location,
+             (unsigned long)parsed->id);
+
+    ESP_LOGI(TAG, "Sending ACK to %s for packet %lu", parsed->source, (unsigned long)parsed->id);
+    lora_transmit(ack_packet);
+}
+
 static void store_received_packet(const char *packet, const mesh_packet_t *parsed, int rssi, int snr)
 {
     data_lock();
@@ -828,12 +888,17 @@ static void lora_rx_task(void *parameter)
                     bool is_duplicate = packet_seen(parsed.source, parsed.id);
                     bool is_broadcast = strcmp(parsed.destination, "ALL") == 0;
                     bool is_for_me = strcmp(parsed.destination, node_id) == 0;
+                    bool is_ack = strcmp(parsed.type, "ACK") == 0;
 
                     if (!from_self && !is_duplicate) {
                         remember_packet(parsed.source, parsed.id);
 
                         if (is_broadcast || is_for_me) {
                             store_received_packet(decrypted_packet, &parsed, rssi, snr);
+                        }
+
+                        if (is_for_me && !is_ack) {
+                            send_ack_packet(&parsed);
                         }
 
                         if (node_config.relay_enabled && parsed.hops > 0 && !is_for_me) {
@@ -924,9 +989,9 @@ static void lora_init(void)
     lora_write_reg(REG_FIFO_TX_BASE_ADDR, 0x00);
     lora_write_reg(REG_FIFO_RX_BASE_ADDR, 0x00);
     lora_write_reg(REG_LNA, lora_read_reg(REG_LNA) | 0x03);
-    lora_write_reg(REG_MODEM_CONFIG_1, 0x72);
-    lora_write_reg(REG_MODEM_CONFIG_2, 0x74);
-    lora_write_reg(REG_MODEM_CONFIG_3, 0x04);
+    lora_write_reg(REG_MODEM_CONFIG_1, LORA_MODEM_CONFIG_1);
+    lora_write_reg(REG_MODEM_CONFIG_2, LORA_MODEM_CONFIG_2);
+    lora_write_reg(REG_MODEM_CONFIG_3, LORA_MODEM_CONFIG_3);
     lora_write_reg(REG_PREAMBLE_MSB, 0x00);
     lora_write_reg(REG_PREAMBLE_LSB, 0x08);
     lora_write_reg(REG_SYNC_WORD, 0x12);
@@ -1034,6 +1099,8 @@ static void config_set_defaults(void)
     copy_field(node_config.node_name, sizeof(node_config.node_name), "Unconfigured Node");
     copy_field(node_config.location, sizeof(node_config.location), "Unknown");
     copy_field(node_config.default_destination, sizeof(node_config.default_destination), "BRGY001");
+    copy_field(node_config.web_pin, sizeof(node_config.web_pin), DEFAULT_WEB_PIN);
+    copy_field(node_config.network_key, sizeof(node_config.network_key), DEFAULT_NETWORK_KEY);
 }
 
 static void apply_config_identity(void)
@@ -1065,6 +1132,8 @@ static void load_node_config(void)
     nvs_get_string_or_default(handle, "node_name", node_config.node_name, sizeof(node_config.node_name), "Mesh Node");
     nvs_get_string_or_default(handle, "location", node_config.location, sizeof(node_config.location), "Unknown");
     nvs_get_string_or_default(handle, "default_dest", node_config.default_destination, sizeof(node_config.default_destination), "BRGY001");
+    nvs_get_string_or_default(handle, "web_pin", node_config.web_pin, sizeof(node_config.web_pin), DEFAULT_WEB_PIN);
+    nvs_get_string_or_default(handle, "network_key", node_config.network_key, sizeof(node_config.network_key), DEFAULT_NETWORK_KEY);
     nvs_close(handle);
 
     node_config.configured = configured == 1;
@@ -1099,6 +1168,12 @@ static esp_err_t save_node_config(const node_config_t *config)
     }
     if (result == ESP_OK) {
         result = nvs_set_str(handle, "default_dest", config->default_destination);
+    }
+    if (result == ESP_OK) {
+        result = nvs_set_str(handle, "web_pin", config->web_pin);
+    }
+    if (result == ESP_OK) {
+        result = nvs_set_str(handle, "network_key", config->network_key);
     }
     if (result == ESP_OK) {
         result = nvs_commit(handle);
@@ -1250,9 +1325,21 @@ static void json_escape_string(char *destination, size_t destination_size, const
     destination[write_index] = '\0';
 }
 
+static int hops_for_priority(const char *priority)
+{
+    if (strcmp(priority, "HIGH") == 0) {
+        return 5;
+    }
+    if (strcmp(priority, "LOW") == 0) {
+        return 1;
+    }
+
+    return 3;
+}
+
 static void build_packet(emergency_message_t *message)
 {
-    snprintf(message->packet, sizeof(message->packet), "BEMS|%lu|%.*s|%.*s|%.*s|%.*s|HOPS=5|RELAY=%u|LOC=%.*s|%.*s",
+    snprintf(message->packet, sizeof(message->packet), "BEMS|%lu|%.*s|%.*s|%.*s|%.*s|HOPS=%d|RELAY=%u|LOC=%.*s|%.*s",
              (unsigned long)message->id,
              31,
              node_id,
@@ -1262,6 +1349,7 @@ static void build_packet(emergency_message_t *message)
              message->type,
              31,
              message->priority,
+             hops_for_priority(message->priority),
              node_config.relay_enabled ? 1 : 0,
              31,
              node_config.location,
@@ -1300,6 +1388,40 @@ static esp_err_t send_redirect(httpd_req_t *request, const char *location)
     return ESP_OK;
 }
 
+static void init_session_token(void)
+{
+    uint32_t random_a = esp_random();
+    uint32_t random_b = esp_random();
+
+    snprintf(session_token, sizeof(session_token), "%08lX%08lX", (unsigned long)random_a, (unsigned long)random_b);
+}
+
+static bool request_has_session(httpd_req_t *request)
+{
+    char cookie[128] = {0};
+    char expected[64];
+
+    if (!node_config.configured) {
+        return true;
+    }
+
+    if (httpd_req_get_hdr_value_str(request, "Cookie", cookie, sizeof(cookie)) != ESP_OK) {
+        return false;
+    }
+
+    snprintf(expected, sizeof(expected), "%s=%s", SESSION_COOKIE_NAME, session_token);
+    return strstr(cookie, expected) != NULL;
+}
+
+static esp_err_t require_session(httpd_req_t *request)
+{
+    if (request_has_session(request)) {
+        return ESP_OK;
+    }
+
+    return send_redirect(request, "/");
+}
+
 static esp_err_t index_handler(httpd_req_t *request)
 {
     httpd_resp_set_type(request, "text/html");
@@ -1307,8 +1429,38 @@ static esp_err_t index_handler(httpd_req_t *request)
     if (!node_config.configured) {
         return httpd_resp_send(request, SETUP_HTML, HTTPD_RESP_USE_STRLEN);
     }
+    if (!request_has_session(request)) {
+        return httpd_resp_send(request, LOGIN_HTML, HTTPD_RESP_USE_STRLEN);
+    }
 
     return httpd_resp_send(request, INDEX_HTML, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t login_handler(httpd_req_t *request)
+{
+    char body[96] = {0};
+    char pin[FIELD_LEN] = {0};
+    char cookie[64];
+    int received = 0;
+
+    while (received < request->content_len && received < (int)sizeof(body) - 1) {
+        int ret = httpd_req_recv(request, body + received, MIN(request->content_len - received, (int)sizeof(body) - 1 - received));
+        if (ret <= 0) {
+            return ESP_FAIL;
+        }
+        received += ret;
+    }
+
+    form_value(body, "pin", pin, sizeof(pin));
+    if (strcmp(pin, node_config.web_pin) != 0) {
+        httpd_resp_set_status(request, "403 Forbidden");
+        httpd_resp_set_type(request, "text/html");
+        return httpd_resp_send(request, LOGIN_HTML, HTTPD_RESP_USE_STRLEN);
+    }
+
+    snprintf(cookie, sizeof(cookie), "%s=%s; Path=/; HttpOnly; SameSite=Lax", SESSION_COOKIE_NAME, session_token);
+    httpd_resp_set_hdr(request, "Set-Cookie", cookie);
+    return send_redirect(request, "/");
 }
 
 static esp_err_t setup_handler(httpd_req_t *request)
@@ -1331,6 +1483,8 @@ static esp_err_t setup_handler(httpd_req_t *request)
     form_value(body, "node_name", new_config.node_name, sizeof(new_config.node_name));
     form_value(body, "location", new_config.location, sizeof(new_config.location));
     form_value(body, "default_destination", new_config.default_destination, sizeof(new_config.default_destination));
+    form_value(body, "web_pin", new_config.web_pin, sizeof(new_config.web_pin));
+    form_value(body, "network_key", new_config.network_key, sizeof(new_config.network_key));
     new_config.configured = true;
     new_config.relay_enabled = strstr(body, "relay_enabled=1") != NULL;
 
@@ -1346,6 +1500,12 @@ static esp_err_t setup_handler(httpd_req_t *request)
     if (new_config.default_destination[0] == '\0') {
         copy_field(new_config.default_destination, sizeof(new_config.default_destination), "BRGY001");
     }
+    if (new_config.web_pin[0] == '\0') {
+        copy_field(new_config.web_pin, sizeof(new_config.web_pin), DEFAULT_WEB_PIN);
+    }
+    if (new_config.network_key[0] == '\0') {
+        copy_field(new_config.network_key, sizeof(new_config.network_key), DEFAULT_NETWORK_KEY);
+    }
 
     ESP_ERROR_CHECK(save_node_config(&new_config));
     httpd_resp_set_type(request, "text/html");
@@ -1357,6 +1517,11 @@ static esp_err_t setup_handler(httpd_req_t *request)
 
 static esp_err_t reset_handler(httpd_req_t *request)
 {
+    esp_err_t session_result = require_session(request);
+    if (session_result != ESP_OK) {
+        return session_result;
+    }
+
     erase_node_config();
     httpd_resp_set_type(request, "text/html");
     httpd_resp_send(request, "<!doctype html><html><body><h2>Factory reset complete.</h2><p>Node is restarting into setup mode.</p></body></html>", HTTPD_RESP_USE_STRLEN);
@@ -1373,6 +1538,11 @@ static esp_err_t send_handler(httpd_req_t *request)
     char priority[FIELD_LEN] = "NORMAL";
     char payload[PAYLOAD_LEN] = "No message";
     int received = 0;
+    esp_err_t session_result = require_session(request);
+
+    if (session_result != ESP_OK) {
+        return session_result;
+    }
 
     while (received < request->content_len && received < (int)sizeof(body) - 1) {
         int ret = httpd_req_recv(request, body + received, MIN(request->content_len - received, (int)sizeof(body) - 1 - received));
@@ -1402,6 +1572,11 @@ static esp_err_t status_handler(httpd_req_t *request)
     char escaped_ssid[FIELD_LEN * 2];
     char escaped_relay[8];
     size_t current_message_count;
+    esp_err_t session_result = require_session(request);
+
+    if (session_result != ESP_OK) {
+        return session_result;
+    }
 
     esp_wifi_ap_get_sta_list(&clients);
     data_lock();
@@ -1433,6 +1608,11 @@ static esp_err_t messages_handler(httpd_req_t *request)
 {
     char response[1536];
     size_t offset = 0;
+    esp_err_t session_result = require_session(request);
+
+    if (session_result != ESP_OK) {
+        return session_result;
+    }
 
     data_lock();
     offset += snprintf(response + offset, sizeof(response) - offset, "[");
@@ -1473,6 +1653,7 @@ static void start_http_server(void)
 
     const httpd_uri_t routes[] = {
         {.uri = "/", .method = HTTP_GET, .handler = index_handler},
+        {.uri = "/login", .method = HTTP_POST, .handler = login_handler},
         {.uri = "/setup", .method = HTTP_POST, .handler = setup_handler},
         {.uri = "/reset", .method = HTTP_POST, .handler = reset_handler},
         {.uri = "/send", .method = HTTP_POST, .handler = send_handler},
@@ -1614,6 +1795,7 @@ void app_main(void)
     ESP_ERROR_CHECK(data_mutex == NULL ? ESP_ERR_NO_MEM : ESP_OK);
 
     init_identity();
+    init_session_token();
     load_packet_counter();
     rgb_led_init();
     init_factory_reset_button();
