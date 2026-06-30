@@ -24,6 +24,7 @@
 #include "lwip/sockets.h"
 #include "nvs.h"
 #include "nvs_flash.h"
+#include "psa/crypto.h"
 
 #define AP_CHANNEL 6
 #define AP_MAX_CONNECTIONS 4
@@ -38,6 +39,15 @@
 #define FACTORY_RESET_HOLD_MS 10000
 #define RESET_WARNING_MS 5000
 #define CONFIG_NAMESPACE "bems_config"
+#define BEMS_NETWORK_KEY "CHANGEME1234567"
+#define BEMS_CRYPTO_VERSION 1
+#define BEMS_FRAME_PREFIX_0 'B'
+#define BEMS_FRAME_PREFIX_1 'M'
+#define BEMS_FRAME_PREFIX_2 '2'
+#define BEMS_FRAME_HEADER_LEN 12
+#define BEMS_NONCE_LEN 8
+#define BEMS_HMAC_TAG_LEN 16
+#define BEMS_MAX_PLAINTEXT (LORA_MAX_PAYLOAD - BEMS_FRAME_HEADER_LEN - BEMS_HMAC_TAG_LEN)
 
 #define LORA_MISO_GPIO 5
 #define LORA_DIO0_GPIO 16
@@ -140,8 +150,23 @@ static rmt_encoder_handle_t rgb_led_encoder;
 static bool rgb_led_ready;
 static bool lora_ready;
 static SemaphoreHandle_t lora_dio0_semaphore;
+static SemaphoreHandle_t data_mutex;
 
 static void copy_field(char *destination, size_t destination_size, const char *source);
+
+static void data_lock(void)
+{
+    if (data_mutex != NULL) {
+        xSemaphoreTake(data_mutex, portMAX_DELAY);
+    }
+}
+
+static void data_unlock(void)
+{
+    if (data_mutex != NULL) {
+        xSemaphoreGive(data_mutex);
+    }
+}
 
 static void rgb_led_init(void)
 {
@@ -307,6 +332,220 @@ static void lora_read_fifo(uint8_t *data, size_t length)
     lora_transfer(REG_FIFO & 0x7F, NULL, data, length);
 }
 
+static void secure_zero(void *data, size_t length)
+{
+    volatile uint8_t *bytes = (volatile uint8_t *)data;
+
+    while (length-- > 0) {
+        *bytes++ = 0;
+    }
+}
+
+static bool constant_time_equal(const uint8_t *left, const uint8_t *right, size_t length)
+{
+    uint8_t diff = 0;
+
+    for (size_t i = 0; i < length; i++) {
+        diff |= left[i] ^ right[i];
+    }
+
+    return diff == 0;
+}
+
+static bool crypto_init_once(void)
+{
+    static bool crypto_ready;
+
+    if (!crypto_ready) {
+        crypto_ready = psa_crypto_init() == PSA_SUCCESS;
+    }
+
+    return crypto_ready;
+}
+
+static bool derive_crypto_keys(uint8_t aes_key[16], uint8_t hmac_key[32])
+{
+    uint8_t material[sizeof(BEMS_NETWORK_KEY) + 32];
+    uint8_t digest[32];
+    size_t hash_length = 0;
+    psa_status_t status;
+
+    if (!crypto_init_once()) {
+        return false;
+    }
+
+    memcpy(material, BEMS_NETWORK_KEY, sizeof(BEMS_NETWORK_KEY) - 1);
+    memcpy(&material[sizeof(BEMS_NETWORK_KEY) - 1], "BMESH AES-128", 13);
+    status = psa_hash_compute(PSA_ALG_SHA_256, material, sizeof(BEMS_NETWORK_KEY) - 1 + 13, digest, sizeof(digest), &hash_length);
+    if (status != PSA_SUCCESS || hash_length < sizeof(digest)) {
+        secure_zero(material, sizeof(material));
+        secure_zero(digest, sizeof(digest));
+        return false;
+    }
+    memcpy(aes_key, digest, 16);
+
+    memcpy(&material[sizeof(BEMS_NETWORK_KEY) - 1], "BMESH HMAC-SHA256", 17);
+    status = psa_hash_compute(PSA_ALG_SHA_256, material, sizeof(BEMS_NETWORK_KEY) - 1 + 17, hmac_key, 32, &hash_length);
+    secure_zero(material, sizeof(material));
+    secure_zero(digest, sizeof(digest));
+
+    return status == PSA_SUCCESS && hash_length == 32;
+}
+
+static bool aes_ctr_crypt(uint8_t *data, size_t length, const uint8_t nonce[BEMS_NONCE_LEN])
+{
+    uint8_t aes_key[16];
+    uint8_t unused_hmac_key[32];
+    uint8_t counter[16] = {0};
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+    psa_key_id_t key_id = 0;
+    psa_cipher_operation_t operation = PSA_CIPHER_OPERATION_INIT;
+    size_t output_length = 0;
+    size_t finish_length = 0;
+    psa_status_t status;
+
+    if (!derive_crypto_keys(aes_key, unused_hmac_key)) {
+        secure_zero(unused_hmac_key, sizeof(unused_hmac_key));
+        return false;
+    }
+    secure_zero(unused_hmac_key, sizeof(unused_hmac_key));
+
+    memcpy(counter, nonce, BEMS_NONCE_LEN);
+    psa_set_key_type(&attributes, PSA_KEY_TYPE_AES);
+    psa_set_key_bits(&attributes, 128);
+    psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_ENCRYPT);
+    psa_set_key_algorithm(&attributes, PSA_ALG_CTR);
+
+    status = psa_import_key(&attributes, aes_key, sizeof(aes_key), &key_id);
+    if (status == PSA_SUCCESS) {
+        status = psa_cipher_encrypt_setup(&operation, key_id, PSA_ALG_CTR);
+    }
+    if (status == PSA_SUCCESS) {
+        status = psa_cipher_set_iv(&operation, counter, sizeof(counter));
+    }
+    if (status == PSA_SUCCESS) {
+        status = psa_cipher_update(&operation, data, length, data, length, &output_length);
+    }
+    if (status == PSA_SUCCESS) {
+        status = psa_cipher_finish(&operation, data + output_length, length - output_length, &finish_length);
+    }
+
+    psa_cipher_abort(&operation);
+    if (key_id != 0) {
+        psa_destroy_key(key_id);
+    }
+    secure_zero(aes_key, sizeof(aes_key));
+    secure_zero(counter, sizeof(counter));
+
+    return status == PSA_SUCCESS && output_length + finish_length == length;
+}
+
+static bool hmac_sha256(const uint8_t *data, size_t data_len, uint8_t tag[32])
+{
+    uint8_t aes_key[16];
+    uint8_t hmac_key[32];
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+    psa_key_id_t key_id = 0;
+    size_t tag_length = 0;
+    psa_status_t status;
+
+    if (!derive_crypto_keys(aes_key, hmac_key)) {
+        return false;
+    }
+
+    psa_set_key_type(&attributes, PSA_KEY_TYPE_HMAC);
+    psa_set_key_bits(&attributes, sizeof(hmac_key) * 8);
+    psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_SIGN_MESSAGE);
+    psa_set_key_algorithm(&attributes, PSA_ALG_HMAC(PSA_ALG_SHA_256));
+
+    status = psa_import_key(&attributes, hmac_key, sizeof(hmac_key), &key_id);
+    if (status == PSA_SUCCESS) {
+        status = psa_mac_compute(key_id, PSA_ALG_HMAC(PSA_ALG_SHA_256), data, data_len, tag, 32, &tag_length);
+    }
+
+    if (key_id != 0) {
+        psa_destroy_key(key_id);
+    }
+    secure_zero(aes_key, sizeof(aes_key));
+    secure_zero(hmac_key, sizeof(hmac_key));
+
+    return status == PSA_SUCCESS && tag_length == 32;
+}
+
+static bool bems_encrypt_packet(const char *plain_packet, uint8_t *frame, size_t frame_size, size_t *frame_len)
+{
+    uint8_t full_tag[32];
+    size_t plain_len = MIN(strlen(plain_packet), (size_t)BEMS_MAX_PLAINTEXT);
+
+    if (frame_size < BEMS_FRAME_HEADER_LEN + plain_len + BEMS_HMAC_TAG_LEN) {
+        return false;
+    }
+
+    frame[0] = BEMS_FRAME_PREFIX_0;
+    frame[1] = BEMS_FRAME_PREFIX_1;
+    frame[2] = BEMS_FRAME_PREFIX_2;
+    frame[3] = BEMS_CRYPTO_VERSION;
+
+    for (size_t i = 0; i < BEMS_NONCE_LEN; i += sizeof(uint32_t)) {
+        uint32_t random_value = esp_random();
+        memcpy(&frame[4 + i], &random_value, MIN(sizeof(random_value), BEMS_NONCE_LEN - i));
+    }
+
+    memcpy(&frame[BEMS_FRAME_HEADER_LEN], plain_packet, plain_len);
+    if (!aes_ctr_crypt(&frame[BEMS_FRAME_HEADER_LEN], plain_len, &frame[4])) {
+        return false;
+    }
+
+    if (!hmac_sha256(frame, BEMS_FRAME_HEADER_LEN + plain_len, full_tag)) {
+        secure_zero(full_tag, sizeof(full_tag));
+        return false;
+    }
+
+    memcpy(&frame[BEMS_FRAME_HEADER_LEN + plain_len], full_tag, BEMS_HMAC_TAG_LEN);
+    *frame_len = BEMS_FRAME_HEADER_LEN + plain_len + BEMS_HMAC_TAG_LEN;
+
+    secure_zero(full_tag, sizeof(full_tag));
+    return true;
+}
+
+static bool bems_decrypt_frame(const uint8_t *frame, size_t frame_len, char *plain_packet, size_t plain_packet_size)
+{
+    uint8_t full_tag[32];
+    uint8_t calculated_tag[BEMS_HMAC_TAG_LEN];
+    size_t cipher_len;
+    bool valid;
+
+    if (frame_len < BEMS_FRAME_HEADER_LEN + BEMS_HMAC_TAG_LEN || plain_packet_size == 0) {
+        return false;
+    }
+    if (frame[0] != BEMS_FRAME_PREFIX_0 || frame[1] != BEMS_FRAME_PREFIX_1 || frame[2] != BEMS_FRAME_PREFIX_2 || frame[3] != BEMS_CRYPTO_VERSION) {
+        return false;
+    }
+
+    cipher_len = frame_len - BEMS_FRAME_HEADER_LEN - BEMS_HMAC_TAG_LEN;
+    if (cipher_len >= plain_packet_size) {
+        return false;
+    }
+
+    if (!hmac_sha256(frame, BEMS_FRAME_HEADER_LEN + cipher_len, full_tag)) {
+        secure_zero(full_tag, sizeof(full_tag));
+        return false;
+    }
+
+    memcpy(calculated_tag, full_tag, sizeof(calculated_tag));
+    valid = constant_time_equal(calculated_tag, &frame[BEMS_FRAME_HEADER_LEN + cipher_len], BEMS_HMAC_TAG_LEN);
+
+    if (valid) {
+        memcpy(plain_packet, &frame[BEMS_FRAME_HEADER_LEN], cipher_len);
+        valid = aes_ctr_crypt((uint8_t *)plain_packet, cipher_len, &frame[4]);
+        plain_packet[cipher_len] = '\0';
+    }
+
+    secure_zero(full_tag, sizeof(full_tag));
+    secure_zero(calculated_tag, sizeof(calculated_tag));
+    return valid;
+}
+
 static void lora_set_mode(uint8_t mode)
 {
     lora_write_reg(REG_OP_MODE, MODE_LONG_RANGE_MODE | mode);
@@ -357,19 +596,25 @@ static emergency_message_t *next_message_slot(void)
 
 static bool packet_seen(const char *source, uint32_t id)
 {
+    bool seen = false;
+
+    data_lock();
     for (size_t i = 0; i < seen_packet_count; i++) {
         if (seen_packets[i].id == id && strcmp(seen_packets[i].source, source) == 0) {
-            return true;
+            seen = true;
+            break;
         }
     }
 
-    return false;
+    data_unlock();
+    return seen;
 }
 
 static void remember_packet(const char *source, uint32_t id)
 {
     seen_packet_t *seen_packet;
 
+    data_lock();
     if (seen_packet_count < MAX_MESSAGES) {
         seen_packet = &seen_packets[seen_packet_count++];
     } else {
@@ -379,6 +624,7 @@ static void remember_packet(const char *source, uint32_t id)
 
     seen_packet->id = id;
     copy_field(seen_packet->source, sizeof(seen_packet->source), source);
+    data_unlock();
 }
 
 static bool parse_mesh_packet(const char *packet, mesh_packet_t *parsed)
@@ -442,6 +688,7 @@ static void build_forward_packet(const mesh_packet_t *parsed, char *packet, size
 
 static void store_received_packet(const char *packet, const mesh_packet_t *parsed, int rssi, int snr)
 {
+    data_lock();
     emergency_message_t *message = next_message_slot();
 
     message->id = parsed->valid ? parsed->id : ++packet_counter;
@@ -452,11 +699,13 @@ static void store_received_packet(const char *packet, const mesh_packet_t *parse
     copy_field(message->priority, sizeof(message->priority), parsed->valid ? parsed->priority : "NORMAL");
     copy_field(message->payload, sizeof(message->payload), parsed->valid ? parsed->payload : packet);
     snprintf(message->packet, sizeof(message->packet), "RSSI=%d SNR=%d | %.*s", rssi, snr, 250, packet);
+    data_unlock();
 }
 
 static bool lora_transmit(const char *packet)
 {
-    size_t length = MIN(strlen(packet), (size_t)LORA_MAX_PAYLOAD);
+    uint8_t frame[LORA_MAX_PAYLOAD];
+    size_t length = 0;
     uint32_t start_tick = xTaskGetTickCount();
 
     if (!lora_ready) {
@@ -464,11 +713,16 @@ static bool lora_transmit(const char *packet)
         return false;
     }
 
+    if (!bems_encrypt_packet(packet, frame, sizeof(frame), &length)) {
+        ESP_LOGW(TAG, "Failed to encrypt LoRa packet");
+        return false;
+    }
+
     lora_set_mode(MODE_STDBY);
     lora_write_reg(REG_DIO_MAPPING_1, 0x40);
     lora_write_reg(REG_IRQ_FLAGS, 0xFF);
     lora_write_reg(REG_FIFO_ADDR_PTR, 0x00);
-    lora_write_fifo((const uint8_t *)packet, length);
+    lora_write_fifo(frame, length);
     lora_write_reg(REG_PAYLOAD_LENGTH, length);
     lora_set_mode(MODE_TX);
 
@@ -476,7 +730,7 @@ static bool lora_transmit(const char *packet)
         if ((lora_read_reg(REG_IRQ_FLAGS) & IRQ_TX_DONE_MASK) != 0) {
             lora_write_reg(REG_IRQ_FLAGS, 0xFF);
             lora_receive_mode();
-            ESP_LOGI(TAG, "SX1278 TX done: %.*s", (int)length, packet);
+            ESP_LOGI(TAG, "SX1278 encrypted TX done: %u bytes", (unsigned int)length);
             return true;
         }
         vTaskDelay(pdMS_TO_TICKS(10));
@@ -491,6 +745,7 @@ static bool lora_transmit(const char *packet)
 static void lora_rx_task(void *parameter)
 {
     uint8_t payload[LORA_MAX_PAYLOAD + 1];
+    char decrypted_packet[PACKET_LEN];
 
     while (true) {
         if (lora_dio0_semaphore != NULL) {
@@ -511,9 +766,14 @@ static void lora_rx_task(void *parameter)
                 lora_read_fifo(payload, length);
                 payload[length] = '\0';
 
-                ESP_LOGI(TAG, "SX1278 RX RSSI=%d SNR=%d: %s", rssi, snr, (char *)payload);
+                if (!bems_decrypt_frame(payload, length, decrypted_packet, sizeof(decrypted_packet))) {
+                    ESP_LOGW(TAG, "Rejected unauthenticated LoRa frame RSSI=%d SNR=%d length=%u", rssi, snr, length);
+                    continue;
+                }
+
+                ESP_LOGI(TAG, "SX1278 RX RSSI=%d SNR=%d: %s", rssi, snr, decrypted_packet);
                 mesh_packet_t parsed;
-                if (parse_mesh_packet((char *)payload, &parsed)) {
+                if (parse_mesh_packet(decrypted_packet, &parsed)) {
                     bool from_self = strcmp(parsed.source, node_id) == 0;
                     bool is_duplicate = packet_seen(parsed.source, parsed.id);
                     bool is_broadcast = strcmp(parsed.destination, "ALL") == 0;
@@ -523,7 +783,7 @@ static void lora_rx_task(void *parameter)
                         remember_packet(parsed.source, parsed.id);
 
                         if (is_broadcast || is_for_me) {
-                            store_received_packet((char *)payload, &parsed, rssi, snr);
+                            store_received_packet(decrypted_packet, &parsed, rssi, snr);
                         }
 
                         if (node_config.relay_enabled && parsed.hops > 0 && !is_for_me) {
@@ -535,7 +795,7 @@ static void lora_rx_task(void *parameter)
                     }
                 } else {
                     mesh_packet_t raw_packet = {0};
-                    store_received_packet((char *)payload, &raw_packet, rssi, snr);
+                    store_received_packet(decrypted_packet, &raw_packet, rssi, snr);
                 }
             }
         }
@@ -889,6 +1149,9 @@ static void build_packet(emergency_message_t *message)
 
 static void queue_message(const char *destination, const char *type, const char *priority, const char *payload)
 {
+    char packet[PACKET_LEN];
+
+    data_lock();
     emergency_message_t *message = next_message_slot();
 
     message->id = ++packet_counter;
@@ -899,9 +1162,11 @@ static void queue_message(const char *destination, const char *type, const char 
     copy_field(message->priority, sizeof(message->priority), priority);
     copy_field(message->payload, sizeof(message->payload), payload);
     build_packet(message);
+    copy_field(packet, sizeof(packet), message->packet);
+    data_unlock();
 
-    ESP_LOGI(TAG, "LoRa TX pending: %s", message->packet);
-    lora_transmit(message->packet);
+    ESP_LOGI(TAG, "LoRa TX pending: %s", packet);
+    lora_transmit(packet);
 }
 
 static esp_err_t send_redirect(httpd_req_t *request, const char *location)
@@ -1008,8 +1273,13 @@ static esp_err_t status_handler(httpd_req_t *request)
 {
     wifi_sta_list_t clients = {0};
     char response[384];
+    size_t current_message_count;
 
     esp_wifi_ap_get_sta_list(&clients);
+    data_lock();
+    current_message_count = message_count;
+    data_unlock();
+
     snprintf(response, sizeof(response),
              "{\"node\":\"%s\",\"name\":\"%s\",\"location\":\"%s\",\"ssid\":\"%s\",\"clients\":%u,\"messages\":%u,\"configured\":%s,\"relay\":%s}",
              node_id,
@@ -1017,7 +1287,7 @@ static esp_err_t status_handler(httpd_req_t *request)
              node_config.location,
              ap_ssid,
              clients.num,
-             (unsigned int)message_count,
+             (unsigned int)current_message_count,
              node_config.configured ? "true" : "false",
              node_config.relay_enabled ? "true" : "false");
 
@@ -1030,6 +1300,7 @@ static esp_err_t messages_handler(httpd_req_t *request)
     char response[1536];
     size_t offset = 0;
 
+    data_lock();
     offset += snprintf(response + offset, sizeof(response) - offset, "[");
 
     for (size_t i = 0; i < message_count && offset < sizeof(response); i++) {
@@ -1048,6 +1319,8 @@ static esp_err_t messages_handler(httpd_req_t *request)
     }
 
     snprintf(response + MIN(offset, sizeof(response) - 1), sizeof(response) - MIN(offset, sizeof(response) - 1), "]");
+    data_unlock();
+
     httpd_resp_set_type(request, "application/json");
     return httpd_resp_send(request, response, HTTPD_RESP_USE_STRLEN);
 }
@@ -1202,6 +1475,9 @@ void app_main(void)
     } else {
         ESP_ERROR_CHECK(nvs_status);
     }
+
+    data_mutex = xSemaphoreCreateMutex();
+    ESP_ERROR_CHECK(data_mutex == NULL ? ESP_ERR_NO_MEM : ESP_OK);
 
     init_identity();
     rgb_led_init();
