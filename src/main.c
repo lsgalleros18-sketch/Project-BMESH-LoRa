@@ -210,6 +210,7 @@ static rmt_encoder_handle_t rgb_led_encoder;
 static bool rgb_led_ready;
 static bool lora_ready;
 static volatile bool radio_in_tx;
+static bool duplicate_node_id_warning;
 static SemaphoreHandle_t lora_dio0_semaphore;
 static SemaphoreHandle_t lora_tx_done_semaphore;
 static SemaphoreHandle_t data_mutex;
@@ -316,7 +317,7 @@ static const char INDEX_HTML[] =
     "@media(max-width:860px){.messenger{grid-template-columns:1fr}.thread-list{border-right:0;padding-right:0}}"
     "</style></head><body><div class=top><div class=wrap><h2>Barangay Emergency Mesh</h2>"
     "<div id=status>Loading status...</div></div></div><main class=wrap>"
-    "<section class=card><h3>Send Message</h3><form method=post action=/send>"
+    "<section class=card><h3>Send Message</h3><button id=langBtn type=button>Tagalog</button><form method=post action=/send>"
     "<div class=row><label>Your name<input name=sender_name maxlength=31 placeholder='Optional name for accountability'></label><label>Quick templates<select id=template><option value=''>Choose a template</option><option value='Need medical evacuation|MEDICAL|HIGH'>Need medical evacuation</option><option value='Road impassable|EVACUATION|HIGH'>Road impassable</option><option value='All clear|TEST|LOW'>All clear</option></select></label></div>"
     "<fieldset style='border:0;padding:0;margin:0 0 8px 0'><legend style='font-weight:700'>Message scope</legend>"
     "<label><input type=radio name=scope value=announcement checked> Announcement (all nodes)</label>"
@@ -329,11 +330,11 @@ static const char INDEX_HTML[] =
     "<button type=submit>Queue / Transmit Message</button></form><p class=muted>The portal sends through the SX1278 using GPIO 5/7/6/8/4/16 at 433 MHz.</p></section>"
     "<section class=card><h3>Messages</h3><div class=messenger><div class=thread-list><div class=muted>Loading threads...</div></div><div class=thread-view><div class=muted>Loading messages...</div></div></div></section>"
     "<section class=card><h3>Mesh Health</h3><div id=health class=muted>Loading node roster...</div></section>"
-    "<section class=card><h3>Portal</h3><p class=muted>Connect to this Wi-Fi when offline, then open http://192.168.4.1. Android/iOS captive checks are redirected here automatically.</p>"
+    "<section class=card><h3>Portal</h3><p class=muted id=warningBox></p><p class=muted>Connect to this Wi-Fi when offline, then open http://192.168.4.1. Android/iOS captive checks are redirected here automatically.</p>"
     "<form method=post action=/sync><button type=submit>Sync Messages from Mesh</button></form>"
     "<form method=post action=/reset onsubmit='return confirm(\"Factory reset this node and run setup again?\")'><button type=submit>Factory Reset Node</button></form></section>"
     "</main><script>"
-    "const scopeRadios=[...document.querySelectorAll('input[name=scope]')];const destWrap=document.getElementById('destWrap');const dest=document.getElementById('destination');const announcementDest=document.getElementById('announcementDest');const template=document.getElementById('template');const payload=document.getElementById('payload');"
+    "const scopeRadios=[...document.querySelectorAll('input[name=scope]')];const destWrap=document.getElementById('destWrap');const dest=document.getElementById('destination');const announcementDest=document.getElementById('announcementDest');const template=document.getElementById('template');const payload=document.getElementById('payload');const langBtn=document.getElementById('langBtn');"
     "function syncScope(){let direct=scopeRadios.some(r=>r.checked&&r.value==='direct');destWrap.style.display=direct?'block':'none';dest.required=direct;announcementDest.disabled=direct;if(!direct){dest.value='';announcementDest.value='ALL';}else{announcementDest.value='';}}"
     "template.addEventListener('change',()=>{if(!template.value)return;let parts=template.value.split('|');payload.value=parts[0];document.querySelector('select[name=type]').value=parts[1]||'TEST';document.querySelector('select[name=priority]').value=parts[2]||'NORMAL';template.value='';});"
     "scopeRadios.forEach(r=>r.addEventListener('change',syncScope));syncScope();"
@@ -342,6 +343,7 @@ static const char INDEX_HTML[] =
     "function locText(x){return [x.location?.sitio||'',x.location?.barangay||'',x.location?.municipality||''].filter(Boolean).join(' \xE2\x86\x92 ');}"
     "function renderThreads(){let list=document.querySelector('.thread-list');let entries=Object.values(cachedThreads).sort((a,b)=>{if(a.thread_key==='ANNOUNCEMENTS')return -1;if(b.thread_key==='ANNOUNCEMENTS')return 1;return (b.lastSeen||0)-(a.lastSeen||0);});if(!entries.length){list.innerHTML='<div class=muted>No messages yet.</div>';return;}list.innerHTML=entries.map(t=>'<div class=thread-item'+(t.thread_key===activeThread?' active':'')+' data-thread=\"'+escapeHtml(t.thread_key)+'\"><b>'+escapeHtml(t.label)+'</b><small>'+t.messages.length+' message(s)</small></div>').join('');list.querySelectorAll('.thread-item').forEach(el=>el.addEventListener('click',()=>{activeThread=el.dataset.thread;renderThreads();renderThreadView();}));}"
     "function renderThreadView(){let view=document.querySelector('.thread-view');let thread=cachedThreads[activeThread]||Object.values(cachedThreads)[0];if(!thread){view.innerHTML='<div class=muted>No messages yet.</div>';return;}view.innerHTML='<h4>'+escapeHtml(thread.label)+'</h4>'+thread.messages.map(x=>'<div class=bubble><div class=meta>'+escapeHtml(x.direction)+' #'+x.id+' | '+escapeHtml(x.type)+' | '+escapeHtml(x.priority)+' | '+escapeHtml(x.thread_key)+' | Status: '+escapeHtml(x.status||'UNKNOWN')+'</div><div><b>From:</b> '+escapeHtml(x.source)+'<br><b>To:</b> '+escapeHtml(x.destination)+'<br><b>Payload:</b> '+escapeHtml(x.payload)+'</div><div class=location><b>Location:</b> '+escapeHtml(locText(x))+'</div>'+((x.thread_key==='ANNOUNCEMENTS')?'<div class=location><b>Sender:</b> '+escapeHtml(x.source)+'</div>':'')+'</div>').join('');}"
+    "const strings={en:{scope:'Message scope',announcement:'Announcement (all nodes)',direct:'Direct message (specific node)',messages:'Messages',health:'Mesh Health',portal:'Portal',send:'Queue / Transmit Message',toggle:'Tagalog'},tl:{scope:'Layunin ng mensahe',announcement:'Anunsyo (lahat ng node)',direct:'Direktang mensahe (tiyak na node)',messages:'Mga Mensahe',health:'Kalagayan ng Mesh',portal:'Portal',send:'Ipadala ang Mensahe',toggle:'English'}};let lang='en';function applyLang(){let s=strings[lang];document.querySelector('legend').textContent=s.scope;document.querySelectorAll('label')[2].childNodes[1].textContent=' '+s.announcement;document.querySelectorAll('label')[3].childNodes[1].textContent=' '+s.direct;document.querySelectorAll('section.card h3')[1].textContent=s.messages;document.querySelectorAll('section.card h3')[2].textContent=s.health;document.querySelectorAll('section.card h3')[3].textContent=s.portal;document.querySelector('button[type=submit]').textContent=s.send;langBtn.textContent=s.toggle;}langBtn.addEventListener('click',()=>{lang=lang==='en'?'tl':'en';applyLang();});applyLang();"
     "async function load(){let s=await fetch('/api/status').then(r=>r.json());"
     "document.getElementById('status').innerHTML='Node <b>'+s.node+'</b> | '+s.name+' | '+s.location+' | Relay <b>'+s.relay+'</b> | AP <b>'+s.ssid+'</b> | Clients <b>'+s.clients+'</b>';"
     "let m=await fetch('/api/messages').then(r=>r.json());cachedThreads={};let peers={};m.forEach(x=>{let key=x.thread_key||'UNKNOWN';if(!cachedThreads[key])cachedThreads[key]={thread_key:key,label:key==='ANNOUNCEMENTS'?'Announcements':key,messages:[],lastSeen:0};cachedThreads[key].messages.push(x);cachedThreads[key].lastSeen=Math.max(cachedThreads[key].lastSeen,x.id||0);if(key==='ANNOUNCEMENTS')cachedThreads[key].label='Announcements';else if(!cachedThreads[key].label||cachedThreads[key].label===key)cachedThreads[key].label=key;if(x.source){let p=peers[x.source]||{id:x.source,lastSeen:0,location:''};p.lastSeen=Math.max(p.lastSeen,x.id||0);p.location=locText(x);peers[x.source]=p;}});if(!cachedThreads[activeThread]&&Object.keys(cachedThreads).length){activeThread=Object.keys(cachedThreads)[0];}renderThreads();renderThreadView();let health=document.getElementById('health');let roster=Object.values(peers).sort((a,b)=>b.lastSeen-a.lastSeen);health.innerHTML=roster.length?roster.map(p=>'<div class=msg><b>'+escapeHtml(p.id)+'</b><br><span class=muted>Last seen #'+p.lastSeen+'</span><br>'+escapeHtml(p.location||'Unknown')+'</div>').join(''):'No peers yet.';}"
@@ -1151,6 +1153,9 @@ static void lora_rx_task(void *parameter)
                                 remember_packet(synced_packet.source, synced_packet.id);
                                 store_received_packet(parsed.payload, &synced_packet, rssi, snr);
                             }
+                            if (is_for_me && strcmp(parsed.source, node_id) != 0) {
+                                duplicate_node_id_warning = true;
+                            }
                             continue;
                         }
 
@@ -1163,6 +1168,9 @@ static void lora_rx_task(void *parameter)
                         }
 
                         if (is_ack && is_for_me) {
+                            if (strcmp(parsed.source, node_id) != 0) {
+                                duplicate_node_id_warning = true;
+                            }
                             uint32_t ack_id = ack_id_from_payload(parsed.payload);
                             if (ack_id != 0) {
                                 update_message_status(ack_id, node_id, "ACKED");
@@ -2105,7 +2113,7 @@ static esp_err_t sync_handler(httpd_req_t *request)
 static esp_err_t status_handler(httpd_req_t *request)
 {
     wifi_sta_list_t clients = {0};
-    char response[384];
+    char response[512];
     char escaped_node[FIELD_LEN * 2];
     char escaped_name[FIELD_LEN * 2];
     char escaped_location[FIELD_LEN * 2];
@@ -2130,7 +2138,7 @@ static esp_err_t status_handler(httpd_req_t *request)
     json_escape_string(escaped_relay, sizeof(escaped_relay), "true");
 
     snprintf(response, sizeof(response),
-             "{\"node\":\"%s\",\"name\":\"%s\",\"location\":\"%s\",\"ssid\":\"%s\",\"clients\":%u,\"messages\":%u,\"configured\":%s,\"relay\":\"%s\"}",
+             "{\"node\":\"%s\",\"name\":\"%s\",\"location\":\"%s\",\"ssid\":\"%s\",\"clients\":%u,\"messages\":%u,\"configured\":%s,\"relay\":\"%s\",\"duplicate_warning\":%s}",
              escaped_node,
              escaped_name,
              escaped_location,
@@ -2138,7 +2146,8 @@ static esp_err_t status_handler(httpd_req_t *request)
              clients.num,
              (unsigned int)current_message_count,
              node_config.configured ? "true" : "false",
-             escaped_relay);
+             escaped_relay,
+             duplicate_node_id_warning ? "true" : "false");
 
     httpd_resp_set_type(request, "application/json");
     return httpd_resp_send(request, response, HTTPD_RESP_USE_STRLEN);
