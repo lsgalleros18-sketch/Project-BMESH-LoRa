@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <sys/param.h>
 
 #include "driver/gpio.h"
@@ -138,6 +139,7 @@ typedef struct {
     location_info_t origin_location;   // decoded from LOC= at store time
     char thread_key[FIELD_LEN];        // NEW — "ANNOUNCEMENTS" or the peer node_id
     char status[FIELD_LEN];
+    uint32_t stored_epoch;
 } emergency_message_t;
 
 typedef struct {
@@ -157,6 +159,11 @@ static void update_message_status(uint32_t id, const char *source, const char *s
 static bool lora_channel_clear(void);
 static void retry_tracker_add(const emergency_message_t *message);
 static void retry_tracker_task(void *parameter);
+static void time_sync_task(void *parameter);
+static uint32_t current_epoch_seconds(void);
+static void apply_time_sync(uint32_t epoch, uint8_t distance);
+static void send_time_sync_packet(uint32_t epoch, uint8_t distance, uint8_t hops);
+static void broadcast_time_sync_if_synced(void);
 
 typedef struct {
     uint32_t id;
@@ -203,6 +210,10 @@ static size_t seen_packet_count;
 static uint32_t packet_counter;
 static uint32_t highest_seen_id;
 static TickType_t last_send_tick;
+static int64_t epoch_offset_sec;
+static bool time_synced;
+static uint8_t time_sync_distance;
+static TickType_t last_time_sync_broadcast_tick;
 static httpd_handle_t http_server;
 static spi_device_handle_t lora_spi;
 static rmt_channel_handle_t rgb_led_channel;
@@ -331,6 +342,7 @@ static const char INDEX_HTML[] =
     "<section class=card><h3>Messages</h3><div class=messenger><div class=thread-list><div class=muted>Loading threads...</div></div><div class=thread-view><div class=muted>Loading messages...</div></div></div></section>"
     "<section class=card><h3>Mesh Health</h3><div id=health class=muted>Loading node roster...</div></section>"
     "<section class=card><h3>Portal</h3><p class=muted id=warningBox></p><p class=muted>Connect to this Wi-Fi when offline, then open http://192.168.4.1. Android/iOS captive checks are redirected here automatically.</p>"
+    "<form method=post action=/settime><label>Set time<input name=epoch id=epochInput readonly></label><button type=submit>Sync Clock</button></form>"
     "<form method=post action=/sync><button type=submit>Sync Messages from Mesh</button></form>"
     "<form method=post action=/reset onsubmit='return confirm(\"Factory reset this node and run setup again?\")'><button type=submit>Factory Reset Node</button></form></section>"
     "</main><script>"
@@ -342,10 +354,13 @@ static const char INDEX_HTML[] =
     "function escapeHtml(v){return String(v).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('\"','&quot;');}"
     "function locText(x){return [x.location?.sitio||'',x.location?.barangay||'',x.location?.municipality||''].filter(Boolean).join(' \xE2\x86\x92 ');}"
     "function renderThreads(){let list=document.querySelector('.thread-list');let entries=Object.values(cachedThreads).sort((a,b)=>{if(a.thread_key==='ANNOUNCEMENTS')return -1;if(b.thread_key==='ANNOUNCEMENTS')return 1;return (b.lastSeen||0)-(a.lastSeen||0);});if(!entries.length){list.innerHTML='<div class=muted>No messages yet.</div>';return;}list.innerHTML=entries.map(t=>'<div class=thread-item'+(t.thread_key===activeThread?' active':'')+' data-thread=\"'+escapeHtml(t.thread_key)+'\"><b>'+escapeHtml(t.label)+'</b><small>'+t.messages.length+' message(s)</small></div>').join('');list.querySelectorAll('.thread-item').forEach(el=>el.addEventListener('click',()=>{activeThread=el.dataset.thread;renderThreads();renderThreadView();}));}"
-    "function renderThreadView(){let view=document.querySelector('.thread-view');let thread=cachedThreads[activeThread]||Object.values(cachedThreads)[0];if(!thread){view.innerHTML='<div class=muted>No messages yet.</div>';return;}view.innerHTML='<h4>'+escapeHtml(thread.label)+'</h4>'+thread.messages.map(x=>'<div class=bubble><div class=meta>'+escapeHtml(x.direction)+' #'+x.id+' | '+escapeHtml(x.type)+' | '+escapeHtml(x.priority)+' | '+escapeHtml(x.thread_key)+' | Status: '+escapeHtml(x.status||'UNKNOWN')+'</div><div><b>From:</b> '+escapeHtml(x.source)+'<br><b>To:</b> '+escapeHtml(x.destination)+'<br><b>Payload:</b> '+escapeHtml(x.payload)+'</div><div class=location><b>Location:</b> '+escapeHtml(locText(x))+'</div>'+((x.thread_key==='ANNOUNCEMENTS')?'<div class=location><b>Sender:</b> '+escapeHtml(x.source)+'</div>':'')+'</div>').join('');}"
+    "function fmtEpoch(e){return e?new Date(e*1000).toLocaleString():'time unknown';}"
+    "function renderThreadView(){let view=document.querySelector('.thread-view');let thread=cachedThreads[activeThread]||Object.values(cachedThreads)[0];if(!thread){view.innerHTML='<div class=muted>No messages yet.</div>';return;}view.innerHTML='<h4>'+escapeHtml(thread.label)+'</h4>'+thread.messages.map(x=>'<div class=bubble><div class=meta>'+escapeHtml(x.direction)+' #'+x.id+' | '+escapeHtml(x.type)+' | '+escapeHtml(x.priority)+' | '+escapeHtml(x.thread_key)+' | Status: '+escapeHtml(x.status||'UNKNOWN')+' | '+escapeHtml(fmtEpoch(x.stored_epoch))+'</div><div><b>From:</b> '+escapeHtml(x.source)+'<br><b>To:</b> '+escapeHtml(x.destination)+'<br><b>Payload:</b> '+escapeHtml(x.payload)+'</div><div class=location><b>Location:</b> '+escapeHtml(locText(x))+'</div>'+((x.thread_key==='ANNOUNCEMENTS')?'<div class=location><b>Sender:</b> '+escapeHtml(x.source)+'</div>':'')+'</div>').join('');}"
     "const strings={en:{scope:'Message scope',announcement:'Announcement (all nodes)',direct:'Direct message (specific node)',messages:'Messages',health:'Mesh Health',portal:'Portal',send:'Queue / Transmit Message',toggle:'Tagalog'},tl:{scope:'Layunin ng mensahe',announcement:'Anunsyo (lahat ng node)',direct:'Direktang mensahe (tiyak na node)',messages:'Mga Mensahe',health:'Kalagayan ng Mesh',portal:'Portal',send:'Ipadala ang Mensahe',toggle:'English'}};let lang='en';function applyLang(){let s=strings[lang];document.querySelector('legend').textContent=s.scope;document.querySelectorAll('label')[2].childNodes[1].textContent=' '+s.announcement;document.querySelectorAll('label')[3].childNodes[1].textContent=' '+s.direct;document.querySelectorAll('section.card h3')[1].textContent=s.messages;document.querySelectorAll('section.card h3')[2].textContent=s.health;document.querySelectorAll('section.card h3')[3].textContent=s.portal;document.querySelector('button[type=submit]').textContent=s.send;langBtn.textContent=s.toggle;}langBtn.addEventListener('click',()=>{lang=lang==='en'?'tl':'en';applyLang();});applyLang();"
+    "document.getElementById('epochInput').value=Math.floor(Date.now()/1000);"
     "async function load(){let s=await fetch('/api/status').then(r=>r.json());"
-    "document.getElementById('status').innerHTML='Node <b>'+s.node+'</b> | '+s.name+' | '+s.location+' | Relay <b>'+s.relay+'</b> | AP <b>'+s.ssid+'</b> | Clients <b>'+s.clients+'</b>';"
+    "document.getElementById('status').innerHTML='Node <b>'+s.node+'</b> | '+s.name+' | '+s.location+' | Relay <b>'+s.relay+'</b> | AP <b>'+s.ssid+'</b> | Clients <b>'+s.clients+'</b> | Time <b>'+(s.time_synced?(new Date(s.epoch*1000).toLocaleString()):'unknown')+'</b>';"
+    "document.getElementById('warningBox').textContent=s.duplicate_warning?'Possible duplicate node ID on the mesh':'';"
     "let m=await fetch('/api/messages').then(r=>r.json());cachedThreads={};let peers={};m.forEach(x=>{let key=x.thread_key||'UNKNOWN';if(!cachedThreads[key])cachedThreads[key]={thread_key:key,label:key==='ANNOUNCEMENTS'?'Announcements':key,messages:[],lastSeen:0};cachedThreads[key].messages.push(x);cachedThreads[key].lastSeen=Math.max(cachedThreads[key].lastSeen,x.id||0);if(key==='ANNOUNCEMENTS')cachedThreads[key].label='Announcements';else if(!cachedThreads[key].label||cachedThreads[key].label===key)cachedThreads[key].label=key;if(x.source){let p=peers[x.source]||{id:x.source,lastSeen:0,location:''};p.lastSeen=Math.max(p.lastSeen,x.id||0);p.location=locText(x);peers[x.source]=p;}});if(!cachedThreads[activeThread]&&Object.keys(cachedThreads).length){activeThread=Object.keys(cachedThreads)[0];}renderThreads();renderThreadView();let health=document.getElementById('health');let roster=Object.values(peers).sort((a,b)=>b.lastSeen-a.lastSeen);health.innerHTML=roster.length?roster.map(p=>'<div class=msg><b>'+escapeHtml(p.id)+'</b><br><span class=muted>Last seen #'+p.lastSeen+'</span><br>'+escapeHtml(p.location||'Unknown')+'</div>').join(''):'No peers yet.';}"
     "load();setInterval(load,4000);</script></body></html>";
 
@@ -899,7 +914,76 @@ static uint32_t ack_id_from_payload(const char *payload)
 
 static bool is_control_packet_type(const char *type)
 {
-    return strcmp(type, "ACK") == 0 || strcmp(type, "SYNC_REQ") == 0 || strcmp(type, "SYNC_RESP") == 0;
+    return strcmp(type, "ACK") == 0 || strcmp(type, "SYNC_REQ") == 0 || strcmp(type, "SYNC_RESP") == 0 || strcmp(type, "TIME_SYNC") == 0;
+}
+
+static uint32_t current_epoch_seconds(void)
+{
+    return (uint32_t)(epoch_offset_sec + (int64_t)(xTaskGetTickCount() / configTICK_RATE_HZ));
+}
+
+static void apply_time_sync(uint32_t epoch, uint8_t distance)
+{
+    uint32_t now_ticks = xTaskGetTickCount();
+    uint32_t now_seconds = now_ticks / configTICK_RATE_HZ;
+
+    epoch_offset_sec = (int64_t)epoch - (int64_t)now_seconds;
+    time_synced = true;
+    time_sync_distance = distance;
+    last_time_sync_broadcast_tick = 0;
+}
+
+static uint32_t time_sync_epoch_from_payload(const char *payload)
+{
+    if (strncmp(payload, "epoch=", 6) == 0) {
+        return (uint32_t)strtoul(payload + 6, NULL, 10);
+    }
+    return 0;
+}
+
+static uint8_t time_sync_dist_from_payload(const char *payload)
+{
+    const char *dist_ptr = strstr(payload, "~dist=");
+    if (dist_ptr != NULL) {
+        return (uint8_t)strtoul(dist_ptr + 6, NULL, 10);
+    }
+    return 0;
+}
+
+static void send_time_sync_packet(uint32_t epoch, uint8_t distance, uint8_t hops)
+{
+    char packet[PACKET_LEN];
+    char encoded_location[SITIO_LEN + BARANGAY_LEN + MUNICIPALITY_LEN + 2];
+    uint32_t message_id;
+
+    data_lock();
+    message_id = ++packet_counter;
+    save_packet_counter();
+    data_unlock();
+
+    location_encode(&node_config.location, encoded_location, sizeof(encoded_location));
+
+    snprintf(packet, sizeof(packet), "BEMS|%lu|%.*s|ALL|TIME_SYNC|NORMAL|HOPS=%u|RELAY=1|LOC=%s|epoch=%lu~dist=%u",
+             (unsigned long)message_id,
+             31,
+             node_id,
+             hops,
+             encoded_location,
+             (unsigned long)epoch,
+             distance);
+    lora_transmit(packet);
+}
+
+static void broadcast_time_sync_if_synced(void)
+{
+    if (!time_synced) {
+        return;
+    }
+
+    if ((xTaskGetTickCount() - last_time_sync_broadcast_tick) >= pdMS_TO_TICKS(15 * 60 * 1000)) {
+        send_time_sync_packet(current_epoch_seconds(), time_sync_distance, 2);
+        last_time_sync_broadcast_tick = xTaskGetTickCount();
+    }
 }
 
 static bool is_private_destination_for_other_node(const char *destination, const char *requester)
@@ -1038,6 +1122,7 @@ static void store_received_packet(const char *packet, const mesh_packet_t *parse
         copy_field(message->thread_key, sizeof(message->thread_key), "UNKNOWN");
     }
     copy_field(message->status, sizeof(message->status), parsed->valid ? "RECEIVED" : "RECEIVED");
+    message->stored_epoch = time_synced ? current_epoch_seconds() : 0;
     snprintf(message->packet, sizeof(message->packet), "RSSI=%d SNR=%d | %.*s", rssi, snr, 250, packet);
     if (parsed->valid && !is_control_packet_type(parsed->type)) {
         update_highest_seen_id(message->id);
@@ -1155,6 +1240,16 @@ static void lora_rx_task(void *parameter)
                             }
                             if (is_for_me && strcmp(parsed.source, node_id) != 0) {
                                 duplicate_node_id_warning = true;
+                            }
+                            continue;
+                        }
+
+                        if (strcmp(parsed.type, "TIME_SYNC") == 0) {
+                            uint32_t epoch = time_sync_epoch_from_payload(parsed.payload);
+                            uint8_t dist = time_sync_dist_from_payload(parsed.payload);
+
+                            if ((epoch != 0) && (!time_synced || dist < time_sync_distance)) {
+                                apply_time_sync(epoch, dist);
                             }
                             continue;
                         }
@@ -1426,6 +1521,14 @@ static void retry_tracker_task(void *parameter)
         }
         data_unlock();
         vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
+static void time_sync_task(void *parameter)
+{
+    while (true) {
+        broadcast_time_sync_if_synced();
+        vTaskDelay(pdMS_TO_TICKS(30000));
     }
 }
 
@@ -1875,6 +1978,7 @@ static void queue_message(const char *destination, const char *type, const char 
     copy_field(message->priority, sizeof(message->priority), priority);
     copy_field(message->payload, sizeof(message->payload), payload);
     copy_field(message->status, sizeof(message->status), "PENDING");
+    message->stored_epoch = time_synced ? current_epoch_seconds() : 0;
     build_packet(message);
     compute_thread_key(message->thread_key, sizeof(message->thread_key), message->source, message->destination);
     message->origin_location = node_config.location;
@@ -2026,6 +2130,38 @@ static esp_err_t setup_handler(httpd_req_t *request)
     return ESP_OK;
 }
 
+static esp_err_t settime_handler(httpd_req_t *request)
+{
+    char body[128] = {0};
+    char epoch_value[FIELD_LEN] = {0};
+    uint32_t epoch = 0;
+    int received = 0;
+    esp_err_t session_result = require_session(request);
+
+    if (session_result != ESP_OK) {
+        return session_result;
+    }
+
+    while (received < request->content_len && received < (int)sizeof(body) - 1) {
+        int ret = httpd_req_recv(request, body + received, MIN(request->content_len - received, (int)sizeof(body) - 1 - received));
+        if (ret <= 0) {
+            return ESP_FAIL;
+        }
+        received += ret;
+    }
+
+    form_value(body, "epoch", epoch_value, sizeof(epoch_value));
+    epoch = (uint32_t)strtoul(epoch_value, NULL, 10);
+    if (epoch == 0) {
+        httpd_resp_set_status(request, "400 Bad Request");
+        return httpd_resp_send(request, "Invalid epoch", HTTPD_RESP_USE_STRLEN);
+    }
+
+    apply_time_sync(epoch, 0);
+    send_time_sync_packet(epoch, 0, 2);
+    return send_redirect(request, "/");
+}
+
 static esp_err_t reset_handler(httpd_req_t *request)
 {
     esp_err_t session_result = require_session(request);
@@ -2138,7 +2274,7 @@ static esp_err_t status_handler(httpd_req_t *request)
     json_escape_string(escaped_relay, sizeof(escaped_relay), "true");
 
     snprintf(response, sizeof(response),
-             "{\"node\":\"%s\",\"name\":\"%s\",\"location\":\"%s\",\"ssid\":\"%s\",\"clients\":%u,\"messages\":%u,\"configured\":%s,\"relay\":\"%s\",\"duplicate_warning\":%s}",
+             "{\"node\":\"%s\",\"name\":\"%s\",\"location\":\"%s\",\"ssid\":\"%s\",\"clients\":%u,\"messages\":%u,\"configured\":%s,\"relay\":\"%s\",\"duplicate_warning\":%s,\"time_synced\":%s,\"epoch\":%lu}",
              escaped_node,
              escaped_name,
              escaped_location,
@@ -2147,7 +2283,9 @@ static esp_err_t status_handler(httpd_req_t *request)
              (unsigned int)current_message_count,
              node_config.configured ? "true" : "false",
              escaped_relay,
-             duplicate_node_id_warning ? "true" : "false");
+             duplicate_node_id_warning ? "true" : "false",
+             time_synced ? "true" : "false",
+             (unsigned long)current_epoch_seconds());
 
     httpd_resp_set_type(request, "application/json");
     return httpd_resp_send(request, response, HTTPD_RESP_USE_STRLEN);
@@ -2195,7 +2333,7 @@ static esp_err_t messages_handler(httpd_req_t *request)
         json_escape_string(escaped_barangay, sizeof(escaped_barangay), message->origin_location.barangay);
         json_escape_string(escaped_municipality, sizeof(escaped_municipality), message->origin_location.municipality);
         offset += snprintf(response + offset, sizeof(response) - offset,
-                           "%s{\"id\":%lu,\"direction\":\"%s\",\"source\":\"%s\",\"destination\":\"%s\",\"type\":\"%s\",\"priority\":\"%s\",\"payload\":\"%s\",\"packet\":\"%s\",\"thread_key\":\"%s\",\"status\":\"%s\",\"location\":{\"sitio\":\"%s\",\"barangay\":\"%s\",\"municipality\":\"%s\"}}",
+                           "%s{\"id\":%lu,\"direction\":\"%s\",\"source\":\"%s\",\"destination\":\"%s\",\"type\":\"%s\",\"priority\":\"%s\",\"payload\":\"%s\",\"packet\":\"%s\",\"thread_key\":\"%s\",\"status\":\"%s\",\"stored_epoch\":%lu,\"location\":{\"sitio\":\"%s\",\"barangay\":\"%s\",\"municipality\":\"%s\"}}",
                            i == 0 ? "" : ",",
                            (unsigned long)message->id,
                            escaped_direction,
@@ -2207,6 +2345,7 @@ static esp_err_t messages_handler(httpd_req_t *request)
                            escaped_packet,
                            escaped_thread_key,
                            escaped_status,
+                           (unsigned long)message->stored_epoch,
                            escaped_sitio,
                            escaped_barangay,
                            escaped_municipality);
@@ -2236,6 +2375,7 @@ static void start_http_server(void)
         {.uri = "/login", .method = HTTP_POST, .handler = login_handler},
         {.uri = "/setup", .method = HTTP_POST, .handler = setup_handler},
         {.uri = "/reset", .method = HTTP_POST, .handler = reset_handler},
+        {.uri = "/settime", .method = HTTP_POST, .handler = settime_handler},
         {.uri = "/send", .method = HTTP_POST, .handler = send_handler},
         {.uri = "/sync", .method = HTTP_POST, .handler = sync_handler},
         {.uri = "/api/status", .method = HTTP_GET, .handler = status_handler},
@@ -2386,6 +2526,7 @@ void app_main(void)
     xTaskCreate(boot_sync_task, "boot_sync_task", 4096, NULL, 4, NULL);
     xTaskCreate(lora_rx_task, "lora_rx_task", 4096, NULL, 6, NULL);
     xTaskCreate(retry_tracker_task, "retry_tracker_task", 4096, NULL, 3, NULL);
+    xTaskCreate(time_sync_task, "time_sync_task", 3072, NULL, 2, NULL);
     start_wifi_ap();
     start_http_server();
     xTaskCreate(factory_reset_button_task, "factory_reset_button_task", 3072, NULL, 7, NULL);
