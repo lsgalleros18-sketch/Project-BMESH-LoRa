@@ -140,7 +140,6 @@ typedef struct {
     char node_id[FIELD_LEN];
     char node_name[FIELD_LEN];
     location_info_t location;          // was: char location[FIELD_LEN]
-    bool relay_enabled;
     char default_destination[FIELD_LEN];
     char web_pin[FIELD_LEN];
     char network_key[FIELD_LEN];
@@ -323,11 +322,12 @@ static const char SETUP_HTML[] =
     "<main class=wrap><section class=card><form method=post action=/setup>"
     "<label>Node ID<input name=node_id maxlength=31 placeholder='Example: BRGY001, HH023, RELAY04' required></label>"
     "<label>Node Name<input name=node_name maxlength=31 placeholder='Example: Barangay Hall or House 23' required></label>"
-    "<label>Location<input name=location maxlength=31 placeholder='Example: Purok 3, Chapel Roof' required></label>"
+    "<label>Sitio / Landmark<input name=sitio maxlength=23 placeholder='Example: Purok 3, Chapel Roof'></label>"
+    "<label>Barangay<input name=barangay maxlength=23 placeholder='Example: San Isidro' required></label>"
+    "<label>Municipality<input name=municipality maxlength=23 placeholder='Example: Cabuyao'></label>"
     "<label>Default Destination<input name=default_destination maxlength=31 value='BRGY001' placeholder='Example: ALL or BRGY001'></label>"
     "<label>Web PIN<input name=web_pin maxlength=31 value='1234' placeholder='Shared portal PIN' required></label>"
     "<label>Network Key<input name=network_key maxlength=31 value='CHANGEME1234567' placeholder='Shared mesh encryption key' required></label>"
-    "<label><input name=relay_enabled type=checkbox value=1 checked> Relay messages for the mesh</label>"
     "<button type=submit>Save Setup and Reboot</button></form>"
     "<p class=muted>Factory reset later by holding BOOT for 10 seconds during startup.</p></section></main></body></html>";
 
@@ -806,7 +806,7 @@ static void send_ack_packet(const mesh_packet_t *parsed)
              node_id,
              31,
              parsed->source,
-             node_config.relay_enabled ? 1 : 0,
+             1,
              encoded_location,
              (unsigned long)parsed->id);
 
@@ -1078,7 +1078,7 @@ static void lora_rx_task(void *parameter)
                             send_ack_packet(&parsed);
                         }
 
-                        if (node_config.relay_enabled && parsed.hops > 0 && !is_for_me) {
+                        if (parsed.hops > 0 && !is_for_me) {
                             char forward_packet[PACKET_LEN];
                             build_forward_packet(&parsed, forward_packet, sizeof(forward_packet));
                             ESP_LOGI(TAG, "Relaying packet toward %s with %d hops left", parsed.destination, parsed.hops - 1);
@@ -1365,7 +1365,6 @@ static void update_highest_seen_id(uint32_t id)
 static void config_set_defaults(void)
 {
     node_config.configured = false;
-    node_config.relay_enabled = true;
     copy_field(node_config.node_id, sizeof(node_config.node_id), node_id);
     copy_field(node_config.node_name, sizeof(node_config.node_name), "Unconfigured Node");
     copy_field(node_config.location.sitio, sizeof(node_config.location.sitio), "");
@@ -1390,7 +1389,6 @@ static void load_node_config(void)
 {
     nvs_handle_t handle;
     uint8_t configured = 0;
-    uint8_t relay_enabled = 1;
     bool migrated_location = false;
     char legacy_location[FIELD_LEN] = {0};
 
@@ -1402,7 +1400,6 @@ static void load_node_config(void)
     }
 
     nvs_get_u8(handle, "configured", &configured);
-    nvs_get_u8(handle, "relay", &relay_enabled);
     nvs_get_string_or_default(handle, "node_id", node_config.node_id, sizeof(node_config.node_id), node_id);
     nvs_get_string_or_default(handle, "node_name", node_config.node_name, sizeof(node_config.node_name), "Mesh Node");
     nvs_get_string_or_default(handle, "default_dest", node_config.default_destination, sizeof(node_config.default_destination), "BRGY001");
@@ -1427,7 +1424,6 @@ static void load_node_config(void)
     nvs_close(handle);
 
     node_config.configured = configured == 1;
-    node_config.relay_enabled = relay_enabled == 1;
     apply_config_identity();
 
     if (migrated_location) {
@@ -1455,9 +1451,6 @@ static esp_err_t save_node_config(const node_config_t *config)
     }
 
     result = nvs_set_u8(handle, "configured", config->configured ? 1 : 0);
-    if (result == ESP_OK) {
-        result = nvs_set_u8(handle, "relay", config->relay_enabled ? 1 : 0);
-    }
     if (result == ESP_OK) {
         result = nvs_set_str(handle, "node_id", config->node_id);
     }
@@ -1660,7 +1653,7 @@ static void build_packet(emergency_message_t *message)
              31,
              message->priority,
              hops_for_priority(message->priority),
-             node_config.relay_enabled ? 1 : 0,
+             1,
              31,
              node_config.location.barangay,
              120,
@@ -1791,13 +1784,13 @@ static esp_err_t setup_handler(httpd_req_t *request)
     form_value(body, "node_id", raw_node_id, sizeof(raw_node_id));
     copy_node_id(new_config.node_id, sizeof(new_config.node_id), raw_node_id);
     form_value(body, "node_name", new_config.node_name, sizeof(new_config.node_name));
-    form_value(body, "location", new_config.location.barangay, sizeof(new_config.location.barangay));
+    form_value(body, "sitio", new_config.location.sitio, sizeof(new_config.location.sitio));
+    form_value(body, "barangay", new_config.location.barangay, sizeof(new_config.location.barangay));
+    form_value(body, "municipality", new_config.location.municipality, sizeof(new_config.location.municipality));
     form_value(body, "default_destination", new_config.default_destination, sizeof(new_config.default_destination));
     form_value(body, "web_pin", new_config.web_pin, sizeof(new_config.web_pin));
     form_value(body, "network_key", new_config.network_key, sizeof(new_config.network_key));
     new_config.configured = true;
-    new_config.relay_enabled = strstr(body, "relay_enabled=1") != NULL;
-
     if (new_config.node_id[0] == '\0') {
         copy_field(new_config.node_id, sizeof(new_config.node_id), node_id);
     }
@@ -1909,7 +1902,7 @@ static esp_err_t status_handler(httpd_req_t *request)
     json_escape_string(escaped_name, sizeof(escaped_name), node_config.node_name);
     json_escape_string(escaped_location, sizeof(escaped_location), node_config.location.barangay);
     json_escape_string(escaped_ssid, sizeof(escaped_ssid), ap_ssid);
-    json_escape_string(escaped_relay, sizeof(escaped_relay), node_config.relay_enabled ? "true" : "false");
+    json_escape_string(escaped_relay, sizeof(escaped_relay), "true");
 
     snprintf(response, sizeof(response),
              "{\"node\":\"%s\",\"name\":\"%s\",\"location\":\"%s\",\"ssid\":\"%s\",\"clients\":%u,\"messages\":%u,\"configured\":%s,\"relay\":\"%s\"}",
