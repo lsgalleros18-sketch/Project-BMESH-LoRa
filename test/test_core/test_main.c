@@ -32,6 +32,7 @@ typedef struct {
     char relay[FIELD_LEN];
     char location_raw[PACKET_LEN];
     location_info_t location;
+    char thread_key[FIELD_LEN];
     char payload[PAYLOAD_LEN];
 } mesh_packet_t;
 
@@ -107,6 +108,20 @@ static void location_decode(const char *encoded, location_info_t *loc)
     copy_field(loc->municipality, sizeof(loc->municipality), second_sep + 1);
 }
 
+static void compute_thread_key(char *out, size_t out_size, const char *source, const char *destination)
+{
+    if (out_size == 0) {
+        return;
+    }
+
+    if (strcmp(destination, "ALL") == 0) {
+        copy_field(out, out_size, "ANNOUNCEMENTS");
+        return;
+    }
+
+    copy_field(out, out_size, source);
+}
+
 static bool parse_mesh_packet(const char *packet, mesh_packet_t *parsed)
 {
     char packet_copy[PACKET_LEN];
@@ -144,7 +159,7 @@ static bool parse_mesh_packet(const char *packet, mesh_packet_t *parsed)
     copy_field(parsed->relay, sizeof(parsed->relay), fields[7]);
     copy_field(parsed->location_raw, sizeof(parsed->location_raw), fields[8]);
     location_decode(fields[8], &parsed->location);
-    copy_field(parsed->location, sizeof(parsed->location), fields[8]);
+    compute_thread_key(parsed->thread_key, sizeof(parsed->thread_key), parsed->source, parsed->destination);
     copy_field(parsed->payload, sizeof(parsed->payload), fields[9]);
     return true;
 }
@@ -288,7 +303,16 @@ static void test_parse_mesh_packet_valid_packet(void)
     TEST_ASSERT_EQUAL_STRING("Purok 3", parsed.location.sitio);
     TEST_ASSERT_EQUAL_STRING("San Isidro", parsed.location.barangay);
     TEST_ASSERT_EQUAL_STRING("Cabuyao", parsed.location.municipality);
+    TEST_ASSERT_EQUAL_STRING("ANNOUNCEMENTS", parsed.thread_key);
     TEST_ASSERT_EQUAL_STRING("Water rising", parsed.payload);
+}
+
+static void test_parse_mesh_packet_sets_thread_key_for_direct_messages(void)
+{
+    mesh_packet_t parsed;
+
+    TEST_ASSERT_TRUE(parse_mesh_packet("BEMS|43|NODE01|NODE99|FLOOD|HIGH|HOPS=5|RELAY=1|LOC=Purok 3~San Isidro~Cabuyao|Water rising", &parsed));
+    TEST_ASSERT_EQUAL_STRING("NODE01", parsed.thread_key);
 }
 
 static void test_parse_mesh_packet_rejects_bad_prefix(void)
@@ -371,6 +395,7 @@ int main(void)
     RUN_TEST(test_form_value_extracts_and_decodes_field);
     RUN_TEST(test_location_encode_round_trips);
     RUN_TEST(test_location_decode_falls_back_to_barangay);
+    RUN_TEST(test_parse_mesh_packet_sets_thread_key_for_direct_messages);
     RUN_TEST(test_packet_seen_uses_source_and_id);
     RUN_TEST(test_packet_seen_expires_after_ttl);
     return UNITY_END();

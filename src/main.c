@@ -147,6 +147,7 @@ typedef struct {
 
 static void location_encode(const location_info_t *loc, char *out, size_t out_size);
 static void location_decode(const char *encoded, location_info_t *loc);
+static void compute_thread_key(char *out, size_t out_size, const char *source, const char *destination);
 
 typedef struct {
     uint32_t id;
@@ -964,6 +965,12 @@ static void store_received_packet(const char *packet, const mesh_packet_t *parse
     copy_field(message->type, sizeof(message->type), parsed->valid ? parsed->type : "RECEIVED");
     copy_field(message->priority, sizeof(message->priority), parsed->valid ? parsed->priority : "NORMAL");
     copy_field(message->payload, sizeof(message->payload), parsed->valid ? parsed->payload : packet);
+    if (parsed->valid) {
+        message->origin_location = parsed->location;
+        compute_thread_key(message->thread_key, sizeof(message->thread_key), parsed->source, parsed->destination);
+    } else {
+        copy_field(message->thread_key, sizeof(message->thread_key), "UNKNOWN");
+    }
     snprintf(message->packet, sizeof(message->packet), "RSSI=%d SNR=%d | %.*s", rssi, snr, 250, packet);
     if (parsed->valid && !is_control_packet_type(parsed->type)) {
         update_highest_seen_id(message->id);
@@ -1248,6 +1255,20 @@ static void location_decode(const char *encoded, location_info_t *loc)
     *second_sep = '\0';
     copy_field(loc->barangay, sizeof(loc->barangay), first_sep + 1);
     copy_field(loc->municipality, sizeof(loc->municipality), second_sep + 1);
+}
+
+static void compute_thread_key(char *out, size_t out_size, const char *source, const char *destination)
+{
+    if (out_size == 0) {
+        return;
+    }
+
+    if (strcmp(destination, "ALL") == 0) {
+        copy_field(out, out_size, "ANNOUNCEMENTS");
+        return;
+    }
+
+    copy_field(out, out_size, source);
 }
 
 static void copy_node_id(char *destination, size_t destination_size, const char *source)
@@ -1649,22 +1670,36 @@ static int hops_for_priority(const char *priority)
 
 static void build_packet(emergency_message_t *message)
 {
-    snprintf(message->packet, sizeof(message->packet), "BEMS|%lu|%.*s|%.*s|%.*s|%.*s|HOPS=%d|RELAY=%u|LOC=%.*s|%.*s",
-             (unsigned long)message->id,
-             31,
-             node_id,
-             31,
-             message->destination,
-             31,
-             message->type,
-             31,
-             message->priority,
-             hops_for_priority(message->priority),
-             1,
-             31,
-             node_config.location.barangay,
-             120,
-             message->payload);
+    char encoded_location[SITIO_LEN + BARANGAY_LEN + MUNICIPALITY_LEN + 2];
+    size_t offset = 0;
+    int written;
+
+    location_encode(&node_config.location, encoded_location, sizeof(encoded_location));
+
+    written = snprintf(message->packet + offset, sizeof(message->packet) - offset, "BEMS|%lu|%.*s|%.*s|%.*s|%.*s|HOPS=%d|RELAY=%u|LOC=%s|",
+                       (unsigned long)message->id,
+                       31,
+                       node_id,
+                       31,
+                       message->destination,
+                       31,
+                       message->type,
+                       31,
+                       message->priority,
+                       hops_for_priority(message->priority),
+                       1,
+                       encoded_location);
+    if (written < 0 || (size_t)written >= sizeof(message->packet) - offset) {
+        message->packet[0] = '\0';
+        return;
+    }
+    offset += (size_t)written;
+
+    written = snprintf(message->packet + offset, sizeof(message->packet) - offset, "%.*s", 120, message->payload);
+    if (written < 0 || (size_t)written >= sizeof(message->packet) - offset) {
+        message->packet[sizeof(message->packet) - 1] = '\0';
+        return;
+    }
 }
 
 static void queue_message(const char *destination, const char *type, const char *priority, const char *payload)
@@ -1682,6 +1717,8 @@ static void queue_message(const char *destination, const char *type, const char 
     copy_field(message->priority, sizeof(message->priority), priority);
     copy_field(message->payload, sizeof(message->payload), payload);
     build_packet(message);
+    compute_thread_key(message->thread_key, sizeof(message->thread_key), message->source, message->destination);
+    message->origin_location = node_config.location;
     copy_field(packet, sizeof(packet), message->packet);
     save_packet_counter();
     data_unlock();
@@ -1928,7 +1965,8 @@ static esp_err_t status_handler(httpd_req_t *request)
 
 static esp_err_t messages_handler(httpd_req_t *request)
 {
-    char response[1536];
+    // 16 messages at roughly 300 bytes each plus JSON framing fits comfortably here.
+    char response[6144];
     size_t offset = 0;
     esp_err_t session_result = require_session(request);
 
@@ -1941,17 +1979,44 @@ static esp_err_t messages_handler(httpd_req_t *request)
 
     for (size_t i = 0; i < message_count && offset < sizeof(response); i++) {
         emergency_message_t *message = &messages[message_count - 1 - i];
+        char escaped_direction[FIELD_LEN * 2];
+        char escaped_source[FIELD_LEN * 2];
+        char escaped_destination[FIELD_LEN * 2];
+        char escaped_type[FIELD_LEN * 2];
+        char escaped_priority[FIELD_LEN * 2];
+        char escaped_payload[PAYLOAD_LEN * 2];
+        char escaped_packet[PACKET_LEN * 2];
+        char escaped_thread_key[FIELD_LEN * 2];
+        char escaped_sitio[SITIO_LEN * 2];
+        char escaped_barangay[BARANGAY_LEN * 2];
+        char escaped_municipality[MUNICIPALITY_LEN * 2];
+
+        json_escape_string(escaped_direction, sizeof(escaped_direction), message->direction);
+        json_escape_string(escaped_source, sizeof(escaped_source), message->source);
+        json_escape_string(escaped_destination, sizeof(escaped_destination), message->destination);
+        json_escape_string(escaped_type, sizeof(escaped_type), message->type);
+        json_escape_string(escaped_priority, sizeof(escaped_priority), message->priority);
+        json_escape_string(escaped_payload, sizeof(escaped_payload), message->payload);
+        json_escape_string(escaped_packet, sizeof(escaped_packet), message->packet);
+        json_escape_string(escaped_thread_key, sizeof(escaped_thread_key), message->thread_key);
+        json_escape_string(escaped_sitio, sizeof(escaped_sitio), message->origin_location.sitio);
+        json_escape_string(escaped_barangay, sizeof(escaped_barangay), message->origin_location.barangay);
+        json_escape_string(escaped_municipality, sizeof(escaped_municipality), message->origin_location.municipality);
         offset += snprintf(response + offset, sizeof(response) - offset,
-                           "%s{\"id\":%lu,\"direction\":\"%s\",\"source\":\"%s\",\"destination\":\"%s\",\"type\":\"%s\",\"priority\":\"%s\",\"payload\":\"%s\",\"packet\":\"%s\"}",
+                           "%s{\"id\":%lu,\"direction\":\"%s\",\"source\":\"%s\",\"destination\":\"%s\",\"type\":\"%s\",\"priority\":\"%s\",\"payload\":\"%s\",\"packet\":\"%s\",\"thread_key\":\"%s\",\"location\":{\"sitio\":\"%s\",\"barangay\":\"%s\",\"municipality\":\"%s\"}}",
                            i == 0 ? "" : ",",
                            (unsigned long)message->id,
-                           message->direction,
-                           message->source,
-                           message->destination,
-                           message->type,
-                           message->priority,
-                           message->payload,
-                           message->packet);
+                           escaped_direction,
+                           escaped_source,
+                           escaped_destination,
+                           escaped_type,
+                           escaped_priority,
+                           escaped_payload,
+                           escaped_packet,
+                           escaped_thread_key,
+                           escaped_sitio,
+                           escaped_barangay,
+                           escaped_municipality);
     }
 
     snprintf(response + MIN(offset, sizeof(response) - 1), sizeof(response) - MIN(offset, sizeof(response) - 1), "]");
