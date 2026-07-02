@@ -1,4 +1,5 @@
 #include <stdbool.h>
+#include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -6,10 +7,19 @@
 #include <unity.h>
 
 #define FIELD_LEN 32
+#define SITIO_LEN 24
+#define BARANGAY_LEN 24
+#define MUNICIPALITY_LEN 24
 #define PAYLOAD_LEN 160
 #define PACKET_LEN 320
 #define MAX_SEEN_PACKETS 4
 #define SEEN_PACKET_TTL_MS 60000
+
+typedef struct {
+    char sitio[SITIO_LEN];
+    char barangay[BARANGAY_LEN];
+    char municipality[MUNICIPALITY_LEN];
+} location_info_t;
 
 typedef struct {
     bool valid;
@@ -20,7 +30,8 @@ typedef struct {
     char type[FIELD_LEN];
     char priority[FIELD_LEN];
     char relay[FIELD_LEN];
-    char location[FIELD_LEN];
+    char location_raw[PACKET_LEN];
+    location_info_t location;
     char payload[PAYLOAD_LEN];
 } mesh_packet_t;
 
@@ -50,6 +61,50 @@ static void copy_field(char *destination, size_t destination_size, const char *s
     }
 
     destination[write_index] = '\0';
+}
+
+static void location_encode(const location_info_t *loc, char *out, size_t out_size)
+{
+    if (out_size == 0) {
+        return;
+    }
+
+    snprintf(out, out_size, "%.*s~%.*s~%.*s",
+             SITIO_LEN - 1, loc->sitio,
+             BARANGAY_LEN - 1, loc->barangay,
+             MUNICIPALITY_LEN - 1, loc->municipality);
+}
+
+static void location_decode(const char *encoded, location_info_t *loc)
+{
+    char buffer[SITIO_LEN + BARANGAY_LEN + MUNICIPALITY_LEN + 2];
+    char *first_sep;
+    char *second_sep;
+
+    memset(loc, 0, sizeof(*loc));
+    if (encoded == NULL) {
+        return;
+    }
+
+    copy_field(buffer, sizeof(buffer), encoded);
+    first_sep = strchr(buffer, '~');
+    if (first_sep == NULL) {
+        copy_field(loc->barangay, sizeof(loc->barangay), buffer);
+        return;
+    }
+
+    *first_sep = '\0';
+    copy_field(loc->sitio, sizeof(loc->sitio), buffer);
+
+    second_sep = strchr(first_sep + 1, '~');
+    if (second_sep == NULL) {
+        copy_field(loc->barangay, sizeof(loc->barangay), first_sep + 1);
+        return;
+    }
+
+    *second_sep = '\0';
+    copy_field(loc->barangay, sizeof(loc->barangay), first_sep + 1);
+    copy_field(loc->municipality, sizeof(loc->municipality), second_sep + 1);
 }
 
 static bool parse_mesh_packet(const char *packet, mesh_packet_t *parsed)
@@ -87,6 +142,8 @@ static bool parse_mesh_packet(const char *packet, mesh_packet_t *parsed)
     copy_field(parsed->type, sizeof(parsed->type), fields[4]);
     copy_field(parsed->priority, sizeof(parsed->priority), fields[5]);
     copy_field(parsed->relay, sizeof(parsed->relay), fields[7]);
+    copy_field(parsed->location_raw, sizeof(parsed->location_raw), fields[8]);
+    location_decode(fields[8], &parsed->location);
     copy_field(parsed->location, sizeof(parsed->location), fields[8]);
     copy_field(parsed->payload, sizeof(parsed->payload), fields[9]);
     return true;
@@ -218,7 +275,7 @@ static void test_parse_mesh_packet_valid_packet(void)
 {
     mesh_packet_t parsed;
 
-    TEST_ASSERT_TRUE(parse_mesh_packet("BEMS|42|NODE01|ALL|FLOOD|HIGH|HOPS=5|RELAY=1|LOC=HALL|Water rising", &parsed));
+    TEST_ASSERT_TRUE(parse_mesh_packet("BEMS|42|NODE01|ALL|FLOOD|HIGH|HOPS=5|RELAY=1|LOC=Purok 3~San Isidro~Cabuyao|Water rising", &parsed));
     TEST_ASSERT_TRUE(parsed.valid);
     TEST_ASSERT_EQUAL_UINT32(42, parsed.id);
     TEST_ASSERT_EQUAL_INT(5, parsed.hops);
@@ -227,7 +284,10 @@ static void test_parse_mesh_packet_valid_packet(void)
     TEST_ASSERT_EQUAL_STRING("FLOOD", parsed.type);
     TEST_ASSERT_EQUAL_STRING("HIGH", parsed.priority);
     TEST_ASSERT_EQUAL_STRING("RELAY=1", parsed.relay);
-    TEST_ASSERT_EQUAL_STRING("LOC=HALL", parsed.location);
+    TEST_ASSERT_EQUAL_STRING("LOC=Purok 3~San Isidro~Cabuyao", parsed.location_raw);
+    TEST_ASSERT_EQUAL_STRING("Purok 3", parsed.location.sitio);
+    TEST_ASSERT_EQUAL_STRING("San Isidro", parsed.location.barangay);
+    TEST_ASSERT_EQUAL_STRING("Cabuyao", parsed.location.municipality);
     TEST_ASSERT_EQUAL_STRING("Water rising", parsed.payload);
 }
 
@@ -252,6 +312,36 @@ static void test_form_value_extracts_and_decodes_field(void)
 
     TEST_ASSERT_TRUE(form_value("node_id=BRGY01&location=Purok+3%2C+Hall", "location", output, sizeof(output)));
     TEST_ASSERT_EQUAL_STRING("Purok 3, Hall", output);
+}
+
+static void test_location_encode_round_trips(void)
+{
+    location_info_t input = {0};
+    location_info_t output = {0};
+    char encoded[96] = {0};
+
+    copy_field(input.sitio, sizeof(input.sitio), "Purok 3");
+    copy_field(input.barangay, sizeof(input.barangay), "San Isidro");
+    copy_field(input.municipality, sizeof(input.municipality), "Cabuyao");
+
+    location_encode(&input, encoded, sizeof(encoded));
+    location_decode(encoded, &output);
+
+    TEST_ASSERT_EQUAL_STRING("Purok 3~San Isidro~Cabuyao", encoded);
+    TEST_ASSERT_EQUAL_STRING("Purok 3", output.sitio);
+    TEST_ASSERT_EQUAL_STRING("San Isidro", output.barangay);
+    TEST_ASSERT_EQUAL_STRING("Cabuyao", output.municipality);
+}
+
+static void test_location_decode_falls_back_to_barangay(void)
+{
+    location_info_t output = {0};
+
+    location_decode("Barangay Hall", &output);
+
+    TEST_ASSERT_EQUAL_STRING("", output.sitio);
+    TEST_ASSERT_EQUAL_STRING("Barangay Hall", output.barangay);
+    TEST_ASSERT_EQUAL_STRING("", output.municipality);
 }
 
 static void test_packet_seen_uses_source_and_id(void)
@@ -279,6 +369,8 @@ int main(void)
     RUN_TEST(test_parse_mesh_packet_rejects_bad_prefix);
     RUN_TEST(test_url_decode_decodes_spaces_and_hex);
     RUN_TEST(test_form_value_extracts_and_decodes_field);
+    RUN_TEST(test_location_encode_round_trips);
+    RUN_TEST(test_location_decode_falls_back_to_barangay);
     RUN_TEST(test_packet_seen_uses_source_and_id);
     RUN_TEST(test_packet_seen_expires_after_ttl);
     return UNITY_END();

@@ -34,7 +34,10 @@
 #define MAX_SEEN_PACKETS 64
 #define SEEN_PACKET_TTL_MS 60000
 #define FIELD_LEN 32
-#define PAYLOAD_LEN 160
+#define SITIO_LEN 24
+#define BARANGAY_LEN 24
+#define MUNICIPALITY_LEN 24
+#define PAYLOAD_LEN 140
 #define PACKET_LEN 320
 #define BOOT_BUTTON_GPIO 0
 #define RGB_LED_GPIO 48
@@ -114,6 +117,12 @@
 #define LORA_MODEM_CONFIG_3 (LORA_LOW_DATA_RATE_OPTIMIZE_OFF | LORA_AGC_AUTO_ON)
 
 typedef struct {
+    char sitio[SITIO_LEN];             // Purok/landmark, e.g. "Purok 3, Chapel Roof"
+    char barangay[BARANGAY_LEN];       // e.g. "San Isidro"
+    char municipality[MUNICIPALITY_LEN]; // e.g. "Cabuyao"
+} location_info_t;
+
+typedef struct {
     uint32_t id;
     char direction[8];
     char source[FIELD_LEN];
@@ -122,18 +131,23 @@ typedef struct {
     char priority[FIELD_LEN];
     char payload[PAYLOAD_LEN];
     char packet[PACKET_LEN];
+    location_info_t origin_location;   // decoded from LOC= at store time
+    char thread_key[FIELD_LEN];        // NEW — "ANNOUNCEMENTS" or the peer node_id
 } emergency_message_t;
 
 typedef struct {
     bool configured;
-    bool relay_enabled;
     char node_id[FIELD_LEN];
     char node_name[FIELD_LEN];
-    char location[FIELD_LEN];
+    location_info_t location;          // was: char location[FIELD_LEN]
+    bool relay_enabled;
     char default_destination[FIELD_LEN];
     char web_pin[FIELD_LEN];
     char network_key[FIELD_LEN];
 } node_config_t;
+
+static void location_encode(const location_info_t *loc, char *out, size_t out_size);
+static void location_decode(const char *encoded, location_info_t *loc);
 
 typedef struct {
     uint32_t id;
@@ -150,7 +164,8 @@ typedef struct {
     char type[FIELD_LEN];
     char priority[FIELD_LEN];
     char relay[FIELD_LEN];
-    char location[FIELD_LEN];
+    char location_raw[PACKET_LEN];
+    location_info_t location; // was: char location[FIELD_LEN]
     char payload[PAYLOAD_LEN];
 } mesh_packet_t;
 
@@ -182,6 +197,7 @@ static void copy_field(char *destination, size_t destination_size, const char *s
 static void save_packet_counter(void);
 static void update_highest_seen_id(uint32_t id);
 static bool lora_transmit(const char *packet);
+static esp_err_t save_node_config(const node_config_t *config);
 
 static void data_lock(void)
 {
@@ -746,7 +762,8 @@ static bool parse_mesh_packet(const char *packet, mesh_packet_t *parsed)
     copy_field(parsed->type, sizeof(parsed->type), fields[4]);
     copy_field(parsed->priority, sizeof(parsed->priority), fields[5]);
     copy_field(parsed->relay, sizeof(parsed->relay), fields[7]);
-    copy_field(parsed->location, sizeof(parsed->location), fields[8]);
+    copy_field(parsed->location_raw, sizeof(parsed->location_raw), fields[8]);
+    location_decode(fields[8], &parsed->location);
     copy_field(parsed->payload, sizeof(parsed->payload), fields[9]);
     return true;
 }
@@ -754,8 +771,11 @@ static bool parse_mesh_packet(const char *packet, mesh_packet_t *parsed)
 static void build_forward_packet(const mesh_packet_t *parsed, char *packet, size_t packet_size)
 {
     int next_hops = MAX(parsed->hops - 1, 0);
+    char encoded_location[SITIO_LEN + BARANGAY_LEN + MUNICIPALITY_LEN + 2];
 
-    snprintf(packet, packet_size, "BEMS|%lu|%.*s|%.*s|%.*s|%.*s|HOPS=%d|%.*s|%.*s|%.*s",
+    location_encode(&parsed->location, encoded_location, sizeof(encoded_location));
+
+    snprintf(packet, packet_size, "BEMS|%lu|%.*s|%.*s|%.*s|%.*s|HOPS=%d|%.*s|%s|%.*s",
              (unsigned long)parsed->id,
              31,
              parsed->source,
@@ -768,8 +788,7 @@ static void build_forward_packet(const mesh_packet_t *parsed, char *packet, size
              next_hops,
              31,
              parsed->relay,
-             31,
-             parsed->location,
+             encoded_location,
              120,
              parsed->payload);
 }
@@ -777,16 +796,18 @@ static void build_forward_packet(const mesh_packet_t *parsed, char *packet, size
 static void send_ack_packet(const mesh_packet_t *parsed)
 {
     char ack_packet[PACKET_LEN];
+    char encoded_location[SITIO_LEN + BARANGAY_LEN + MUNICIPALITY_LEN + 2];
 
-    snprintf(ack_packet, sizeof(ack_packet), "BEMS|%lu|%.*s|%.*s|ACK|NORMAL|HOPS=0|RELAY=%u|LOC=%.*s|ACK for %lu",
+    location_encode(&node_config.location, encoded_location, sizeof(encoded_location));
+
+    snprintf(ack_packet, sizeof(ack_packet), "BEMS|%lu|%.*s|%.*s|ACK|NORMAL|HOPS=0|RELAY=%u|LOC=%s|ACK for %lu",
              (unsigned long)parsed->id,
              31,
              node_id,
              31,
              parsed->source,
              node_config.relay_enabled ? 1 : 0,
-             31,
-             node_config.location,
+             encoded_location,
              (unsigned long)parsed->id);
 
     ESP_LOGI(TAG, "Sending ACK to %s for packet %lu", parsed->source, (unsigned long)parsed->id);
@@ -817,6 +838,9 @@ static void send_sync_responses(const mesh_packet_t *request)
     emergency_message_t snapshot[MAX_MESSAGES];
     size_t snapshot_count = 0;
     uint32_t last_id = sync_last_id_from_payload(request->payload);
+    char encoded_location[SITIO_LEN + BARANGAY_LEN + MUNICIPALITY_LEN + 2];
+
+    location_encode(&node_config.location, encoded_location, sizeof(encoded_location));
 
     data_lock();
     for (size_t i = 0; i < message_count && snapshot_count < MAX_MESSAGES; i++) {
@@ -850,14 +874,13 @@ static void send_sync_responses(const mesh_packet_t *request)
             original_packet = snapshot[i].packet;
         }
 
-        prefix_len = snprintf(sync_response, sizeof(sync_response), "BEMS|%lu|%.*s|%.*s|SYNC_RESP|NORMAL|HOPS=0|RELAY=0|LOC=%.*s|",
+        prefix_len = snprintf(sync_response, sizeof(sync_response), "BEMS|%lu|%.*s|%.*s|SYNC_RESP|NORMAL|HOPS=0|RELAY=0|LOC=%s|",
                               (unsigned long)snapshot[i].id,
                               31,
                               node_id,
                               31,
                               request->source,
-                              31,
-                              node_config.location);
+                              encoded_location);
         original_len = strlen(original_packet);
 
         if (prefix_len < 0 || (size_t)prefix_len >= sizeof(sync_response) || (size_t)prefix_len + original_len > BEMS_MAX_PLAINTEXT) {
@@ -874,6 +897,7 @@ static void send_sync_responses(const mesh_packet_t *request)
 static void send_sync_request(uint32_t last_id)
 {
     char sync_request[PACKET_LEN];
+    char encoded_location[SITIO_LEN + BARANGAY_LEN + MUNICIPALITY_LEN + 2];
     uint32_t request_id;
 
     data_lock();
@@ -881,12 +905,13 @@ static void send_sync_request(uint32_t last_id)
     save_packet_counter();
     data_unlock();
 
-    snprintf(sync_request, sizeof(sync_request), "BEMS|%lu|%.*s|ALL|SYNC_REQ|NORMAL|HOPS=1|RELAY=0|LOC=%.*s|last_id=%lu",
+    location_encode(&node_config.location, encoded_location, sizeof(encoded_location));
+
+    snprintf(sync_request, sizeof(sync_request), "BEMS|%lu|%.*s|ALL|SYNC_REQ|NORMAL|HOPS=1|RELAY=0|LOC=%s|last_id=%lu",
              (unsigned long)request_id,
              31,
              node_id,
-             31,
-             node_config.location,
+             encoded_location,
              (unsigned long)last_id);
 
     ESP_LOGI(TAG, "Broadcasting SYNC_REQ with last_id=%lu", (unsigned long)last_id);
@@ -1174,6 +1199,50 @@ static void copy_field(char *destination, size_t destination_size, const char *s
     destination[write_index] = '\0';
 }
 
+static void location_encode(const location_info_t *loc, char *out, size_t out_size)
+{
+    if (out_size == 0) {
+        return;
+    }
+
+    snprintf(out, out_size, "%.*s~%.*s~%.*s",
+             SITIO_LEN - 1, loc->sitio,
+             BARANGAY_LEN - 1, loc->barangay,
+             MUNICIPALITY_LEN - 1, loc->municipality);
+}
+
+static void location_decode(const char *encoded, location_info_t *loc)
+{
+    char buffer[SITIO_LEN + BARANGAY_LEN + MUNICIPALITY_LEN + 2];
+    char *first_sep;
+    char *second_sep;
+
+    memset(loc, 0, sizeof(*loc));
+    if (encoded == NULL) {
+        return;
+    }
+
+    copy_field(buffer, sizeof(buffer), encoded);
+    first_sep = strchr(buffer, '~');
+    if (first_sep == NULL) {
+        copy_field(loc->barangay, sizeof(loc->barangay), buffer);
+        return;
+    }
+
+    *first_sep = '\0';
+    copy_field(loc->sitio, sizeof(loc->sitio), buffer);
+
+    second_sep = strchr(first_sep + 1, '~');
+    if (second_sep == NULL) {
+        copy_field(loc->barangay, sizeof(loc->barangay), first_sep + 1);
+        return;
+    }
+
+    *second_sep = '\0';
+    copy_field(loc->barangay, sizeof(loc->barangay), first_sep + 1);
+    copy_field(loc->municipality, sizeof(loc->municipality), second_sep + 1);
+}
+
 static void copy_node_id(char *destination, size_t destination_size, const char *source)
 {
     size_t write_index = 0;
@@ -1299,7 +1368,9 @@ static void config_set_defaults(void)
     node_config.relay_enabled = true;
     copy_field(node_config.node_id, sizeof(node_config.node_id), node_id);
     copy_field(node_config.node_name, sizeof(node_config.node_name), "Unconfigured Node");
-    copy_field(node_config.location, sizeof(node_config.location), "Unknown");
+    copy_field(node_config.location.sitio, sizeof(node_config.location.sitio), "");
+    copy_field(node_config.location.barangay, sizeof(node_config.location.barangay), "Unknown");
+    copy_field(node_config.location.municipality, sizeof(node_config.location.municipality), "");
     copy_field(node_config.default_destination, sizeof(node_config.default_destination), "BRGY001");
     copy_field(node_config.web_pin, sizeof(node_config.web_pin), DEFAULT_WEB_PIN);
     copy_field(node_config.network_key, sizeof(node_config.network_key), DEFAULT_NETWORK_KEY);
@@ -1320,10 +1391,12 @@ static void load_node_config(void)
     nvs_handle_t handle;
     uint8_t configured = 0;
     uint8_t relay_enabled = 1;
+    bool migrated_location = false;
+    char legacy_location[FIELD_LEN] = {0};
 
     config_set_defaults();
 
-    if (nvs_open(CONFIG_NAMESPACE, NVS_READONLY, &handle) != ESP_OK) {
+    if (nvs_open(CONFIG_NAMESPACE, NVS_READWRITE, &handle) != ESP_OK) {
         apply_config_identity();
         return;
     }
@@ -1332,18 +1405,44 @@ static void load_node_config(void)
     nvs_get_u8(handle, "relay", &relay_enabled);
     nvs_get_string_or_default(handle, "node_id", node_config.node_id, sizeof(node_config.node_id), node_id);
     nvs_get_string_or_default(handle, "node_name", node_config.node_name, sizeof(node_config.node_name), "Mesh Node");
-    nvs_get_string_or_default(handle, "location", node_config.location, sizeof(node_config.location), "Unknown");
     nvs_get_string_or_default(handle, "default_dest", node_config.default_destination, sizeof(node_config.default_destination), "BRGY001");
     nvs_get_string_or_default(handle, "web_pin", node_config.web_pin, sizeof(node_config.web_pin), DEFAULT_WEB_PIN);
     nvs_get_string_or_default(handle, "network_key", node_config.network_key, sizeof(node_config.network_key), DEFAULT_NETWORK_KEY);
+
+    if (nvs_get_str(handle, "sitio", node_config.location.sitio, &(size_t){sizeof(node_config.location.sitio)}) != ESP_OK) {
+        copy_field(node_config.location.sitio, sizeof(node_config.location.sitio), "");
+    }
+    if (nvs_get_str(handle, "barangay", node_config.location.barangay, &(size_t){sizeof(node_config.location.barangay)}) != ESP_OK) {
+        if (nvs_get_str(handle, "location", legacy_location, &(size_t){sizeof(legacy_location)}) == ESP_OK && legacy_location[0] != '\0') {
+            location_decode(legacy_location, &node_config.location);
+            migrated_location = true;
+        } else {
+            copy_field(node_config.location.barangay, sizeof(node_config.location.barangay), "Unknown");
+        }
+    }
+    if (nvs_get_str(handle, "municipality", node_config.location.municipality, &(size_t){sizeof(node_config.location.municipality)}) != ESP_OK) {
+        copy_field(node_config.location.municipality, sizeof(node_config.location.municipality), "");
+    }
+
     nvs_close(handle);
 
     node_config.configured = configured == 1;
     node_config.relay_enabled = relay_enabled == 1;
     apply_config_identity();
 
-    ESP_LOGI(TAG, "Config loaded: configured=%d node=%s name=%s location=%s relay=%d",
-             node_config.configured, node_config.node_id, node_config.node_name, node_config.location, node_config.relay_enabled);
+    if (migrated_location) {
+        ESP_LOGI(TAG, "Migrating legacy location key to structured fields");
+        save_node_config(&node_config);
+    }
+
+    char encoded_location[SITIO_LEN + BARANGAY_LEN + MUNICIPALITY_LEN + 2];
+    location_encode(&node_config.location, encoded_location, sizeof(encoded_location));
+
+    ESP_LOGI(TAG, "Config loaded: configured=%d node=%s name=%s location=%s",
+             node_config.configured,
+             node_config.node_id,
+             node_config.node_name,
+             encoded_location);
 }
 
 static esp_err_t save_node_config(const node_config_t *config)
@@ -1366,7 +1465,13 @@ static esp_err_t save_node_config(const node_config_t *config)
         result = nvs_set_str(handle, "node_name", config->node_name);
     }
     if (result == ESP_OK) {
-        result = nvs_set_str(handle, "location", config->location);
+        result = nvs_set_str(handle, "sitio", config->location.sitio);
+    }
+    if (result == ESP_OK) {
+        result = nvs_set_str(handle, "barangay", config->location.barangay);
+    }
+    if (result == ESP_OK) {
+        result = nvs_set_str(handle, "municipality", config->location.municipality);
     }
     if (result == ESP_OK) {
         result = nvs_set_str(handle, "default_dest", config->default_destination);
@@ -1376,6 +1481,9 @@ static esp_err_t save_node_config(const node_config_t *config)
     }
     if (result == ESP_OK) {
         result = nvs_set_str(handle, "network_key", config->network_key);
+    }
+    if (result == ESP_OK) {
+        result = nvs_erase_key(handle, "location");
     }
     if (result == ESP_OK) {
         result = nvs_commit(handle);
@@ -1554,7 +1662,7 @@ static void build_packet(emergency_message_t *message)
              hops_for_priority(message->priority),
              node_config.relay_enabled ? 1 : 0,
              31,
-             node_config.location,
+             node_config.location.barangay,
              120,
              message->payload);
 }
@@ -1683,7 +1791,7 @@ static esp_err_t setup_handler(httpd_req_t *request)
     form_value(body, "node_id", raw_node_id, sizeof(raw_node_id));
     copy_node_id(new_config.node_id, sizeof(new_config.node_id), raw_node_id);
     form_value(body, "node_name", new_config.node_name, sizeof(new_config.node_name));
-    form_value(body, "location", new_config.location, sizeof(new_config.location));
+    form_value(body, "location", new_config.location.barangay, sizeof(new_config.location.barangay));
     form_value(body, "default_destination", new_config.default_destination, sizeof(new_config.default_destination));
     form_value(body, "web_pin", new_config.web_pin, sizeof(new_config.web_pin));
     form_value(body, "network_key", new_config.network_key, sizeof(new_config.network_key));
@@ -1696,8 +1804,8 @@ static esp_err_t setup_handler(httpd_req_t *request)
     if (new_config.node_name[0] == '\0') {
         copy_field(new_config.node_name, sizeof(new_config.node_name), "Mesh Node");
     }
-    if (new_config.location[0] == '\0') {
-        copy_field(new_config.location, sizeof(new_config.location), "Unknown");
+    if (new_config.location.barangay[0] == '\0') {
+        copy_field(new_config.location.barangay, sizeof(new_config.location.barangay), "Unknown");
     }
     if (new_config.default_destination[0] == '\0') {
         copy_field(new_config.default_destination, sizeof(new_config.default_destination), "BRGY001");
@@ -1799,7 +1907,7 @@ static esp_err_t status_handler(httpd_req_t *request)
 
     json_escape_string(escaped_node, sizeof(escaped_node), node_id);
     json_escape_string(escaped_name, sizeof(escaped_name), node_config.node_name);
-    json_escape_string(escaped_location, sizeof(escaped_location), node_config.location);
+    json_escape_string(escaped_location, sizeof(escaped_location), node_config.location.barangay);
     json_escape_string(escaped_ssid, sizeof(escaped_ssid), ap_ssid);
     json_escape_string(escaped_relay, sizeof(escaped_relay), node_config.relay_enabled ? "true" : "false");
 
