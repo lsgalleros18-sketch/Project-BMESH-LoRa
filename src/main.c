@@ -2366,7 +2366,9 @@ static esp_err_t status_handler(httpd_req_t *request)
 
 static esp_err_t messages_handler(httpd_req_t *request)
 {
-    emergency_message_t snapshot[MAX_MESSAGES];
+    // esp_http_server dispatches this on a single worker task by default, so a static
+    // snapshot buffer is safe here and keeps the worker stack clear for chunked I/O.
+    static emergency_message_t snapshot[MAX_MESSAGES];
     size_t snapshot_count = 0;
     esp_err_t session_result = require_session(request);
 
@@ -2400,7 +2402,7 @@ static void start_http_server(void)
     config.server_port = HTTP_PORT;
     config.max_uri_handlers = 16;
     config.uri_match_fn = httpd_uri_match_wildcard;
-    config.stack_size = 12288;
+    config.stack_size = 24576;
 
     const httpd_uri_t routes[] = {
         {.uri = "/", .method = HTTP_GET, .handler = index_handler},
