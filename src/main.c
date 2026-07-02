@@ -155,15 +155,16 @@ typedef struct {
 static void location_encode(const location_info_t *loc, char *out, size_t out_size);
 static void location_decode(const char *encoded, location_info_t *loc);
 static void compute_thread_key(char *out, size_t out_size, const char *source, const char *destination);
+static void json_escape_string(char *destination, size_t destination_size, const char *source);
 static void update_message_status(uint32_t id, const char *source, const char *status);
 static bool lora_channel_clear(void);
-static void retry_tracker_add(const emergency_message_t *message);
 static void retry_tracker_task(void *parameter);
 static void time_sync_task(void *parameter);
 static uint32_t current_epoch_seconds(void);
 static void apply_time_sync(uint32_t epoch, uint8_t distance);
 static void send_time_sync_packet(uint32_t epoch, uint8_t distance, uint8_t hops);
 static void broadcast_time_sync_if_synced(void);
+static void write_message_json_chunk(httpd_req_t *request, const emergency_message_t *message, bool first);
 
 typedef struct {
     uint32_t id;
@@ -347,7 +348,7 @@ static const char INDEX_HTML[] =
     "<form method=post action=/reset onsubmit='return confirm(\"Factory reset this node and run setup again?\")'><button type=submit>Factory Reset Node</button></form></section>"
     "</main><script>"
     "const scopeRadios=[...document.querySelectorAll('input[name=scope]')];const destWrap=document.getElementById('destWrap');const dest=document.getElementById('destination');const announcementDest=document.getElementById('announcementDest');const template=document.getElementById('template');const payload=document.getElementById('payload');const langBtn=document.getElementById('langBtn');"
-    "function syncScope(){let direct=scopeRadios.some(r=>r.checked&&r.value==='direct');destWrap.style.display=direct?'block':'none';dest.required=direct;announcementDest.disabled=direct;if(!direct){dest.value='';announcementDest.value='ALL';}else{announcementDest.value='';}}"
+    "function syncScope(){let direct=scopeRadios.some(r=>r.checked&&r.value==='direct');destWrap.style.display=direct?'block':'none';dest.required=direct;dest.disabled=!direct;announcementDest.disabled=direct;if(!direct){announcementDest.value='ALL';}}"
     "template.addEventListener('change',()=>{if(!template.value)return;let parts=template.value.split('|');payload.value=parts[0];document.querySelector('select[name=type]').value=parts[1]||'TEST';document.querySelector('select[name=priority]').value=parts[2]||'NORMAL';template.value='';});"
     "scopeRadios.forEach(r=>r.addEventListener('change',syncScope));syncScope();"
     "let activeThread='ANNOUNCEMENTS';let cachedThreads={};"
@@ -986,6 +987,70 @@ static void broadcast_time_sync_if_synced(void)
     }
 }
 
+static void write_message_json_chunk(httpd_req_t *request, const emergency_message_t *message, bool first)
+{
+    char escaped_direction[FIELD_LEN * 2];
+    char escaped_source[FIELD_LEN * 2];
+    char escaped_destination[FIELD_LEN * 2];
+    char escaped_type[FIELD_LEN * 2];
+    char escaped_priority[FIELD_LEN * 2];
+    char escaped_payload[PAYLOAD_LEN * 2];
+    char escaped_packet[PACKET_LEN * 2];
+    char escaped_thread_key[FIELD_LEN * 2];
+    char escaped_status[FIELD_LEN * 2];
+    char escaped_sitio[SITIO_LEN * 2];
+    char escaped_barangay[BARANGAY_LEN * 2];
+    char escaped_municipality[MUNICIPALITY_LEN * 2];
+
+    json_escape_string(escaped_direction, sizeof(escaped_direction), message->direction);
+    json_escape_string(escaped_source, sizeof(escaped_source), message->source);
+    json_escape_string(escaped_destination, sizeof(escaped_destination), message->destination);
+    json_escape_string(escaped_type, sizeof(escaped_type), message->type);
+    json_escape_string(escaped_priority, sizeof(escaped_priority), message->priority);
+    json_escape_string(escaped_payload, sizeof(escaped_payload), message->payload);
+    json_escape_string(escaped_packet, sizeof(escaped_packet), message->packet);
+    json_escape_string(escaped_thread_key, sizeof(escaped_thread_key), message->thread_key);
+    json_escape_string(escaped_status, sizeof(escaped_status), message->status);
+    json_escape_string(escaped_sitio, sizeof(escaped_sitio), message->origin_location.sitio);
+    json_escape_string(escaped_barangay, sizeof(escaped_barangay), message->origin_location.barangay);
+    json_escape_string(escaped_municipality, sizeof(escaped_municipality), message->origin_location.municipality);
+
+    httpd_resp_send_chunk(request, first ? "" : ",", HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(request, "{\"id\":", HTTPD_RESP_USE_STRLEN);
+    char id_chunk[24];
+    snprintf(id_chunk, sizeof(id_chunk), "%lu", (unsigned long)message->id);
+    httpd_resp_send_chunk(request, id_chunk, HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(request, ",\"direction\":\"", HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(request, escaped_direction, HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(request, "\",\"source\":\"", HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(request, escaped_source, HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(request, "\",\"destination\":\"", HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(request, escaped_destination, HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(request, "\",\"type\":\"", HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(request, escaped_type, HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(request, "\",\"priority\":\"", HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(request, escaped_priority, HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(request, "\",\"payload\":\"", HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(request, escaped_payload, HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(request, "\",\"packet\":\"", HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(request, escaped_packet, HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(request, "\",\"thread_key\":\"", HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(request, escaped_thread_key, HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(request, "\",\"status\":\"", HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(request, escaped_status, HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(request, "\",\"stored_epoch\":", HTTPD_RESP_USE_STRLEN);
+    char epoch_chunk[24];
+    snprintf(epoch_chunk, sizeof(epoch_chunk), "%lu", (unsigned long)message->stored_epoch);
+    httpd_resp_send_chunk(request, epoch_chunk, HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(request, ",\"location\":{\"sitio\":\"", HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(request, escaped_sitio, HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(request, "\",\"barangay\":\"", HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(request, escaped_barangay, HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(request, "\",\"municipality\":\"", HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(request, escaped_municipality, HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(request, "\"}}", HTTPD_RESP_USE_STRLEN);
+}
+
 static bool is_private_destination_for_other_node(const char *destination, const char *requester)
 {
     return strcmp(destination, "ALL") != 0 && strcmp(destination, requester) != 0;
@@ -1464,9 +1529,9 @@ static void update_message_status(uint32_t id, const char *source, const char *s
     data_unlock();
 }
 
-static void retry_tracker_add(const emergency_message_t *message)
+static void retry_tracker_add_by_value(uint32_t id, const char *source, const char *destination, const char *priority)
 {
-    if (strcmp(message->priority, "HIGH") != 0 || strcmp(message->destination, "ALL") == 0) {
+    if (strcmp(priority, "HIGH") != 0 || strcmp(destination, "ALL") == 0) {
         return;
     }
 
@@ -1474,10 +1539,10 @@ static void retry_tracker_add(const emergency_message_t *message)
     for (size_t i = 0; i < MAX_MESSAGES; i++) {
         retry_entry_t *entry = &retry_entries[i];
         if (!entry->active) {
-            entry->id = message->id;
-            copy_field(entry->source, sizeof(entry->source), message->source);
-            copy_field(entry->destination, sizeof(entry->destination), message->destination);
-            copy_field(entry->priority, sizeof(entry->priority), message->priority);
+            entry->id = id;
+            copy_field(entry->source, sizeof(entry->source), source);
+            copy_field(entry->destination, sizeof(entry->destination), destination);
+            copy_field(entry->priority, sizeof(entry->priority), priority);
             entry->attempts = 1;
             entry->next_retry_tick = xTaskGetTickCount() + pdMS_TO_TICKS(5000);
             entry->active = true;
@@ -1966,6 +2031,10 @@ static void build_packet(emergency_message_t *message)
 static void queue_message(const char *destination, const char *type, const char *priority, const char *payload)
 {
     char packet[PACKET_LEN];
+    uint32_t queued_id;
+    char queued_source[FIELD_LEN];
+    char queued_destination[FIELD_LEN];
+    char queued_priority[FIELD_LEN];
 
     data_lock();
     emergency_message_t *message = next_message_slot();
@@ -1982,16 +2051,20 @@ static void queue_message(const char *destination, const char *type, const char 
     build_packet(message);
     compute_thread_key(message->thread_key, sizeof(message->thread_key), message->source, message->destination);
     message->origin_location = node_config.location;
+    queued_id = message->id;
+    copy_field(queued_source, sizeof(queued_source), message->source);
+    copy_field(queued_destination, sizeof(queued_destination), message->destination);
+    copy_field(queued_priority, sizeof(queued_priority), message->priority);
     copy_field(packet, sizeof(packet), message->packet);
     save_packet_counter();
     data_unlock();
 
     ESP_LOGI(TAG, "LoRa TX pending: %s", packet);
     if (lora_transmit(packet)) {
-        update_message_status(message->id, message->source, "SENT");
-        retry_tracker_add(message);
+        update_message_status(queued_id, queued_source, "SENT");
+        retry_tracker_add_by_value(queued_id, queued_source, queued_destination, queued_priority);
     } else {
-        update_message_status(message->id, message->source, "FAILED");
+        update_message_status(queued_id, queued_source, "FAILED");
     }
 }
 
@@ -2293,69 +2366,27 @@ static esp_err_t status_handler(httpd_req_t *request)
 
 static esp_err_t messages_handler(httpd_req_t *request)
 {
-    // 16 messages at roughly 300 bytes each plus JSON framing fits comfortably here.
-    char response[6144];
-    size_t offset = 0;
+    emergency_message_t snapshot[MAX_MESSAGES];
+    size_t snapshot_count = 0;
     esp_err_t session_result = require_session(request);
 
     if (session_result != ESP_OK) {
         return session_result;
     }
 
-    data_lock();
-    offset += snprintf(response + offset, sizeof(response) - offset, "[");
-
-    for (size_t i = 0; i < message_count && offset < sizeof(response); i++) {
-        emergency_message_t *message = &messages[message_count - 1 - i];
-        char escaped_direction[FIELD_LEN * 2];
-        char escaped_source[FIELD_LEN * 2];
-        char escaped_destination[FIELD_LEN * 2];
-        char escaped_type[FIELD_LEN * 2];
-        char escaped_priority[FIELD_LEN * 2];
-        char escaped_payload[PAYLOAD_LEN * 2];
-        char escaped_packet[PACKET_LEN * 2];
-        char escaped_thread_key[FIELD_LEN * 2];
-        char escaped_status[FIELD_LEN * 2];
-        char escaped_sitio[SITIO_LEN * 2];
-        char escaped_barangay[BARANGAY_LEN * 2];
-        char escaped_municipality[MUNICIPALITY_LEN * 2];
-
-        json_escape_string(escaped_direction, sizeof(escaped_direction), message->direction);
-        json_escape_string(escaped_source, sizeof(escaped_source), message->source);
-        json_escape_string(escaped_destination, sizeof(escaped_destination), message->destination);
-        json_escape_string(escaped_type, sizeof(escaped_type), message->type);
-        json_escape_string(escaped_priority, sizeof(escaped_priority), message->priority);
-        json_escape_string(escaped_payload, sizeof(escaped_payload), message->payload);
-        json_escape_string(escaped_packet, sizeof(escaped_packet), message->packet);
-        json_escape_string(escaped_thread_key, sizeof(escaped_thread_key), message->thread_key);
-        json_escape_string(escaped_status, sizeof(escaped_status), message->status);
-        json_escape_string(escaped_sitio, sizeof(escaped_sitio), message->origin_location.sitio);
-        json_escape_string(escaped_barangay, sizeof(escaped_barangay), message->origin_location.barangay);
-        json_escape_string(escaped_municipality, sizeof(escaped_municipality), message->origin_location.municipality);
-        offset += snprintf(response + offset, sizeof(response) - offset,
-                           "%s{\"id\":%lu,\"direction\":\"%s\",\"source\":\"%s\",\"destination\":\"%s\",\"type\":\"%s\",\"priority\":\"%s\",\"payload\":\"%s\",\"packet\":\"%s\",\"thread_key\":\"%s\",\"status\":\"%s\",\"stored_epoch\":%lu,\"location\":{\"sitio\":\"%s\",\"barangay\":\"%s\",\"municipality\":\"%s\"}}",
-                           i == 0 ? "" : ",",
-                           (unsigned long)message->id,
-                           escaped_direction,
-                           escaped_source,
-                           escaped_destination,
-                           escaped_type,
-                           escaped_priority,
-                           escaped_payload,
-                           escaped_packet,
-                           escaped_thread_key,
-                           escaped_status,
-                           (unsigned long)message->stored_epoch,
-                           escaped_sitio,
-                           escaped_barangay,
-                           escaped_municipality);
-    }
-
-    snprintf(response + MIN(offset, sizeof(response) - 1), sizeof(response) - MIN(offset, sizeof(response) - 1), "]");
-    data_unlock();
-
     httpd_resp_set_type(request, "application/json");
-    return httpd_resp_send(request, response, HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(request, "[", 1);
+    data_lock();
+    for (size_t i = 0; i < message_count && snapshot_count < MAX_MESSAGES; i++) {
+        snapshot[snapshot_count++] = messages[message_count - 1 - i];
+    }
+    data_unlock();
+    for (size_t i = 0; i < snapshot_count; i++) {
+        write_message_json_chunk(request, &snapshot[i], i == 0);
+    }
+    httpd_resp_send_chunk(request, "]", 1);
+    httpd_resp_set_type(request, "application/json");
+    return httpd_resp_send_chunk(request, NULL, 0);
 }
 
 static esp_err_t captive_handler(httpd_req_t *request)
@@ -2369,6 +2400,7 @@ static void start_http_server(void)
     config.server_port = HTTP_PORT;
     config.max_uri_handlers = 16;
     config.uri_match_fn = httpd_uri_match_wildcard;
+    config.stack_size = 12288;
 
     const httpd_uri_t routes[] = {
         {.uri = "/", .method = HTTP_GET, .handler = index_handler},
@@ -2524,7 +2556,6 @@ void app_main(void)
     load_node_config();
     lora_init();
     xTaskCreate(boot_sync_task, "boot_sync_task", 4096, NULL, 4, NULL);
-    xTaskCreate(lora_rx_task, "lora_rx_task", 4096, NULL, 6, NULL);
     xTaskCreate(retry_tracker_task, "retry_tracker_task", 4096, NULL, 3, NULL);
     xTaskCreate(time_sync_task, "time_sync_task", 3072, NULL, 2, NULL);
     start_wifi_ap();
