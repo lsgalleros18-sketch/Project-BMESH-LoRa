@@ -92,6 +92,7 @@
 #define REG_MODEM_CONFIG_3 0x26
 #define REG_SYNC_WORD 0x39
 #define REG_DIO_MAPPING_1 0x40
+#define REG_IRQ_FLAGS_1 0x3E
 #define REG_VERSION 0x42
 
 #define MODE_LONG_RANGE_MODE 0x80
@@ -103,6 +104,9 @@
 #define IRQ_TX_DONE_MASK 0x08
 #define IRQ_PAYLOAD_CRC_ERROR_MASK 0x20
 #define IRQ_RX_DONE_MASK 0x40
+
+#define IRQ1_CAD_DONE_MASK 0x04
+#define IRQ1_CAD_DETECTED_MASK 0x01
 
 #define LORA_BW_125_KHZ 0x70
 #define LORA_CR_4_5 0x02
@@ -133,6 +137,7 @@ typedef struct {
     char packet[PACKET_LEN];
     location_info_t origin_location;   // decoded from LOC= at store time
     char thread_key[FIELD_LEN];        // NEW — "ANNOUNCEMENTS" or the peer node_id
+    char status[FIELD_LEN];
 } emergency_message_t;
 
 typedef struct {
@@ -148,6 +153,8 @@ typedef struct {
 static void location_encode(const location_info_t *loc, char *out, size_t out_size);
 static void location_decode(const char *encoded, location_info_t *loc);
 static void compute_thread_key(char *out, size_t out_size, const char *source, const char *destination);
+static void update_message_status(uint32_t id, const char *source, const char *status);
+static bool lora_channel_clear(void);
 
 typedef struct {
     uint32_t id;
@@ -636,6 +643,31 @@ static void lora_set_mode(uint8_t mode)
     lora_write_reg(REG_OP_MODE, MODE_LONG_RANGE_MODE | mode);
 }
 
+static bool lora_channel_clear(void)
+{
+    for (int attempt = 0; attempt < 3; attempt++) {
+        lora_set_mode(MODE_STDBY);
+        lora_write_reg(REG_DIO_MAPPING_1, 0x80);
+        lora_write_reg(REG_IRQ_FLAGS, 0xFF);
+        lora_write_reg(REG_IRQ_FLAGS_1, 0xFF);
+        lora_set_mode(0x07); // CAD mode
+        vTaskDelay(pdMS_TO_TICKS(10));
+
+        uint8_t irq_flags_1 = lora_read_reg(REG_IRQ_FLAGS_1);
+        lora_write_reg(REG_IRQ_FLAGS, 0xFF);
+        lora_write_reg(REG_IRQ_FLAGS_1, 0xFF);
+        lora_set_mode(MODE_STDBY);
+
+        if ((irq_flags_1 & IRQ1_CAD_DONE_MASK) != 0 && (irq_flags_1 & IRQ1_CAD_DETECTED_MASK) == 0) {
+            return true;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(20 + (attempt * 30)));
+    }
+
+    return false;
+}
+
 static void lora_set_frequency(uint32_t frequency_hz)
 {
     uint64_t frf = ((uint64_t)frequency_hz << 19) / 32000000;
@@ -837,6 +869,15 @@ static uint32_t sync_last_id_from_payload(const char *payload)
     return 0;
 }
 
+static uint32_t ack_id_from_payload(const char *payload)
+{
+    if (strncmp(payload, "ACK for ", 8) == 0) {
+        return (uint32_t)strtoul(payload + 8, NULL, 10);
+    }
+
+    return 0;
+}
+
 static bool is_control_packet_type(const char *type)
 {
     return strcmp(type, "ACK") == 0 || strcmp(type, "SYNC_REQ") == 0 || strcmp(type, "SYNC_RESP") == 0;
@@ -977,6 +1018,7 @@ static void store_received_packet(const char *packet, const mesh_packet_t *parse
     } else {
         copy_field(message->thread_key, sizeof(message->thread_key), "UNKNOWN");
     }
+    copy_field(message->status, sizeof(message->status), parsed->valid ? "RECEIVED" : "RECEIVED");
     snprintf(message->packet, sizeof(message->packet), "RSSI=%d SNR=%d | %.*s", rssi, snr, 250, packet);
     if (parsed->valid && !is_control_packet_type(parsed->type)) {
         update_highest_seen_id(message->id);
@@ -1004,6 +1046,11 @@ static bool lora_transmit(const char *packet)
 
     if (lora_tx_done_semaphore == NULL) {
         ESP_LOGW(TAG, "LoRa TX done semaphore is not ready");
+        return false;
+    }
+
+    if (!lora_channel_clear()) {
+        ESP_LOGW(TAG, "Channel busy; TX skipped");
         return false;
     }
 
@@ -1096,6 +1143,13 @@ static void lora_rx_task(void *parameter)
 
                         if (is_for_me && !is_ack) {
                             send_ack_packet(&parsed);
+                        }
+
+                        if (is_ack && is_for_me) {
+                            uint32_t ack_id = ack_id_from_payload(parsed.payload);
+                            if (ack_id != 0) {
+                                update_message_status(ack_id, node_id, "ACKED");
+                            }
                         }
 
                         if (parsed.hops > 0 && !is_for_me) {
@@ -1275,6 +1329,19 @@ static void compute_thread_key(char *out, size_t out_size, const char *source, c
     }
 
     copy_field(out, out_size, source);
+}
+
+static void update_message_status(uint32_t id, const char *source, const char *status)
+{
+    data_lock();
+    for (size_t i = 0; i < message_count; i++) {
+        emergency_message_t *message = &messages[i];
+        if (message->id == id && strcmp(message->source, source) == 0) {
+            copy_field(message->status, sizeof(message->status), status);
+            break;
+        }
+    }
+    data_unlock();
 }
 
 static void copy_node_id(char *destination, size_t destination_size, const char *source)
@@ -1722,6 +1789,7 @@ static void queue_message(const char *destination, const char *type, const char 
     copy_field(message->type, sizeof(message->type), type);
     copy_field(message->priority, sizeof(message->priority), priority);
     copy_field(message->payload, sizeof(message->payload), payload);
+    copy_field(message->status, sizeof(message->status), "PENDING");
     build_packet(message);
     compute_thread_key(message->thread_key, sizeof(message->thread_key), message->source, message->destination);
     message->origin_location = node_config.location;
@@ -1730,7 +1798,11 @@ static void queue_message(const char *destination, const char *type, const char 
     data_unlock();
 
     ESP_LOGI(TAG, "LoRa TX pending: %s", packet);
-    lora_transmit(packet);
+    if (lora_transmit(packet)) {
+        update_message_status(message->id, message->source, "SENT");
+    } else {
+        update_message_status(message->id, message->source, "FAILED");
+    }
 }
 
 static esp_err_t send_redirect(httpd_req_t *request, const char *location)
@@ -1993,6 +2065,7 @@ static esp_err_t messages_handler(httpd_req_t *request)
         char escaped_payload[PAYLOAD_LEN * 2];
         char escaped_packet[PACKET_LEN * 2];
         char escaped_thread_key[FIELD_LEN * 2];
+        char escaped_status[FIELD_LEN * 2];
         char escaped_sitio[SITIO_LEN * 2];
         char escaped_barangay[BARANGAY_LEN * 2];
         char escaped_municipality[MUNICIPALITY_LEN * 2];
@@ -2005,11 +2078,12 @@ static esp_err_t messages_handler(httpd_req_t *request)
         json_escape_string(escaped_payload, sizeof(escaped_payload), message->payload);
         json_escape_string(escaped_packet, sizeof(escaped_packet), message->packet);
         json_escape_string(escaped_thread_key, sizeof(escaped_thread_key), message->thread_key);
+        json_escape_string(escaped_status, sizeof(escaped_status), message->status);
         json_escape_string(escaped_sitio, sizeof(escaped_sitio), message->origin_location.sitio);
         json_escape_string(escaped_barangay, sizeof(escaped_barangay), message->origin_location.barangay);
         json_escape_string(escaped_municipality, sizeof(escaped_municipality), message->origin_location.municipality);
         offset += snprintf(response + offset, sizeof(response) - offset,
-                           "%s{\"id\":%lu,\"direction\":\"%s\",\"source\":\"%s\",\"destination\":\"%s\",\"type\":\"%s\",\"priority\":\"%s\",\"payload\":\"%s\",\"packet\":\"%s\",\"thread_key\":\"%s\",\"location\":{\"sitio\":\"%s\",\"barangay\":\"%s\",\"municipality\":\"%s\"}}",
+                           "%s{\"id\":%lu,\"direction\":\"%s\",\"source\":\"%s\",\"destination\":\"%s\",\"type\":\"%s\",\"priority\":\"%s\",\"payload\":\"%s\",\"packet\":\"%s\",\"thread_key\":\"%s\",\"status\":\"%s\",\"location\":{\"sitio\":\"%s\",\"barangay\":\"%s\",\"municipality\":\"%s\"}}",
                            i == 0 ? "" : ",",
                            (unsigned long)message->id,
                            escaped_direction,
@@ -2020,6 +2094,7 @@ static esp_err_t messages_handler(httpd_req_t *request)
                            escaped_payload,
                            escaped_packet,
                            escaped_thread_key,
+                           escaped_status,
                            escaped_sitio,
                            escaped_barangay,
                            escaped_municipality);
