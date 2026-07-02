@@ -155,6 +155,8 @@ static void location_decode(const char *encoded, location_info_t *loc);
 static void compute_thread_key(char *out, size_t out_size, const char *source, const char *destination);
 static void update_message_status(uint32_t id, const char *source, const char *status);
 static bool lora_channel_clear(void);
+static void retry_tracker_add(const emergency_message_t *message);
+static void retry_tracker_task(void *parameter);
 
 typedef struct {
     uint32_t id;
@@ -176,6 +178,16 @@ typedef struct {
     char payload[PAYLOAD_LEN];
 } mesh_packet_t;
 
+typedef struct {
+    uint32_t id;
+    char source[FIELD_LEN];
+    char destination[FIELD_LEN];
+    char priority[FIELD_LEN];
+    uint8_t attempts;
+    TickType_t next_retry_tick;
+    bool active;
+} retry_entry_t;
+
 static const char *TAG = "barangay_mesh";
 static const char *AP_PASSWORD = "";
 
@@ -185,10 +197,12 @@ static char session_token[SESSION_TOKEN_LEN];
 static node_config_t node_config;
 static emergency_message_t messages[MAX_MESSAGES];
 static seen_packet_t seen_packets[MAX_SEEN_PACKETS];
+static retry_entry_t retry_entries[MAX_MESSAGES];
 static size_t message_count;
 static size_t seen_packet_count;
 static uint32_t packet_counter;
 static uint32_t highest_seen_id;
+static TickType_t last_send_tick;
 static httpd_handle_t http_server;
 static spi_device_handle_t lora_spi;
 static rmt_channel_handle_t rgb_led_channel;
@@ -303,6 +317,7 @@ static const char INDEX_HTML[] =
     "</style></head><body><div class=top><div class=wrap><h2>Barangay Emergency Mesh</h2>"
     "<div id=status>Loading status...</div></div></div><main class=wrap>"
     "<section class=card><h3>Send Message</h3><form method=post action=/send>"
+    "<div class=row><label>Your name<input name=sender_name maxlength=31 placeholder='Optional name for accountability'></label><label>Quick templates<select id=template><option value=''>Choose a template</option><option value='Need medical evacuation|MEDICAL|HIGH'>Need medical evacuation</option><option value='Road impassable|EVACUATION|HIGH'>Road impassable</option><option value='All clear|TEST|LOW'>All clear</option></select></label></div>"
     "<fieldset style='border:0;padding:0;margin:0 0 8px 0'><legend style='font-weight:700'>Message scope</legend>"
     "<label><input type=radio name=scope value=announcement checked> Announcement (all nodes)</label>"
     "<label><input type=radio name=scope value=direct> Direct message (specific node)</label></fieldset>"
@@ -310,24 +325,26 @@ static const char INDEX_HTML[] =
     "<input type=hidden id=announcementDest name=destination value=ALL>"
     "<div class=row><label>Emergency Type<select name=type><option>FLOOD</option><option>FIRE</option><option>MEDICAL</option><option>SECURITY</option><option>EVACUATION</option><option>TEST</option></select></label>"
     "<label>Priority<select name=priority><option>HIGH</option><option>NORMAL</option><option>LOW</option></select></label></div>"
-    "<label>Message<textarea name=payload maxlength=159 placeholder='Short emergency message'></textarea></label>"
+    "<label>Message<textarea id=payload name=payload maxlength=159 placeholder='Short emergency message'></textarea></label>"
     "<button type=submit>Queue / Transmit Message</button></form><p class=muted>The portal sends through the SX1278 using GPIO 5/7/6/8/4/16 at 433 MHz.</p></section>"
     "<section class=card><h3>Messages</h3><div class=messenger><div class=thread-list><div class=muted>Loading threads...</div></div><div class=thread-view><div class=muted>Loading messages...</div></div></div></section>"
+    "<section class=card><h3>Mesh Health</h3><div id=health class=muted>Loading node roster...</div></section>"
     "<section class=card><h3>Portal</h3><p class=muted>Connect to this Wi-Fi when offline, then open http://192.168.4.1. Android/iOS captive checks are redirected here automatically.</p>"
     "<form method=post action=/sync><button type=submit>Sync Messages from Mesh</button></form>"
     "<form method=post action=/reset onsubmit='return confirm(\"Factory reset this node and run setup again?\")'><button type=submit>Factory Reset Node</button></form></section>"
     "</main><script>"
-    "const scopeRadios=[...document.querySelectorAll('input[name=scope]')];const destWrap=document.getElementById('destWrap');const dest=document.getElementById('destination');const announcementDest=document.getElementById('announcementDest');"
+    "const scopeRadios=[...document.querySelectorAll('input[name=scope]')];const destWrap=document.getElementById('destWrap');const dest=document.getElementById('destination');const announcementDest=document.getElementById('announcementDest');const template=document.getElementById('template');const payload=document.getElementById('payload');"
     "function syncScope(){let direct=scopeRadios.some(r=>r.checked&&r.value==='direct');destWrap.style.display=direct?'block':'none';dest.required=direct;announcementDest.disabled=direct;if(!direct){dest.value='';announcementDest.value='ALL';}else{announcementDest.value='';}}"
+    "template.addEventListener('change',()=>{if(!template.value)return;let parts=template.value.split('|');payload.value=parts[0];document.querySelector('select[name=type]').value=parts[1]||'TEST';document.querySelector('select[name=priority]').value=parts[2]||'NORMAL';template.value='';});"
     "scopeRadios.forEach(r=>r.addEventListener('change',syncScope));syncScope();"
     "let activeThread='ANNOUNCEMENTS';let cachedThreads={};"
     "function escapeHtml(v){return String(v).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('\"','&quot;');}"
     "function locText(x){return [x.location?.sitio||'',x.location?.barangay||'',x.location?.municipality||''].filter(Boolean).join(' \xE2\x86\x92 ');}"
     "function renderThreads(){let list=document.querySelector('.thread-list');let entries=Object.values(cachedThreads).sort((a,b)=>{if(a.thread_key==='ANNOUNCEMENTS')return -1;if(b.thread_key==='ANNOUNCEMENTS')return 1;return (b.lastSeen||0)-(a.lastSeen||0);});if(!entries.length){list.innerHTML='<div class=muted>No messages yet.</div>';return;}list.innerHTML=entries.map(t=>'<div class=thread-item'+(t.thread_key===activeThread?' active':'')+' data-thread=\"'+escapeHtml(t.thread_key)+'\"><b>'+escapeHtml(t.label)+'</b><small>'+t.messages.length+' message(s)</small></div>').join('');list.querySelectorAll('.thread-item').forEach(el=>el.addEventListener('click',()=>{activeThread=el.dataset.thread;renderThreads();renderThreadView();}));}"
-    "function renderThreadView(){let view=document.querySelector('.thread-view');let thread=cachedThreads[activeThread]||Object.values(cachedThreads)[0];if(!thread){view.innerHTML='<div class=muted>No messages yet.</div>';return;}view.innerHTML='<h4>'+escapeHtml(thread.label)+'</h4>'+thread.messages.map(x=>'<div class=bubble><div class=meta>'+escapeHtml(x.direction)+' #'+x.id+' | '+escapeHtml(x.type)+' | '+escapeHtml(x.priority)+' | '+escapeHtml(x.thread_key)+'</div><div><b>From:</b> '+escapeHtml(x.source)+'<br><b>To:</b> '+escapeHtml(x.destination)+'<br><b>Payload:</b> '+escapeHtml(x.payload)+'</div><div class=location><b>Location:</b> '+escapeHtml(locText(x))+'</div>'+((x.thread_key==='ANNOUNCEMENTS')?'<div class=location><b>Sender:</b> '+escapeHtml(x.source)+'</div>':'')+'</div>').join('');}"
+    "function renderThreadView(){let view=document.querySelector('.thread-view');let thread=cachedThreads[activeThread]||Object.values(cachedThreads)[0];if(!thread){view.innerHTML='<div class=muted>No messages yet.</div>';return;}view.innerHTML='<h4>'+escapeHtml(thread.label)+'</h4>'+thread.messages.map(x=>'<div class=bubble><div class=meta>'+escapeHtml(x.direction)+' #'+x.id+' | '+escapeHtml(x.type)+' | '+escapeHtml(x.priority)+' | '+escapeHtml(x.thread_key)+' | Status: '+escapeHtml(x.status||'UNKNOWN')+'</div><div><b>From:</b> '+escapeHtml(x.source)+'<br><b>To:</b> '+escapeHtml(x.destination)+'<br><b>Payload:</b> '+escapeHtml(x.payload)+'</div><div class=location><b>Location:</b> '+escapeHtml(locText(x))+'</div>'+((x.thread_key==='ANNOUNCEMENTS')?'<div class=location><b>Sender:</b> '+escapeHtml(x.source)+'</div>':'')+'</div>').join('');}"
     "async function load(){let s=await fetch('/api/status').then(r=>r.json());"
     "document.getElementById('status').innerHTML='Node <b>'+s.node+'</b> | '+s.name+' | '+s.location+' | Relay <b>'+s.relay+'</b> | AP <b>'+s.ssid+'</b> | Clients <b>'+s.clients+'</b>';"
-    "let m=await fetch('/api/messages').then(r=>r.json());cachedThreads={};m.forEach(x=>{let key=x.thread_key||'UNKNOWN';if(!cachedThreads[key])cachedThreads[key]={thread_key:key,label:key==='ANNOUNCEMENTS'?'Announcements':key,messages:[],lastSeen:0};cachedThreads[key].messages.push(x);cachedThreads[key].lastSeen=Math.max(cachedThreads[key].lastSeen,x.id||0);if(key==='ANNOUNCEMENTS')cachedThreads[key].label='Announcements';else if(!cachedThreads[key].label||cachedThreads[key].label===key)cachedThreads[key].label=key;});if(!cachedThreads[activeThread]&&Object.keys(cachedThreads).length){activeThread=Object.keys(cachedThreads)[0];}renderThreads();renderThreadView();}"
+    "let m=await fetch('/api/messages').then(r=>r.json());cachedThreads={};let peers={};m.forEach(x=>{let key=x.thread_key||'UNKNOWN';if(!cachedThreads[key])cachedThreads[key]={thread_key:key,label:key==='ANNOUNCEMENTS'?'Announcements':key,messages:[],lastSeen:0};cachedThreads[key].messages.push(x);cachedThreads[key].lastSeen=Math.max(cachedThreads[key].lastSeen,x.id||0);if(key==='ANNOUNCEMENTS')cachedThreads[key].label='Announcements';else if(!cachedThreads[key].label||cachedThreads[key].label===key)cachedThreads[key].label=key;if(x.source){let p=peers[x.source]||{id:x.source,lastSeen:0,location:''};p.lastSeen=Math.max(p.lastSeen,x.id||0);p.location=locText(x);peers[x.source]=p;}});if(!cachedThreads[activeThread]&&Object.keys(cachedThreads).length){activeThread=Object.keys(cachedThreads)[0];}renderThreads();renderThreadView();let health=document.getElementById('health');let roster=Object.values(peers).sort((a,b)=>b.lastSeen-a.lastSeen);health.innerHTML=roster.length?roster.map(p=>'<div class=msg><b>'+escapeHtml(p.id)+'</b><br><span class=muted>Last seen #'+p.lastSeen+'</span><br>'+escapeHtml(p.location||'Unknown')+'</div>').join(''):'No peers yet.';}"
     "load();setInterval(load,4000);</script></body></html>";
 
 static const char SETUP_HTML[] =
@@ -1344,6 +1361,66 @@ static void update_message_status(uint32_t id, const char *source, const char *s
     data_unlock();
 }
 
+static void retry_tracker_add(const emergency_message_t *message)
+{
+    if (strcmp(message->priority, "HIGH") != 0 || strcmp(message->destination, "ALL") == 0) {
+        return;
+    }
+
+    data_lock();
+    for (size_t i = 0; i < MAX_MESSAGES; i++) {
+        retry_entry_t *entry = &retry_entries[i];
+        if (!entry->active) {
+            entry->id = message->id;
+            copy_field(entry->source, sizeof(entry->source), message->source);
+            copy_field(entry->destination, sizeof(entry->destination), message->destination);
+            copy_field(entry->priority, sizeof(entry->priority), message->priority);
+            entry->attempts = 1;
+            entry->next_retry_tick = xTaskGetTickCount() + pdMS_TO_TICKS(5000);
+            entry->active = true;
+            break;
+        }
+    }
+    data_unlock();
+}
+
+static void retry_tracker_task(void *parameter)
+{
+    while (true) {
+        TickType_t now = xTaskGetTickCount();
+        data_lock();
+        for (size_t i = 0; i < MAX_MESSAGES; i++) {
+            retry_entry_t *entry = &retry_entries[i];
+            if (!entry->active || now < entry->next_retry_tick) {
+                continue;
+            }
+
+            for (size_t j = 0; j < message_count; j++) {
+                emergency_message_t *message = &messages[j];
+                if (message->id != entry->id || strcmp(message->source, entry->source) != 0) {
+                    continue;
+                }
+                if (strcmp(message->status, "ACKED") == 0) {
+                    entry->active = false;
+                    break;
+                }
+                if (entry->attempts >= 3) {
+                    copy_field(message->status, sizeof(message->status), "FAILED");
+                    entry->active = false;
+                    break;
+                }
+                entry->attempts++;
+                entry->next_retry_tick = now + pdMS_TO_TICKS(5000 * entry->attempts);
+                lora_transmit(message->packet);
+                copy_field(message->status, sizeof(message->status), "SENT");
+                break;
+            }
+        }
+        data_unlock();
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
 static void copy_node_id(char *destination, size_t destination_size, const char *source)
 {
     size_t write_index = 0;
@@ -1800,6 +1877,7 @@ static void queue_message(const char *destination, const char *type, const char 
     ESP_LOGI(TAG, "LoRa TX pending: %s", packet);
     if (lora_transmit(packet)) {
         update_message_status(message->id, message->source, "SENT");
+        retry_tracker_add(message);
     } else {
         update_message_status(message->id, message->source, "FAILED");
     }
@@ -1959,6 +2037,7 @@ static esp_err_t send_handler(httpd_req_t *request)
 {
     char body[384] = {0};
     char destination[FIELD_LEN];
+    char sender_name[FIELD_LEN] = {0};
     char type[FIELD_LEN] = "TEST";
     char priority[FIELD_LEN] = "NORMAL";
     char payload[PAYLOAD_LEN] = "No message";
@@ -1978,10 +2057,34 @@ static esp_err_t send_handler(httpd_req_t *request)
     }
 
     copy_field(destination, sizeof(destination), node_config.default_destination);
+    form_value(body, "sender_name", sender_name, sizeof(sender_name));
     form_value(body, "destination", destination, sizeof(destination));
     form_value(body, "type", type, sizeof(type));
     form_value(body, "priority", priority, sizeof(priority));
     form_value(body, "payload", payload, sizeof(payload));
+
+    if ((xTaskGetTickCount() - last_send_tick) < pdMS_TO_TICKS(10000)) {
+        httpd_resp_set_status(request, "429 Too Many Requests");
+        httpd_resp_set_type(request, "text/html");
+        return httpd_resp_send(request, "<!doctype html><html><body><h2>Slow down.</h2><p>Please wait before sending again.</p></body></html>", HTTPD_RESP_USE_STRLEN);
+    }
+
+    last_send_tick = xTaskGetTickCount();
+    if (sender_name[0] != '\0') {
+        char named_payload[PAYLOAD_LEN];
+        size_t prefix_len;
+
+        named_payload[0] = '\0';
+        copy_field(named_payload, sizeof(named_payload), sender_name);
+        prefix_len = strlen(named_payload);
+        if (prefix_len < sizeof(named_payload) - 3) {
+            named_payload[prefix_len++] = ':';
+            named_payload[prefix_len++] = ' ';
+            named_payload[prefix_len] = '\0';
+            copy_field(named_payload + prefix_len, sizeof(named_payload) - prefix_len, payload);
+        }
+        copy_field(payload, sizeof(payload), named_payload);
+    }
 
     queue_message(destination, type, priority, payload);
     return send_redirect(request, "/");
@@ -2272,6 +2375,8 @@ void app_main(void)
     load_node_config();
     lora_init();
     xTaskCreate(boot_sync_task, "boot_sync_task", 4096, NULL, 4, NULL);
+    xTaskCreate(lora_rx_task, "lora_rx_task", 4096, NULL, 6, NULL);
+    xTaskCreate(retry_tracker_task, "retry_tracker_task", 4096, NULL, 3, NULL);
     start_wifi_ap();
     start_http_server();
     xTaskCreate(factory_reset_button_task, "factory_reset_button_task", 3072, NULL, 7, NULL);
