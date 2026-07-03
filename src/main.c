@@ -14,6 +14,7 @@
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_mac.h"
+#include "esp_timer.h"
 #include "esp_netif.h"
 #include "esp_random.h"
 #include "esp_system.h"
@@ -44,6 +45,7 @@
 #define RGB_LED_GPIO 48
 #define FACTORY_RESET_HOLD_MS 10000
 #define RESET_WARNING_MS 5000
+#define DUPLICATE_NODE_ID_WARNING_MS 60000
 #define CONFIG_NAMESPACE "bems_config"
 #define PACKET_COUNTER_KEY "packet_ctr"
 #define HIGHEST_SEEN_ID_KEY "highest_seen"
@@ -159,6 +161,7 @@ static void json_escape_string(char *destination, size_t destination_size, const
 static void update_message_status(uint32_t id, const char *source, const char *status);
 static bool lora_channel_clear(void);
 static void retry_tracker_task(void *parameter);
+static void lora_tx_worker_task(void *parameter);
 static void time_sync_task(void *parameter);
 static uint32_t current_epoch_seconds(void);
 static void apply_time_sync(uint32_t epoch, uint8_t distance);
@@ -196,6 +199,10 @@ typedef struct {
     bool active;
 } retry_entry_t;
 
+typedef struct {
+    char packet[PACKET_LEN];
+} tx_queue_item_t;
+
 static const char *TAG = "barangay_mesh";
 static const char *AP_PASSWORD = "";
 
@@ -223,6 +230,8 @@ static bool rgb_led_ready;
 static bool lora_ready;
 static volatile bool radio_in_tx;
 static bool duplicate_node_id_warning;
+static TickType_t duplicate_node_id_warning_tick;
+static QueueHandle_t lora_tx_queue;
 static SemaphoreHandle_t lora_dio0_semaphore;
 static SemaphoreHandle_t lora_tx_done_semaphore;
 static SemaphoreHandle_t data_mutex;
@@ -245,6 +254,43 @@ static void data_unlock(void)
     if (data_mutex != NULL) {
         xSemaphoreGive(data_mutex);
     }
+}
+
+static void set_duplicate_node_id_warning(void)
+{
+    duplicate_node_id_warning = true;
+    duplicate_node_id_warning_tick = xTaskGetTickCount();
+}
+
+static bool duplicate_node_id_warning_active(void)
+{
+    if (!duplicate_node_id_warning) {
+        return false;
+    }
+
+    if ((xTaskGetTickCount() - duplicate_node_id_warning_tick) > pdMS_TO_TICKS(DUPLICATE_NODE_ID_WARNING_MS)) {
+        duplicate_node_id_warning = false;
+        return false;
+    }
+
+    return true;
+}
+
+static bool queue_lora_transmit(const char *packet)
+{
+    tx_queue_item_t item = {0};
+
+    if (lora_tx_queue == NULL) {
+        return lora_transmit(packet);
+    }
+
+    copy_field(item.packet, sizeof(item.packet), packet);
+    if (xQueueSend(lora_tx_queue, &item, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "LoRa TX queue full; dropping packet");
+        return false;
+    }
+
+    return true;
 }
 
 static void rgb_led_init(void)
@@ -892,7 +938,7 @@ static void send_ack_packet(const mesh_packet_t *parsed)
              (unsigned long)parsed->id);
 
     ESP_LOGI(TAG, "Sending ACK to %s for packet %lu", parsed->source, (unsigned long)parsed->id);
-    lora_transmit(ack_packet);
+    queue_lora_transmit(ack_packet);
 }
 
 static uint32_t sync_last_id_from_payload(const char *payload)
@@ -920,15 +966,12 @@ static bool is_control_packet_type(const char *type)
 
 static uint32_t current_epoch_seconds(void)
 {
-    return (uint32_t)(epoch_offset_sec + (int64_t)(xTaskGetTickCount() / configTICK_RATE_HZ));
+    return (uint32_t)(epoch_offset_sec + (int64_t)(esp_timer_get_time() / 1000000LL));
 }
 
 static void apply_time_sync(uint32_t epoch, uint8_t distance)
 {
-    uint32_t now_ticks = xTaskGetTickCount();
-    uint32_t now_seconds = now_ticks / configTICK_RATE_HZ;
-
-    epoch_offset_sec = (int64_t)epoch - (int64_t)now_seconds;
+    epoch_offset_sec = (int64_t)epoch - (int64_t)(esp_timer_get_time() / 1000000LL);
     time_synced = true;
     time_sync_distance = distance;
     last_time_sync_broadcast_tick = 0;
@@ -1058,10 +1101,15 @@ static bool is_private_destination_for_other_node(const char *destination, const
 
 static void send_sync_responses(const mesh_packet_t *request)
 {
-    emergency_message_t snapshot[MAX_MESSAGES];
+    emergency_message_t *snapshot = malloc(sizeof(*snapshot) * MAX_MESSAGES);
     size_t snapshot_count = 0;
     uint32_t last_id = sync_last_id_from_payload(request->payload);
     char encoded_location[SITIO_LEN + BARANGAY_LEN + MUNICIPALITY_LEN + 2];
+
+    if (snapshot == NULL) {
+        ESP_LOGW(TAG, "Unable to allocate SYNC_RESP snapshot");
+        return;
+    }
 
     location_encode(&node_config.location, encoded_location, sizeof(encoded_location));
 
@@ -1113,8 +1161,10 @@ static void send_sync_responses(const mesh_packet_t *request)
         copy_field(sync_response + prefix_len, sizeof(sync_response) - (size_t)prefix_len, original_packet);
 
         ESP_LOGI(TAG, "SYNC_RESP to %s for packet %lu", request->source, (unsigned long)snapshot[i].id);
-        lora_transmit(sync_response);
+        queue_lora_transmit(sync_response);
     }
+
+    free(snapshot);
 }
 
 static void send_sync_request(uint32_t last_id)
@@ -1138,7 +1188,7 @@ static void send_sync_request(uint32_t last_id)
              (unsigned long)last_id);
 
     ESP_LOGI(TAG, "Broadcasting SYNC_REQ with last_id=%lu", (unsigned long)last_id);
-    lora_transmit(sync_request);
+    queue_lora_transmit(sync_request);
 }
 
 static void send_boot_sync_request(void)
@@ -1304,7 +1354,7 @@ static void lora_rx_task(void *parameter)
                                 store_received_packet(parsed.payload, &synced_packet, rssi, snr);
                             }
                             if (is_for_me && strcmp(parsed.source, node_id) != 0) {
-                                duplicate_node_id_warning = true;
+                                set_duplicate_node_id_warning();
                             }
                             continue;
                         }
@@ -1329,7 +1379,7 @@ static void lora_rx_task(void *parameter)
 
                         if (is_ack && is_for_me) {
                             if (strcmp(parsed.source, node_id) != 0) {
-                                duplicate_node_id_warning = true;
+                                set_duplicate_node_id_warning();
                             }
                             uint32_t ack_id = ack_id_from_payload(parsed.payload);
                             if (ack_id != 0) {
@@ -1341,7 +1391,7 @@ static void lora_rx_task(void *parameter)
                             char forward_packet[PACKET_LEN];
                             build_forward_packet(&parsed, forward_packet, sizeof(forward_packet));
                             ESP_LOGI(TAG, "Relaying packet toward %s with %d hops left", parsed.destination, parsed.hops - 1);
-                            lora_transmit(forward_packet);
+                            queue_lora_transmit(forward_packet);
                         }
                     }
                 } else {
@@ -1556,10 +1606,17 @@ static void retry_tracker_task(void *parameter)
 {
     while (true) {
         TickType_t now = xTaskGetTickCount();
-        data_lock();
         for (size_t i = 0; i < MAX_MESSAGES; i++) {
-            retry_entry_t *entry = &retry_entries[i];
+            retry_entry_t *entry;
+            uint32_t retry_id = 0;
+            char retry_source[FIELD_LEN] = {0};
+            char packet[PACKET_LEN] = {0};
+            bool should_retry = false;
+
+            data_lock();
+            entry = &retry_entries[i];
             if (!entry->active || now < entry->next_retry_tick) {
+                data_unlock();
                 continue;
             }
 
@@ -1579,13 +1636,46 @@ static void retry_tracker_task(void *parameter)
                 }
                 entry->attempts++;
                 entry->next_retry_tick = now + pdMS_TO_TICKS(5000 * entry->attempts);
-                lora_transmit(message->packet);
                 copy_field(message->status, sizeof(message->status), "SENT");
+                retry_id = entry->id;
+                copy_field(retry_source, sizeof(retry_source), entry->source);
+                copy_field(packet, sizeof(packet), message->packet);
+                should_retry = true;
                 break;
             }
+            data_unlock();
+
+            if (should_retry) {
+                if (!queue_lora_transmit(packet)) {
+                    data_lock();
+                    for (size_t j = 0; j < message_count; j++) {
+                        emergency_message_t *message = &messages[j];
+                        if (message->id == retry_id && strcmp(message->source, retry_source) == 0) {
+                            copy_field(message->status, sizeof(message->status), "FAILED");
+                            break;
+                        }
+                    }
+                    data_unlock();
+                }
+            }
         }
-        data_unlock();
         vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
+static void lora_tx_worker_task(void *parameter)
+{
+    tx_queue_item_t item;
+
+    while (true) {
+        if (lora_tx_queue == NULL) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        if (xQueueReceive(lora_tx_queue, &item, portMAX_DELAY) == pdTRUE) {
+            lora_transmit(item.packet);
+        }
     }
 }
 
@@ -1967,13 +2057,23 @@ static void json_escape_string(char *destination, size_t destination_size, const
     }
 
     while (*source != '\0' && write_index < destination_size - 1) {
-        char character = *source++;
+        unsigned char character = (unsigned char)*source++;
 
         if ((character == '"' || character == '\\') && write_index < destination_size - 2) {
             destination[write_index++] = '\\';
-            destination[write_index++] = character;
+            destination[write_index++] = (char)character;
+        } else if (character < 0x20) {
+            if (write_index + 6 >= destination_size) {
+                break;
+            }
+            destination[write_index++] = '\\';
+            destination[write_index++] = 'u';
+            destination[write_index++] = '0';
+            destination[write_index++] = '0';
+            destination[write_index++] = "0123456789ABCDEF"[character >> 4];
+            destination[write_index++] = "0123456789ABCDEF"[character & 0x0F];
         } else if (character != '"' && character != '\\') {
-            destination[write_index++] = character;
+            destination[write_index++] = (char)character;
         } else {
             break;
         }
@@ -2076,6 +2176,39 @@ static esp_err_t send_redirect(httpd_req_t *request, const char *location)
     return ESP_OK;
 }
 
+static bool cookie_matches_session(const char *cookie_header)
+{
+    const char *cursor = cookie_header;
+    char token[128];
+
+    while (*cursor != '\0') {
+        while (*cursor == ' ' || *cursor == ';') {
+            cursor++;
+        }
+
+        size_t token_len = 0;
+        while (cursor[token_len] != '\0' && cursor[token_len] != ';' && token_len < sizeof(token) - 1) {
+            token[token_len] = cursor[token_len];
+            token_len++;
+        }
+        token[token_len] = '\0';
+
+        if (strncmp(token, SESSION_COOKIE_NAME "=", strlen(SESSION_COOKIE_NAME) + 1) == 0) {
+            const char *value = token + strlen(SESSION_COOKIE_NAME) + 1;
+            if (strcmp(value, session_token) == 0) {
+                return true;
+            }
+        }
+
+        cursor += token_len;
+        while (*cursor == ';' || *cursor == ' ') {
+            cursor++;
+        }
+    }
+
+    return false;
+}
+
 static void init_session_token(void)
 {
     uint32_t random_a = esp_random();
@@ -2087,7 +2220,6 @@ static void init_session_token(void)
 static bool request_has_session(httpd_req_t *request)
 {
     char cookie[128] = {0};
-    char expected[64];
 
     if (!node_config.configured) {
         return true;
@@ -2097,8 +2229,7 @@ static bool request_has_session(httpd_req_t *request)
         return false;
     }
 
-    snprintf(expected, sizeof(expected), "%s=%s", SESSION_COOKIE_NAME, session_token);
-    return strstr(cookie, expected) != NULL;
+    return cookie_matches_session(cookie);
 }
 
 static esp_err_t require_session(httpd_req_t *request)
@@ -2328,6 +2459,7 @@ static esp_err_t status_handler(httpd_req_t *request)
     char escaped_location[FIELD_LEN * 2];
     char escaped_ssid[FIELD_LEN * 2];
     char escaped_relay[8];
+    bool duplicate_warning;
     size_t current_message_count;
     esp_err_t session_result = require_session(request);
 
@@ -2345,6 +2477,7 @@ static esp_err_t status_handler(httpd_req_t *request)
     json_escape_string(escaped_location, sizeof(escaped_location), node_config.location.barangay);
     json_escape_string(escaped_ssid, sizeof(escaped_ssid), ap_ssid);
     json_escape_string(escaped_relay, sizeof(escaped_relay), "true");
+    duplicate_warning = duplicate_node_id_warning_active();
 
     snprintf(response, sizeof(response),
              "{\"node\":\"%s\",\"name\":\"%s\",\"location\":\"%s\",\"ssid\":\"%s\",\"clients\":%u,\"messages\":%u,\"configured\":%s,\"relay\":\"%s\",\"duplicate_warning\":%s,\"time_synced\":%s,\"epoch\":%lu}",
@@ -2356,7 +2489,7 @@ static esp_err_t status_handler(httpd_req_t *request)
              (unsigned int)current_message_count,
              node_config.configured ? "true" : "false",
              escaped_relay,
-             duplicate_node_id_warning ? "true" : "false",
+             duplicate_warning ? "true" : "false",
              time_synced ? "true" : "false",
              (unsigned long)current_epoch_seconds());
 
@@ -2366,9 +2499,7 @@ static esp_err_t status_handler(httpd_req_t *request)
 
 static esp_err_t messages_handler(httpd_req_t *request)
 {
-    // esp_http_server dispatches this on a single worker task by default, so a static
-    // snapshot buffer is safe here and keeps the worker stack clear for chunked I/O.
-    static emergency_message_t snapshot[MAX_MESSAGES];
+    emergency_message_t message_copy;
     size_t snapshot_count = 0;
     esp_err_t session_result = require_session(request);
 
@@ -2379,12 +2510,21 @@ static esp_err_t messages_handler(httpd_req_t *request)
     httpd_resp_set_type(request, "application/json");
     httpd_resp_send_chunk(request, "[", 1);
     data_lock();
-    for (size_t i = 0; i < message_count && snapshot_count < MAX_MESSAGES; i++) {
-        snapshot[snapshot_count++] = messages[message_count - 1 - i];
-    }
+    snapshot_count = message_count;
     data_unlock();
-    for (size_t i = 0; i < snapshot_count; i++) {
-        write_message_json_chunk(request, &snapshot[i], i == 0);
+    for (size_t i = 0; i < snapshot_count && i < MAX_MESSAGES; i++) {
+        bool wrote = false;
+
+        data_lock();
+        if (message_count > i) {
+            message_copy = messages[message_count - 1 - i];
+            wrote = true;
+        }
+        data_unlock();
+
+        if (wrote) {
+            write_message_json_chunk(request, &message_copy, i == 0);
+        }
     }
     httpd_resp_send_chunk(request, "]", 1);
     httpd_resp_set_type(request, "application/json");
@@ -2402,7 +2542,7 @@ static void start_http_server(void)
     config.server_port = HTTP_PORT;
     config.max_uri_handlers = 16;
     config.uri_match_fn = httpd_uri_match_wildcard;
-    config.stack_size = 24576;
+    config.stack_size = 16384;
 
     const httpd_uri_t routes[] = {
         {.uri = "/", .method = HTTP_GET, .handler = index_handler},
@@ -2548,6 +2688,8 @@ void app_main(void)
 
     data_mutex = xSemaphoreCreateMutex();
     ESP_ERROR_CHECK(data_mutex == NULL ? ESP_ERR_NO_MEM : ESP_OK);
+    lora_tx_queue = xQueueCreate(8, sizeof(tx_queue_item_t));
+    ESP_ERROR_CHECK(lora_tx_queue == NULL ? ESP_ERR_NO_MEM : ESP_OK);
 
     init_identity();
     init_session_token();
@@ -2557,6 +2699,7 @@ void app_main(void)
     init_factory_reset_button();
     load_node_config();
     lora_init();
+    xTaskCreate(lora_tx_worker_task, "lora_tx_worker_task", 4096, NULL, 6, NULL);
     xTaskCreate(boot_sync_task, "boot_sync_task", 4096, NULL, 4, NULL);
     xTaskCreate(retry_tracker_task, "retry_tracker_task", 4096, NULL, 3, NULL);
     xTaskCreate(time_sync_task, "time_sync_task", 3072, NULL, 2, NULL);
