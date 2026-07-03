@@ -22,7 +22,7 @@ bool derive_crypto_keys(uint8_t aes_key[16], uint8_t hmac_key[32]);
 bool aes_ctr_crypt(uint8_t *data, size_t length, const uint8_t nonce[BEMS_NONCE_LEN]);
 
 // HMAC-SHA256 computation
-bool hmac_sha256(const uint8_t *data, size_t data_len, uint8_t tag[32]);
+bool bems_hmac_sha256(const uint8_t *data, size_t data_len, uint8_t tag[32]);
 
 // Encrypts a plaintext mesh packet into a BEMS frame
 bool bems_encrypt_packet(const char *plain_packet, uint8_t *frame, size_t frame_size, size_t *frame_len);

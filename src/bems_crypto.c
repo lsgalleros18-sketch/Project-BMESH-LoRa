@@ -131,7 +131,7 @@ bool aes_ctr_crypt(uint8_t *data, size_t length, const uint8_t nonce[BEMS_NONCE_
     return status == PSA_SUCCESS && output_length + finish_length == length;
 }
 
-bool hmac_sha256(const uint8_t *data, size_t data_len, uint8_t tag[32])
+bool bems_hmac_sha256(const uint8_t *data, size_t data_len, uint8_t tag[32])
 {
     uint8_t aes_key[16];
     uint8_t hmac_key[32];
@@ -190,7 +190,7 @@ bool bems_encrypt_packet(const char *plain_packet, uint8_t *frame, size_t frame_
         return false;
     }
 
-    if (!hmac_sha256(frame, BEMS_FRAME_HEADER_LEN + plain_len, full_tag)) {
+    if (!bems_hmac_sha256(frame, BEMS_FRAME_HEADER_LEN + plain_len, full_tag)) {
         secure_zero(full_tag, sizeof(full_tag));
         return false;
     }
@@ -221,7 +221,7 @@ bool bems_decrypt_frame(const uint8_t *frame, size_t frame_len, char *plain_pack
         return false;
     }
 
-    if (!hmac_sha256(frame, BEMS_FRAME_HEADER_LEN + cipher_len, full_tag)) {
+    if (!bems_hmac_sha256(frame, BEMS_FRAME_HEADER_LEN + cipher_len, full_tag)) {
         secure_zero(full_tag, sizeof(full_tag));
         return false;
     }
