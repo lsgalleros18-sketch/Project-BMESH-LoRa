@@ -4,17 +4,11 @@
 #include <stdlib.h>
 #include "esp_random.h"
 #include "psa/crypto.h"
-
-// Forward declare node_config to avoid circular dependency
-extern struct {
-    char network_key[32];
-} node_config;
+#include "node_config.h"
 
 #define DEFAULT_NETWORK_KEY "CHANGEME1234567"
-#define FIELD_LEN 32
 #define LORA_MAX_PAYLOAD 255
 #define BEMS_MAX_PLAINTEXT (LORA_MAX_PAYLOAD - BEMS_FRAME_HEADER_LEN - BEMS_HMAC_TAG_LEN)
-#define MIN(a, b) ((a) < (b) ? (a) : (b))
 
 void secure_zero(void *data, size_t length)
 {
@@ -51,7 +45,8 @@ bool derive_crypto_keys(uint8_t aes_key[16], uint8_t hmac_key[32])
 {
     uint8_t material[FIELD_LEN + 32];
     uint8_t digest[32];
-    size_t key_len = strlen(node_config.network_key);
+    const node_config_t *config = node_config_get();
+    size_t key_len = strlen(config->network_key);
     size_t hash_length = 0;
     psa_status_t status;
 
@@ -63,7 +58,7 @@ bool derive_crypto_keys(uint8_t aes_key[16], uint8_t hmac_key[32])
         key_len = strlen(DEFAULT_NETWORK_KEY);
         memcpy(material, DEFAULT_NETWORK_KEY, key_len);
     } else {
-        memcpy(material, node_config.network_key, key_len);
+        memcpy(material, config->network_key, key_len);
     }
 
     memcpy(&material[key_len], "BMESH AES-128", 13);

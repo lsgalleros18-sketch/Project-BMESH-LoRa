@@ -3,21 +3,11 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
-
-#define FIELD_LEN 32
-#define SITIO_LEN 24
-#define BARANGAY_LEN 24
-#define MUNICIPALITY_LEN 24
+#include "bems_common.h"
 #define PAYLOAD_LEN 140
 #define PACKET_LEN 320
 #define MAX_SEEN_PACKETS 64
 #define SEEN_PACKET_TTL_MS 60000
-
-typedef struct {
-    char sitio[SITIO_LEN];
-    char barangay[BARANGAY_LEN];
-    char municipality[MUNICIPALITY_LEN];
-} location_info_t;
 
 typedef struct {
     bool valid;

@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include "bems_common.h"
 
 #define BEMS_CRYPTO_VERSION 1
 #define BEMS_FRAME_PREFIX_0 'B'

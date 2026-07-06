@@ -2,11 +2,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
-
-#define FIELD_LEN 32
-#define SITIO_LEN 24
-#define BARANGAY_LEN 24
-#define MUNICIPALITY_LEN 24
+#include "bems_common.h"
 
 typedef struct {
     char sitio[SITIO_LEN];
@@ -24,18 +20,10 @@ typedef struct {
     char network_key[FIELD_LEN];
 } node_config_t;
 
-// Global configuration
-extern node_config_t node_config;
-extern char node_id[FIELD_LEN];
-
-// Loads node configuration from NVS
-void load_node_config(void);
-
-// Saves node configuration to NVS
-int save_node_config(const node_config_t *config);
-
-// Sets default configuration values
-void config_set_defaults(void);
-
-// Erases stored configuration
-void erase_node_config(void);
+const node_config_t *node_config_get(void);
+const char *node_config_get_node_id(void);
+void node_config_set_identity(const char *node_id);
+void node_config_load(void);
+int node_config_save(const node_config_t *config);
+void node_config_set_defaults(void);
+void node_config_erase(void);
