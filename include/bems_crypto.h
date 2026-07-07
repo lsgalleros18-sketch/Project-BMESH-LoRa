@@ -12,6 +12,7 @@
 #define BEMS_FRAME_HEADER_LEN 12
 #define BEMS_NONCE_LEN 8
 #define BEMS_HMAC_TAG_LEN 16
+#define BEMS_MAX_PLAINTEXT (255 - BEMS_FRAME_HEADER_LEN - BEMS_HMAC_TAG_LEN)
 
 // Initializes PSA crypto library
 bool crypto_init_once(void);

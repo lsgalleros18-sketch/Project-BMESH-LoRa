@@ -6,9 +6,7 @@
 #include "psa/crypto.h"
 #include "node_config.h"
 
-#define DEFAULT_NETWORK_KEY "CHANGEME1234567"
 #define LORA_MAX_PAYLOAD 255
-#define BEMS_MAX_PLAINTEXT (LORA_MAX_PAYLOAD - BEMS_FRAME_HEADER_LEN - BEMS_HMAC_TAG_LEN)
 
 void secure_zero(void *data, size_t length)
 {
@@ -54,12 +52,11 @@ bool derive_crypto_keys(uint8_t aes_key[16], uint8_t hmac_key[32])
         return false;
     }
 
-    if (key_len == 0) {
-        key_len = strlen(DEFAULT_NETWORK_KEY);
-        memcpy(material, DEFAULT_NETWORK_KEY, key_len);
-    } else {
-        memcpy(material, config->network_key, key_len);
+    if (!node_config_is_provisioned()) {
+        return false;
     }
+
+    memcpy(material, config->network_key, key_len);
 
     memcpy(&material[key_len], "BMESH AES-128", 13);
     status = psa_hash_compute(PSA_ALG_SHA_256, material, key_len + 13, digest, sizeof(digest), &hash_length);

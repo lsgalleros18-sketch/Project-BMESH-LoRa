@@ -48,7 +48,6 @@
 #define CONFIG_NAMESPACE "bems_config"
 #define PACKET_COUNTER_KEY "packet_ctr"
 #define HIGHEST_SEEN_ID_KEY "highest_seen"
-#define DEFAULT_WEB_PIN "1234"
 #define SESSION_COOKIE_NAME "BMESH_SESSION"
 #define SESSION_TOKEN_LEN 17
 
@@ -128,12 +127,10 @@ typedef struct {
     uint32_t stored_epoch;
 } emergency_message_t;
 
-static void location_encode(const location_info_t *loc, char *out, size_t out_size);
-static void location_decode(const char *encoded, location_info_t *loc);
 static void compute_thread_key(char *out, size_t out_size, const char *source, const char *destination);
 static void json_escape_string(char *destination, size_t destination_size, const char *source);
 static void update_message_status(uint32_t id, const char *source, const char *status);
-static bool lora_channel_clear(void);
+static void mesh_control_rx_task(void *parameter);
 static void retry_tracker_task(void *parameter);
 static void lora_tx_worker_task(void *parameter);
 static void time_sync_task(void *parameter);
@@ -145,47 +142,29 @@ static void write_message_json_chunk(httpd_req_t *request, const emergency_messa
 
 typedef struct {
     uint32_t id;
-    TickType_t seen_tick;
-    char source[FIELD_LEN];
-} seen_packet_t;
-
-typedef struct {
-    bool valid;
-    uint32_t id;
-    int hops;
-    char source[FIELD_LEN];
-    char destination[FIELD_LEN];
-    char type[FIELD_LEN];
-    char priority[FIELD_LEN];
-    char relay[FIELD_LEN];
-    char location_raw[PACKET_LEN];
-    location_info_t location; // was: char location[FIELD_LEN]
-    char payload[PAYLOAD_LEN];
-} mesh_packet_t;
-
-typedef struct {
-    uint32_t id;
     char source[FIELD_LEN];
     char destination[FIELD_LEN];
     char priority[FIELD_LEN];
     uint8_t attempts;
+    uint8_t max_attempts;
+    uint8_t mode;
     TickType_t next_retry_tick;
+    TickType_t retry_interval_ticks;
     bool active;
 } retry_entry_t;
+
+#define RETRY_MODE_ACK 1
+#define RETRY_MODE_BROADCAST 2
 
 typedef struct {
     char packet[PACKET_LEN];
 } tx_queue_item_t;
 
 static const char *TAG = "barangay_mesh";
-static const char *AP_PASSWORD = "";
 
 static char node_id[FIELD_LEN];
 static char ap_ssid[FIELD_LEN];
-static char session_token[SESSION_TOKEN_LEN];
-static node_config_t node_config;
 static emergency_message_t messages[MAX_MESSAGES];
-static seen_packet_t seen_packets[MAX_SEEN_PACKETS];
 static retry_entry_t retry_entries[MAX_MESSAGES];
 static size_t message_count;
 static size_t seen_packet_count;
@@ -197,25 +176,43 @@ static bool time_synced;
 static uint8_t time_sync_distance;
 static TickType_t last_time_sync_broadcast_tick;
 static httpd_handle_t http_server;
-static spi_device_handle_t lora_spi;
 static rmt_channel_handle_t rgb_led_channel;
 static rmt_encoder_handle_t rgb_led_encoder;
 static bool rgb_led_ready;
-static bool lora_ready;
-static volatile bool radio_in_tx;
 static bool duplicate_node_id_warning;
 static TickType_t duplicate_node_id_warning_tick;
 static QueueHandle_t lora_tx_queue;
-static SemaphoreHandle_t lora_dio0_semaphore;
-static SemaphoreHandle_t lora_tx_done_semaphore;
 static SemaphoreHandle_t data_mutex;
+
+typedef struct {
+    bool active;
+    char token[SESSION_TOKEN_LEN];
+    char ip[40];
+    TickType_t last_seen;
+} session_record_t;
+
+typedef struct {
+    bool active;
+    char ip[40];
+    uint8_t failures;
+    TickType_t lock_until;
+} login_lockout_t;
+
+#define MAX_SESSIONS 4
+#define MAX_LOCKOUTS 4
+#ifndef SESSION_IDLE_TIMEOUT_MS
+#define SESSION_IDLE_TIMEOUT_MS 900000
+#endif
+#define LOGIN_BASE_LOCK_MS 30000
+
+static session_record_t sessions[MAX_SESSIONS];
+static login_lockout_t lockouts[MAX_LOCKOUTS];
+
+#define node_config (*node_config_get())
 
 static void copy_field(char *destination, size_t destination_size, const char *source);
 static void save_packet_counter(void);
 static void update_highest_seen_id(uint32_t id);
-static bool lora_transmit(const char *packet);
-static esp_err_t save_node_config(const node_config_t *config);
-
 static void data_lock(void)
 {
     if (data_mutex != NULL) {
@@ -402,8 +399,8 @@ static const char SETUP_HTML[] =
     "<label>Barangay<input name=barangay maxlength=23 placeholder='Example: San Isidro' required></label>"
     "<label>Municipality<input name=municipality maxlength=23 placeholder='Example: Cabuyao'></label>"
     "<label>Default Destination<input name=default_destination maxlength=31 value='BRGY001' placeholder='Example: ALL or BRGY001'></label>"
-    "<label>Web PIN<input name=web_pin maxlength=31 value='1234' placeholder='Shared portal PIN' required></label>"
-    "<label>Network Key<input name=network_key maxlength=31 value='CHANGEME1234567' placeholder='Shared mesh encryption key' required></label>"
+    "<label>Web PIN<input name=web_pin maxlength=31 placeholder='Generated on first boot' required></label>"
+    "<label>Network Key<input name=network_key maxlength=31 placeholder='Generated on first boot or enter pairing key' required></label>"
     "<button type=submit>Save Setup and Reboot</button></form>"
     "<p class=muted>Factory reset later by holding BOOT for 10 seconds during startup.</p></section></main></body></html>";
 
@@ -420,55 +417,6 @@ static const char LOGIN_HTML[] =
     "<label>Portal PIN<input name=pin maxlength=31 type=password required></label>"
     "<button type=submit>Unlock Portal</button></form><p class=muted>Use the shared PIN configured for this node.</p></section></main></body></html>";
 
-static esp_err_t lora_transfer(uint8_t address, const uint8_t *tx_data, uint8_t *rx_data, size_t length)
-{
-    uint8_t tx_buffer[LORA_MAX_PAYLOAD + 1] = {0};
-    uint8_t rx_buffer[LORA_MAX_PAYLOAD + 1] = {0};
-    spi_transaction_t transaction = {0};
-
-    if (length > LORA_MAX_PAYLOAD) {
-        return ESP_ERR_INVALID_SIZE;
-    }
-
-    tx_buffer[0] = address;
-    if (tx_data != NULL && length > 0) {
-        memcpy(&tx_buffer[1], tx_data, length);
-    }
-
-    transaction.length = (length + 1) * 8;
-    transaction.tx_buffer = tx_buffer;
-    transaction.rx_buffer = rx_buffer;
-
-    esp_err_t result = spi_device_transmit(lora_spi, &transaction);
-    if (result == ESP_OK && rx_data != NULL && length > 0) {
-        memcpy(rx_data, &rx_buffer[1], length);
-    }
-
-    return result;
-}
-
-static uint8_t lora_read_reg(uint8_t address)
-{
-    uint8_t value = 0;
-    lora_transfer(address & 0x7F, NULL, &value, 1);
-    return value;
-}
-
-static void lora_write_reg(uint8_t address, uint8_t value)
-{
-    lora_transfer(address | 0x80, &value, NULL, 1);
-}
-
-static void lora_write_fifo(const uint8_t *data, size_t length)
-{
-    lora_transfer(REG_FIFO | 0x80, data, NULL, length);
-}
-
-static void lora_read_fifo(uint8_t *data, size_t length)
-{
-    lora_transfer(REG_FIFO & 0x7F, NULL, data, length);
-}
-
 static emergency_message_t *next_message_slot(void)
 {
     emergency_message_t *message;
@@ -482,133 +430,6 @@ static emergency_message_t *next_message_slot(void)
 
     memset(message, 0, sizeof(*message));
     return message;
-}
-
-static bool packet_seen(const char *source, uint32_t id)
-{
-    bool seen = false;
-    TickType_t now = xTaskGetTickCount();
-    TickType_t ttl_ticks = pdMS_TO_TICKS(SEEN_PACKET_TTL_MS);
-
-    data_lock();
-    for (size_t i = 0; i < seen_packet_count;) {
-        if ((now - seen_packets[i].seen_tick) > ttl_ticks) {
-            seen_packets[i] = seen_packets[seen_packet_count - 1];
-            seen_packet_count--;
-            continue;
-        }
-
-        if (seen_packets[i].id == id && strcmp(seen_packets[i].source, source) == 0) {
-            seen = true;
-            break;
-        }
-
-        i++;
-    }
-
-    data_unlock();
-    return seen;
-}
-
-static void remember_packet(const char *source, uint32_t id)
-{
-    seen_packet_t *seen_packet;
-    TickType_t now = xTaskGetTickCount();
-    TickType_t ttl_ticks = pdMS_TO_TICKS(SEEN_PACKET_TTL_MS);
-    size_t slot_index = 0;
-
-    data_lock();
-    for (size_t i = 0; i < seen_packet_count;) {
-        if ((now - seen_packets[i].seen_tick) > ttl_ticks) {
-            seen_packets[i] = seen_packets[seen_packet_count - 1];
-            seen_packet_count--;
-            continue;
-        }
-
-        i++;
-    }
-
-    if (seen_packet_count < MAX_SEEN_PACKETS) {
-        seen_packet = &seen_packets[seen_packet_count++];
-    } else {
-        for (size_t i = 1; i < seen_packet_count; i++) {
-            if ((now - seen_packets[i].seen_tick) > (now - seen_packets[slot_index].seen_tick)) {
-                slot_index = i;
-            }
-        }
-        seen_packet = &seen_packets[slot_index];
-    }
-
-    seen_packet->id = id;
-    seen_packet->seen_tick = now;
-    copy_field(seen_packet->source, sizeof(seen_packet->source), source);
-    data_unlock();
-}
-
-static bool parse_mesh_packet(const char *packet, mesh_packet_t *parsed)
-{
-    char packet_copy[PACKET_LEN];
-    char *fields[10] = {0};
-    char *cursor = packet_copy;
-    size_t field_count = 0;
-
-    memset(parsed, 0, sizeof(*parsed));
-    copy_field(packet_copy, sizeof(packet_copy), packet);
-
-    while (field_count < sizeof(fields) / sizeof(fields[0]) && cursor != NULL) {
-        fields[field_count++] = cursor;
-        if (field_count == sizeof(fields) / sizeof(fields[0])) {
-            break;
-        }
-
-        cursor = strchr(cursor, '|');
-        if (cursor != NULL) {
-            *cursor = '\0';
-            cursor++;
-        }
-    }
-
-    if (field_count < 10 || strcmp(fields[0], "BEMS") != 0) {
-        return false;
-    }
-
-    parsed->valid = true;
-    parsed->id = (uint32_t)strtoul(fields[1], NULL, 10);
-    parsed->hops = strncmp(fields[6], "HOPS=", 5) == 0 ? atoi(fields[6] + 5) : 0;
-    copy_field(parsed->source, sizeof(parsed->source), fields[2]);
-    copy_field(parsed->destination, sizeof(parsed->destination), fields[3]);
-    copy_field(parsed->type, sizeof(parsed->type), fields[4]);
-    copy_field(parsed->priority, sizeof(parsed->priority), fields[5]);
-    copy_field(parsed->relay, sizeof(parsed->relay), fields[7]);
-    copy_field(parsed->location_raw, sizeof(parsed->location_raw), fields[8]);
-    location_decode(fields[8], &parsed->location);
-    copy_field(parsed->payload, sizeof(parsed->payload), fields[9]);
-    return true;
-}
-
-static void build_forward_packet(const mesh_packet_t *parsed, char *packet, size_t packet_size)
-{
-    int next_hops = MAX(parsed->hops - 1, 0);
-    char encoded_location[SITIO_LEN + BARANGAY_LEN + MUNICIPALITY_LEN + 2];
-
-    location_encode(&parsed->location, encoded_location, sizeof(encoded_location));
-
-    snprintf(packet, packet_size, "BEMS|%lu|%.*s|%.*s|%.*s|%.*s|HOPS=%d|%.*s|%s|%.*s",
-             (unsigned long)parsed->id,
-             31,
-             parsed->source,
-             31,
-             parsed->destination,
-             31,
-             parsed->type,
-             31,
-             parsed->priority,
-             next_hops,
-             31,
-             parsed->relay,
-             encoded_location,
-             120,
-             parsed->payload);
 }
 
 static void send_ack_packet(const mesh_packet_t *parsed)
@@ -896,7 +717,7 @@ static void boot_sync_task(void *parameter)
 {
     vTaskDelay(pdMS_TO_TICKS(1500));
 
-    if (node_config.configured && lora_ready) {
+    if (node_config.configured) {
         send_boot_sync_request();
     }
 
@@ -939,248 +760,6 @@ static void store_received_packet(const char *packet, const mesh_packet_t *parse
     data_unlock();
 }
 
-static bool lora_transmit(const char *packet)
-{
-    uint8_t frame[LORA_MAX_PAYLOAD];
-    size_t length = 0;
-
-    if (!lora_ready) {
-        ESP_LOGW(TAG, "SX1278 is not ready; packet kept in local log only");
-        return false;
-    }
-
-    if (!bems_encrypt_packet(packet, frame, sizeof(frame), &length)) {
-        ESP_LOGW(TAG, "Failed to encrypt LoRa packet");
-        return false;
-    }
-
-    if (lora_tx_done_semaphore == NULL) {
-        ESP_LOGW(TAG, "LoRa TX done semaphore is not ready");
-        return false;
-    }
-
-    if (!lora_channel_clear()) {
-        ESP_LOGW(TAG, "Channel busy; TX skipped");
-        return false;
-    }
-
-    xSemaphoreTake(lora_tx_done_semaphore, 0);
-    lora_set_mode(MODE_STDBY);
-    lora_write_reg(REG_DIO_MAPPING_1, 0x40);
-    lora_write_reg(REG_IRQ_FLAGS, 0xFF);
-    lora_write_reg(REG_FIFO_ADDR_PTR, 0x00);
-    lora_write_fifo(frame, length);
-    lora_write_reg(REG_PAYLOAD_LENGTH, length);
-    radio_in_tx = true;
-    lora_set_mode(MODE_TX);
-
-    if (xSemaphoreTake(lora_tx_done_semaphore, pdMS_TO_TICKS(5000)) == pdTRUE) {
-        radio_in_tx = false;
-        lora_write_reg(REG_IRQ_FLAGS, 0xFF);
-        lora_receive_mode();
-        ESP_LOGI(TAG, "SX1278 encrypted TX done: %u bytes", (unsigned int)length);
-        return true;
-    }
-
-    radio_in_tx = false;
-    lora_write_reg(REG_IRQ_FLAGS, 0xFF);
-    lora_receive_mode();
-    ESP_LOGW(TAG, "SX1278 TX timeout");
-    return false;
-}
-
-static void lora_rx_task(void *parameter)
-{
-    uint8_t payload[LORA_MAX_PAYLOAD + 1];
-    char decrypted_packet[PACKET_LEN];
-
-    while (true) {
-        if (lora_dio0_semaphore != NULL) {
-            xSemaphoreTake(lora_dio0_semaphore, portMAX_DELAY);
-        }
-
-        if (lora_ready && (lora_read_reg(REG_IRQ_FLAGS) & IRQ_RX_DONE_MASK) != 0) {
-            uint8_t flags = lora_read_reg(REG_IRQ_FLAGS);
-            lora_write_reg(REG_IRQ_FLAGS, 0xFF);
-
-            if ((flags & IRQ_PAYLOAD_CRC_ERROR_MASK) == 0) {
-                uint8_t length = lora_read_reg(REG_RX_NB_BYTES);
-                uint8_t current_addr = lora_read_reg(REG_FIFO_RX_CURRENT_ADDR);
-                int rssi = (int)lora_read_reg(REG_PKT_RSSI_VALUE) - 164;
-                int snr = ((int8_t)lora_read_reg(REG_PKT_SNR_VALUE)) / 4;
-
-                lora_write_reg(REG_FIFO_ADDR_PTR, current_addr);
-                lora_read_fifo(payload, length);
-                payload[length] = '\0';
-
-                if (!bems_decrypt_frame(payload, length, decrypted_packet, sizeof(decrypted_packet))) {
-                    ESP_LOGW(TAG, "Rejected unauthenticated LoRa frame RSSI=%d SNR=%d length=%u", rssi, snr, length);
-                    continue;
-                }
-
-                ESP_LOGI(TAG, "SX1278 RX RSSI=%d SNR=%d: %s", rssi, snr, decrypted_packet);
-                mesh_packet_t parsed;
-                if (parse_mesh_packet(decrypted_packet, &parsed)) {
-                    bool from_self = strcmp(parsed.source, node_id) == 0;
-                    bool is_duplicate = packet_seen(parsed.source, parsed.id);
-                    bool is_broadcast = strcmp(parsed.destination, "ALL") == 0;
-                    bool is_for_me = strcmp(parsed.destination, node_id) == 0;
-                    bool is_ack = strcmp(parsed.type, "ACK") == 0;
-                    bool is_sync_req = strcmp(parsed.type, "SYNC_REQ") == 0;
-                    bool is_sync_resp = strcmp(parsed.type, "SYNC_RESP") == 0;
-
-                    if (!from_self && !is_duplicate) {
-                        remember_packet(parsed.source, parsed.id);
-
-                        if (is_sync_req) {
-                            send_sync_responses(&parsed);
-                            continue;
-                        }
-
-                        if (is_sync_resp) {
-                            mesh_packet_t synced_packet;
-
-                            if (is_for_me && parse_mesh_packet(parsed.payload, &synced_packet) && !packet_seen(synced_packet.source, synced_packet.id)) {
-                                remember_packet(synced_packet.source, synced_packet.id);
-                                store_received_packet(parsed.payload, &synced_packet, rssi, snr);
-                            }
-                            if (is_for_me && strcmp(parsed.source, node_id) != 0) {
-                                set_duplicate_node_id_warning();
-                            }
-                            continue;
-                        }
-
-                        if (strcmp(parsed.type, "TIME_SYNC") == 0) {
-                            uint32_t epoch = time_sync_epoch_from_payload(parsed.payload);
-                            uint8_t dist = time_sync_dist_from_payload(parsed.payload);
-
-                            if ((epoch != 0) && (!time_synced || dist < time_sync_distance)) {
-                                apply_time_sync(epoch, dist);
-                            }
-                            continue;
-                        }
-
-                        if (is_broadcast || is_for_me) {
-                            store_received_packet(decrypted_packet, &parsed, rssi, snr);
-                        }
-
-                        if (is_for_me && !is_ack) {
-                            send_ack_packet(&parsed);
-                        }
-
-                        if (is_ack && is_for_me) {
-                            if (strcmp(parsed.source, node_id) != 0) {
-                                set_duplicate_node_id_warning();
-                            }
-                            uint32_t ack_id = ack_id_from_payload(parsed.payload);
-                            if (ack_id != 0) {
-                                update_message_status(ack_id, node_id, "ACKED");
-                            }
-                        }
-
-                        if (parsed.hops > 0 && !is_for_me) {
-                            char forward_packet[PACKET_LEN];
-                            build_forward_packet(&parsed, forward_packet, sizeof(forward_packet));
-                            ESP_LOGI(TAG, "Relaying packet toward %s with %d hops left", parsed.destination, parsed.hops - 1);
-                            queue_lora_transmit(forward_packet);
-                        }
-                    }
-                } else {
-                    mesh_packet_t raw_packet = {0};
-                    store_received_packet(decrypted_packet, &raw_packet, rssi, snr);
-                }
-            }
-        }
-    }
-}
-
-static void lora_init(void)
-{
-    spi_bus_config_t bus_config = {
-        .mosi_io_num = LORA_MOSI_GPIO,
-        .miso_io_num = LORA_MISO_GPIO,
-        .sclk_io_num = LORA_SCK_GPIO,
-        .quadwp_io_num = -1,
-        .quadhd_io_num = -1,
-        .max_transfer_sz = LORA_MAX_PAYLOAD + 1,
-    };
-    spi_device_interface_config_t device_config = {
-        .clock_speed_hz = 1000000,
-        .mode = 0,
-        .spics_io_num = LORA_NSS_GPIO,
-        .queue_size = 1,
-    };
-
-    gpio_config_t reset_config = {
-        .pin_bit_mask = 1ULL << LORA_RST_GPIO,
-        .mode = GPIO_MODE_OUTPUT,
-    };
-    gpio_config_t dio0_config = {
-        .pin_bit_mask = 1ULL << LORA_DIO0_GPIO,
-        .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_POSEDGE,
-    };
-
-    ESP_ERROR_CHECK(gpio_config(&reset_config));
-    ESP_ERROR_CHECK(gpio_config(&dio0_config));
-
-    lora_dio0_semaphore = xSemaphoreCreateBinary();
-    if (lora_dio0_semaphore == NULL) {
-        ESP_LOGE(TAG, "Failed to create LoRa DIO0 semaphore");
-        return;
-    }
-
-    lora_tx_done_semaphore = xSemaphoreCreateBinary();
-    if (lora_tx_done_semaphore == NULL) {
-        ESP_LOGE(TAG, "Failed to create LoRa TX done semaphore");
-        return;
-    }
-
-    esp_err_t isr_result = gpio_install_isr_service(0);
-    if (isr_result != ESP_OK && isr_result != ESP_ERR_INVALID_STATE) {
-        ESP_LOGE(TAG, "Failed to install GPIO ISR service: %s", esp_err_to_name(isr_result));
-        return;
-    }
-
-    ESP_ERROR_CHECK(gpio_isr_handler_add(LORA_DIO0_GPIO, lora_dio0_isr_handler, NULL));
-
-    gpio_set_level(LORA_RST_GPIO, 0);
-    vTaskDelay(pdMS_TO_TICKS(10));
-    gpio_set_level(LORA_RST_GPIO, 1);
-    vTaskDelay(pdMS_TO_TICKS(20));
-
-    ESP_ERROR_CHECK(spi_bus_initialize(LORA_SPI_HOST, &bus_config, SPI_DMA_CH_AUTO));
-    ESP_ERROR_CHECK(spi_bus_add_device(LORA_SPI_HOST, &device_config, &lora_spi));
-
-    uint8_t version = lora_read_reg(REG_VERSION);
-    if (version != 0x12) {
-        ESP_LOGE(TAG, "SX1278 not detected. REG_VERSION=0x%02X, check wiring and 3.3V power", version);
-        return;
-    }
-
-    lora_set_mode(MODE_SLEEP);
-    vTaskDelay(pdMS_TO_TICKS(10));
-    lora_set_frequency(LORA_FREQUENCY_HZ);
-    lora_write_reg(REG_FIFO_TX_BASE_ADDR, 0x00);
-    lora_write_reg(REG_FIFO_RX_BASE_ADDR, 0x00);
-    lora_write_reg(REG_LNA, lora_read_reg(REG_LNA) | 0x03);
-    lora_write_reg(REG_MODEM_CONFIG_1, LORA_MODEM_CONFIG_1);
-    lora_write_reg(REG_MODEM_CONFIG_2, LORA_MODEM_CONFIG_2);
-    lora_write_reg(REG_MODEM_CONFIG_3, LORA_MODEM_CONFIG_3);
-    lora_write_reg(REG_PREAMBLE_MSB, 0x00);
-    lora_write_reg(REG_PREAMBLE_LSB, 0x08);
-    lora_write_reg(REG_SYNC_WORD, 0x12);
-    lora_write_reg(REG_PA_CONFIG, 0x8F);
-
-    lora_ready = true;
-    lora_receive_mode();
-    xTaskCreate(lora_rx_task, "lora_rx_task", 4096, NULL, 6, NULL);
-
-    ESP_LOGI(TAG, "SX1278 ready on 433 MHz");
-}
-
 static void copy_field(char *destination, size_t destination_size, const char *source)
 {
     size_t write_index = 0;
@@ -1197,50 +776,6 @@ static void copy_field(char *destination, size_t destination_size, const char *s
     }
 
     destination[write_index] = '\0';
-}
-
-static void location_encode(const location_info_t *loc, char *out, size_t out_size)
-{
-    if (out_size == 0) {
-        return;
-    }
-
-    snprintf(out, out_size, "%.*s~%.*s~%.*s",
-             SITIO_LEN - 1, loc->sitio,
-             BARANGAY_LEN - 1, loc->barangay,
-             MUNICIPALITY_LEN - 1, loc->municipality);
-}
-
-static void location_decode(const char *encoded, location_info_t *loc)
-{
-    char buffer[SITIO_LEN + BARANGAY_LEN + MUNICIPALITY_LEN + 2];
-    char *first_sep;
-    char *second_sep;
-
-    memset(loc, 0, sizeof(*loc));
-    if (encoded == NULL) {
-        return;
-    }
-
-    copy_field(buffer, sizeof(buffer), encoded);
-    first_sep = strchr(buffer, '~');
-    if (first_sep == NULL) {
-        copy_field(loc->barangay, sizeof(loc->barangay), buffer);
-        return;
-    }
-
-    *first_sep = '\0';
-    copy_field(loc->sitio, sizeof(loc->sitio), buffer);
-
-    second_sep = strchr(first_sep + 1, '~');
-    if (second_sep == NULL) {
-        copy_field(loc->barangay, sizeof(loc->barangay), first_sep + 1);
-        return;
-    }
-
-    *second_sep = '\0';
-    copy_field(loc->barangay, sizeof(loc->barangay), first_sep + 1);
-    copy_field(loc->municipality, sizeof(loc->municipality), second_sep + 1);
 }
 
 static void compute_thread_key(char *out, size_t out_size, const char *source, const char *destination)
@@ -1270,9 +805,30 @@ static void update_message_status(uint32_t id, const char *source, const char *s
     data_unlock();
 }
 
+static bool message_requires_delivery_ack(const char *destination, const char *priority)
+{
+    return strcmp(destination, "ALL") != 0 && strcmp(priority, "LOW") != 0;
+}
+
 static void retry_tracker_add_by_value(uint32_t id, const char *source, const char *destination, const char *priority)
 {
-    if (strcmp(priority, "HIGH") != 0 || strcmp(destination, "ALL") == 0) {
+    uint8_t max_attempts = 0;
+    TickType_t retry_interval = 0;
+    uint8_t mode = 0;
+
+    if (strcmp(destination, "ALL") == 0) {
+        mode = RETRY_MODE_BROADCAST;
+        max_attempts = 3;
+        retry_interval = pdMS_TO_TICKS(400);
+    } else if (strcmp(priority, "HIGH") == 0) {
+        mode = RETRY_MODE_ACK;
+        max_attempts = 4;
+        retry_interval = pdMS_TO_TICKS(3000);
+    } else if (strcmp(priority, "NORMAL") == 0) {
+        mode = RETRY_MODE_ACK;
+        max_attempts = 2;
+        retry_interval = pdMS_TO_TICKS(8000);
+    } else {
         return;
     }
 
@@ -1285,7 +841,10 @@ static void retry_tracker_add_by_value(uint32_t id, const char *source, const ch
             copy_field(entry->destination, sizeof(entry->destination), destination);
             copy_field(entry->priority, sizeof(entry->priority), priority);
             entry->attempts = 1;
-            entry->next_retry_tick = xTaskGetTickCount() + pdMS_TO_TICKS(5000);
+            entry->max_attempts = max_attempts;
+            entry->mode = mode;
+            entry->retry_interval_ticks = retry_interval;
+            entry->next_retry_tick = xTaskGetTickCount() + retry_interval;
             entry->active = true;
             break;
         }
@@ -1303,11 +862,53 @@ static void retry_tracker_task(void *parameter)
             char retry_source[FIELD_LEN] = {0};
             char packet[PACKET_LEN] = {0};
             bool should_retry = false;
+            bool should_jitter_repeat = false;
+            uint32_t broadcast_retry_id = 0;
+            char broadcast_retry_source[FIELD_LEN] = {0};
+            char broadcast_packet[PACKET_LEN] = {0};
 
             data_lock();
             entry = &retry_entries[i];
             if (!entry->active || now < entry->next_retry_tick) {
                 data_unlock();
+                continue;
+            }
+
+            if (entry->mode == RETRY_MODE_BROADCAST) {
+                for (size_t j = 0; j < message_count; j++) {
+                    emergency_message_t *message = &messages[j];
+                    if (message->id != entry->id || strcmp(message->source, entry->source) != 0) {
+                        continue;
+                    }
+                    if (entry->attempts >= entry->max_attempts) {
+                        copy_field(message->status, sizeof(message->status), "SENT (no delivery confirmation expected)");
+                        entry->active = false;
+                        break;
+                    }
+                    entry->attempts++;
+                    entry->next_retry_tick = now + entry->retry_interval_ticks + pdMS_TO_TICKS(200 + (esp_random() % 1001));
+                    copy_field(message->status, sizeof(message->status), "SENT (no delivery confirmation expected)");
+                    broadcast_retry_id = entry->id;
+                    copy_field(broadcast_retry_source, sizeof(broadcast_retry_source), entry->source);
+                    copy_field(broadcast_packet, sizeof(broadcast_packet), message->packet);
+                    should_jitter_repeat = true;
+                    break;
+                }
+                data_unlock();
+
+                if (should_jitter_repeat) {
+                    if (!queue_lora_transmit(broadcast_packet)) {
+                        data_lock();
+                        for (size_t j = 0; j < message_count; j++) {
+                            emergency_message_t *message = &messages[j];
+                            if (message->id == broadcast_retry_id && strcmp(message->source, broadcast_retry_source) == 0) {
+                                copy_field(message->status, sizeof(message->status), "FAILED");
+                                break;
+                            }
+                        }
+                        data_unlock();
+                    }
+                }
                 continue;
             }
 
@@ -1320,13 +921,13 @@ static void retry_tracker_task(void *parameter)
                     entry->active = false;
                     break;
                 }
-                if (entry->attempts >= 3) {
+                if (entry->attempts >= entry->max_attempts) {
                     copy_field(message->status, sizeof(message->status), "FAILED");
                     entry->active = false;
                     break;
                 }
                 entry->attempts++;
-                entry->next_retry_tick = now + pdMS_TO_TICKS(5000 * entry->attempts);
+                entry->next_retry_tick = now + (entry->retry_interval_ticks * entry->attempts);
                 copy_field(message->status, sizeof(message->status), "SENT");
                 retry_id = entry->id;
                 copy_field(retry_source, sizeof(retry_source), entry->source);
@@ -1497,141 +1098,6 @@ static void update_highest_seen_id(uint32_t id)
     }
 }
 
-static void config_set_defaults(void)
-{
-    node_config.configured = false;
-    copy_field(node_config.node_id, sizeof(node_config.node_id), node_id);
-    copy_field(node_config.node_name, sizeof(node_config.node_name), "Unconfigured Node");
-    copy_field(node_config.location.sitio, sizeof(node_config.location.sitio), "");
-    copy_field(node_config.location.barangay, sizeof(node_config.location.barangay), "Unknown");
-    copy_field(node_config.location.municipality, sizeof(node_config.location.municipality), "");
-    copy_field(node_config.default_destination, sizeof(node_config.default_destination), "BRGY001");
-    copy_field(node_config.web_pin, sizeof(node_config.web_pin), DEFAULT_WEB_PIN);
-    copy_field(node_config.network_key, sizeof(node_config.network_key), DEFAULT_NETWORK_KEY);
-}
-
-static void apply_config_identity(void)
-{
-    if (node_config.configured) {
-        copy_field(node_id, sizeof(node_id), node_config.node_id);
-        snprintf(ap_ssid, sizeof(ap_ssid), "BMesh-%.*s", 24, node_config.node_id);
-    } else {
-        snprintf(ap_ssid, sizeof(ap_ssid), "BMesh-SETUP-%.*s", 18, node_id + 4);
-    }
-}
-
-static void load_node_config(void)
-{
-    nvs_handle_t handle;
-    uint8_t configured = 0;
-    bool migrated_location = false;
-    char legacy_location[FIELD_LEN] = {0};
-
-    config_set_defaults();
-
-    if (nvs_open(CONFIG_NAMESPACE, NVS_READWRITE, &handle) != ESP_OK) {
-        apply_config_identity();
-        return;
-    }
-
-    nvs_get_u8(handle, "configured", &configured);
-    nvs_get_string_or_default(handle, "node_id", node_config.node_id, sizeof(node_config.node_id), node_id);
-    nvs_get_string_or_default(handle, "node_name", node_config.node_name, sizeof(node_config.node_name), "Mesh Node");
-    nvs_get_string_or_default(handle, "default_dest", node_config.default_destination, sizeof(node_config.default_destination), "BRGY001");
-    nvs_get_string_or_default(handle, "web_pin", node_config.web_pin, sizeof(node_config.web_pin), DEFAULT_WEB_PIN);
-    nvs_get_string_or_default(handle, "network_key", node_config.network_key, sizeof(node_config.network_key), DEFAULT_NETWORK_KEY);
-
-    if (nvs_get_str(handle, "sitio", node_config.location.sitio, &(size_t){sizeof(node_config.location.sitio)}) != ESP_OK) {
-        copy_field(node_config.location.sitio, sizeof(node_config.location.sitio), "");
-    }
-    if (nvs_get_str(handle, "barangay", node_config.location.barangay, &(size_t){sizeof(node_config.location.barangay)}) != ESP_OK) {
-        if (nvs_get_str(handle, "location", legacy_location, &(size_t){sizeof(legacy_location)}) == ESP_OK && legacy_location[0] != '\0') {
-            location_decode(legacy_location, &node_config.location);
-            migrated_location = true;
-        } else {
-            copy_field(node_config.location.barangay, sizeof(node_config.location.barangay), "Unknown");
-        }
-    }
-    if (nvs_get_str(handle, "municipality", node_config.location.municipality, &(size_t){sizeof(node_config.location.municipality)}) != ESP_OK) {
-        copy_field(node_config.location.municipality, sizeof(node_config.location.municipality), "");
-    }
-
-    nvs_close(handle);
-
-    node_config.configured = configured == 1;
-    apply_config_identity();
-
-    if (migrated_location) {
-        ESP_LOGI(TAG, "Migrating legacy location key to structured fields");
-        save_node_config(&node_config);
-    }
-
-    char encoded_location[SITIO_LEN + BARANGAY_LEN + MUNICIPALITY_LEN + 2];
-    location_encode(&node_config.location, encoded_location, sizeof(encoded_location));
-
-    ESP_LOGI(TAG, "Config loaded: configured=%d node=%s name=%s location=%s",
-             node_config.configured,
-             node_config.node_id,
-             node_config.node_name,
-             encoded_location);
-}
-
-static esp_err_t save_node_config(const node_config_t *config)
-{
-    nvs_handle_t handle;
-    esp_err_t result = nvs_open(CONFIG_NAMESPACE, NVS_READWRITE, &handle);
-
-    if (result != ESP_OK) {
-        return result;
-    }
-
-    result = nvs_set_u8(handle, "configured", config->configured ? 1 : 0);
-    if (result == ESP_OK) {
-        result = nvs_set_str(handle, "node_id", config->node_id);
-    }
-    if (result == ESP_OK) {
-        result = nvs_set_str(handle, "node_name", config->node_name);
-    }
-    if (result == ESP_OK) {
-        result = nvs_set_str(handle, "sitio", config->location.sitio);
-    }
-    if (result == ESP_OK) {
-        result = nvs_set_str(handle, "barangay", config->location.barangay);
-    }
-    if (result == ESP_OK) {
-        result = nvs_set_str(handle, "municipality", config->location.municipality);
-    }
-    if (result == ESP_OK) {
-        result = nvs_set_str(handle, "default_dest", config->default_destination);
-    }
-    if (result == ESP_OK) {
-        result = nvs_set_str(handle, "web_pin", config->web_pin);
-    }
-    if (result == ESP_OK) {
-        result = nvs_set_str(handle, "network_key", config->network_key);
-    }
-    if (result == ESP_OK) {
-        result = nvs_erase_key(handle, "location");
-    }
-    if (result == ESP_OK) {
-        result = nvs_commit(handle);
-    }
-
-    nvs_close(handle);
-    return result;
-}
-
-static void erase_node_config(void)
-{
-    nvs_handle_t handle;
-
-    if (nvs_open(CONFIG_NAMESPACE, NVS_READWRITE, &handle) == ESP_OK) {
-        nvs_erase_all(handle);
-        nvs_commit(handle);
-        nvs_close(handle);
-    }
-}
-
 static void init_factory_reset_button(void)
 {
     gpio_config_t boot_button_config = {
@@ -1662,7 +1128,7 @@ static void factory_reset_button_task(void *parameter)
             if (held_ms >= FACTORY_RESET_HOLD_MS) {
                 ESP_LOGW(TAG, "BOOT held for 10 seconds. Factory reset confirmed.");
                 rgb_led_blink_green(3);
-                erase_node_config();
+                node_config_erase();
                 vTaskDelay(pdMS_TO_TICKS(500));
                 esp_restart();
             }
@@ -1737,6 +1203,100 @@ static bool form_value(const char *body, const char *key, char *output, size_t o
     }
 
     return false;
+}
+
+static void build_location_string(char *out, size_t out_size)
+{
+    location_encode(&node_config.location, out, out_size);
+}
+
+static void send_control_packet(const char *type, const char *destination, const char *payload)
+{
+    char packet[PACKET_LEN];
+    char encoded_location[SITIO_LEN + BARANGAY_LEN + MUNICIPALITY_LEN + 2];
+    uint32_t message_id;
+
+    data_lock();
+    message_id = ++packet_counter;
+    save_packet_counter();
+    data_unlock();
+
+    build_location_string(encoded_location, sizeof(encoded_location));
+    snprintf(packet, sizeof(packet), "BEMS|%lu|%.*s|%.*s|%s|NORMAL|HOPS=1|RELAY=0|LOC=%s|%s",
+             (unsigned long)message_id,
+             31,
+             node_id,
+             31,
+             destination,
+             type,
+             encoded_location,
+             payload != NULL ? payload : "");
+
+    lora_transmit(packet);
+}
+
+static bool node_id_collision_detected(const char *proposed_id)
+{
+    char packet[PACKET_LEN];
+    int rssi = 0;
+    int snr = 0;
+    int64_t start_us = esp_timer_get_time();
+
+    send_control_packet("ID_CHECK", "ALL", proposed_id);
+
+    while ((esp_timer_get_time() - start_us) < 2500000LL) {
+        if (!lora_receive_plain_packet(packet, sizeof(packet), &rssi, &snr, 250)) {
+            continue;
+        }
+
+        mesh_packet_t parsed;
+        if (!parse_mesh_packet(packet, &parsed)) {
+            continue;
+        }
+
+        if (strcmp(parsed.type, "ID_TAKEN") == 0 && strcmp(parsed.destination, proposed_id) == 0) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static void mesh_control_rx_task(void *parameter)
+{
+    char packet[PACKET_LEN];
+    int rssi = 0;
+    int snr = 0;
+
+    while (true) {
+        if (!lora_receive_plain_packet(packet, sizeof(packet), &rssi, &snr, 1000)) {
+            continue;
+        }
+
+        mesh_packet_t parsed;
+        if (!parse_mesh_packet(packet, &parsed)) {
+            continue;
+        }
+
+        if (strcmp(parsed.type, "ID_CHECK") == 0 && strcmp(parsed.destination, node_id) == 0 && strcmp(parsed.source, node_id) != 0) {
+            char reply[PACKET_LEN];
+            char encoded_location[SITIO_LEN + BARANGAY_LEN + MUNICIPALITY_LEN + 2];
+
+            vTaskDelay(pdMS_TO_TICKS(200 + (esp_random() % 1001)));
+            build_location_string(encoded_location, sizeof(encoded_location));
+            snprintf(reply, sizeof(reply), "BEMS|%lu|%.*s|%.*s|ID_TAKEN|NORMAL|HOPS=0|RELAY=0|LOC=%s|%.*s",
+                     (unsigned long)++packet_counter,
+                     31,
+                     node_id,
+                     31,
+                     parsed.source,
+                     encoded_location,
+                     31,
+                     node_id);
+            save_packet_counter();
+            lora_transmit(reply);
+        }
+    }
 }
 
 static void json_escape_string(char *destination, size_t destination_size, const char *source)
@@ -1852,7 +1412,11 @@ static void queue_message(const char *destination, const char *type, const char 
 
     ESP_LOGI(TAG, "LoRa TX pending: %s", packet);
     if (lora_transmit(packet)) {
-        update_message_status(queued_id, queued_source, "SENT");
+        if (strcmp(queued_destination, "ALL") == 0 || !message_requires_delivery_ack(queued_destination, queued_priority)) {
+            update_message_status(queued_id, queued_source, "SENT (no delivery confirmation expected)");
+        } else {
+            update_message_status(queued_id, queued_source, "SENT");
+        }
         retry_tracker_add_by_value(queued_id, queued_source, queued_destination, queued_priority);
     } else {
         update_message_status(queued_id, queued_source, "FAILED");
@@ -1865,6 +1429,65 @@ static esp_err_t send_redirect(httpd_req_t *request, const char *location)
     httpd_resp_set_hdr(request, "Location", location);
     httpd_resp_send(request, "", HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
+}
+
+static void ipv4_to_string(const struct sockaddr_in *addr, char *out, size_t out_size)
+{
+    if (out_size == 0) {
+        return;
+    }
+
+    snprintf(out, out_size, "%u.%u.%u.%u",
+             (unsigned int)((ntohl(addr->sin_addr.s_addr) >> 24) & 0xFF),
+             (unsigned int)((ntohl(addr->sin_addr.s_addr) >> 16) & 0xFF),
+             (unsigned int)((ntohl(addr->sin_addr.s_addr) >> 8) & 0xFF),
+             (unsigned int)(ntohl(addr->sin_addr.s_addr) & 0xFF));
+}
+
+static void request_client_id(httpd_req_t *request, char *out, size_t out_size)
+{
+    int sockfd = httpd_req_to_sockfd(request);
+    struct sockaddr_in addr = {0};
+    socklen_t len = sizeof(addr);
+
+    if (getpeername(sockfd, (struct sockaddr *)&addr, &len) == 0) {
+        ipv4_to_string(&addr, out, out_size);
+        return;
+    }
+
+    snprintf(out, out_size, "sockfd:%d", sockfd);
+}
+
+static void random_session_token(char *out, size_t out_size)
+{
+    uint32_t random_a = esp_random();
+    uint32_t random_b = esp_random();
+    snprintf(out, out_size, "%08lX%08lX", (unsigned long)random_a, (unsigned long)random_b);
+}
+
+static session_record_t *session_find_by_token(const char *token)
+{
+    for (size_t i = 0; i < MAX_SESSIONS; i++) {
+        if (sessions[i].active && strcmp(sessions[i].token, token) == 0) {
+            return &sessions[i];
+        }
+    }
+    return NULL;
+}
+
+static session_record_t *session_alloc(void)
+{
+    for (size_t i = 0; i < MAX_SESSIONS; i++) {
+        if (!sessions[i].active) {
+            return &sessions[i];
+        }
+    }
+    return &sessions[0];
+}
+
+static void session_touch(session_record_t *session)
+{
+    session->last_seen = xTaskGetTickCount();
 }
 
 static bool cookie_matches_session(const char *cookie_header)
@@ -1886,7 +1509,9 @@ static bool cookie_matches_session(const char *cookie_header)
 
         if (strncmp(token, SESSION_COOKIE_NAME "=", strlen(SESSION_COOKIE_NAME) + 1) == 0) {
             const char *value = token + strlen(SESSION_COOKIE_NAME) + 1;
-            if (strcmp(value, session_token) == 0) {
+            session_record_t *session = session_find_by_token(value);
+            if (session != NULL) {
+                session_touch(session);
                 return true;
             }
         }
@@ -1900,12 +1525,85 @@ static bool cookie_matches_session(const char *cookie_header)
     return false;
 }
 
-static void init_session_token(void)
+static void purge_expired_sessions(void)
 {
-    uint32_t random_a = esp_random();
-    uint32_t random_b = esp_random();
+    TickType_t now = xTaskGetTickCount();
+    for (size_t i = 0; i < MAX_SESSIONS; i++) {
+        if (sessions[i].active && (now - sessions[i].last_seen) > pdMS_TO_TICKS(SESSION_IDLE_TIMEOUT_MS)) {
+            sessions[i].active = false;
+        }
+    }
+}
 
-    snprintf(session_token, sizeof(session_token), "%08lX%08lX", (unsigned long)random_a, (unsigned long)random_b);
+static login_lockout_t *lockout_find_or_alloc(const char *client_id)
+{
+    for (size_t i = 0; i < MAX_LOCKOUTS; i++) {
+        if (lockouts[i].active && strcmp(lockouts[i].ip, client_id) == 0) {
+            return &lockouts[i];
+        }
+    }
+    for (size_t i = 0; i < MAX_LOCKOUTS; i++) {
+        if (!lockouts[i].active) {
+            lockouts[i].active = true;
+            copy_field(lockouts[i].ip, sizeof(lockouts[i].ip), client_id);
+            return &lockouts[i];
+        }
+    }
+    return &lockouts[0];
+}
+
+static bool login_is_locked(const char *client_id, TickType_t *remaining)
+{
+    login_lockout_t *lockout = lockout_find_or_alloc(client_id);
+    TickType_t now = xTaskGetTickCount();
+
+    if (lockout->lock_until != 0 && now < lockout->lock_until) {
+        if (remaining != NULL) {
+            *remaining = lockout->lock_until - now;
+        }
+        return true;
+    }
+
+    if (remaining != NULL) {
+        *remaining = 0;
+    }
+    return false;
+}
+
+static void login_record_failure(const char *client_id)
+{
+    login_lockout_t *lockout = lockout_find_or_alloc(client_id);
+    TickType_t lock_ms;
+
+    lockout->failures++;
+    if (lockout->failures < 3) {
+        lockout->lock_until = 0;
+        return;
+    }
+
+    if (lockout->failures == 3) {
+        lock_ms = LOGIN_BASE_LOCK_MS;
+    } else {
+        lock_ms = LOGIN_BASE_LOCK_MS << (lockout->failures - 3);
+    }
+    lockout->lock_until = xTaskGetTickCount() + pdMS_TO_TICKS(lock_ms);
+}
+
+static void login_record_success(const char *client_id)
+{
+    login_lockout_t *lockout = lockout_find_or_alloc(client_id);
+    lockout->failures = 0;
+    lockout->lock_until = 0;
+}
+
+static void issue_session_for_client(const char *client_id, char *token_out, size_t token_size)
+{
+    session_record_t *session = session_alloc();
+    random_session_token(session->token, sizeof(session->token));
+    session->active = true;
+    copy_field(session->ip, sizeof(session->ip), client_id);
+    session_touch(session);
+    copy_field(token_out, token_size, session->token);
 }
 
 static bool request_has_session(httpd_req_t *request)
@@ -1934,6 +1632,7 @@ static esp_err_t require_session(httpd_req_t *request)
 
 static esp_err_t index_handler(httpd_req_t *request)
 {
+    purge_expired_sessions();
     httpd_resp_set_type(request, "text/html");
 
     if (!node_config.configured) {
@@ -1950,8 +1649,21 @@ static esp_err_t login_handler(httpd_req_t *request)
 {
     char body[96] = {0};
     char pin[FIELD_LEN] = {0};
-    char cookie[64];
+    char token[SESSION_TOKEN_LEN];
+    char cookie[128];
+    char client_id[40];
     int received = 0;
+    TickType_t remaining = 0;
+
+    request_client_id(request, client_id, sizeof(client_id));
+    if (login_is_locked(client_id, &remaining)) {
+        unsigned int wait_seconds = (unsigned int)pdTICKS_TO_MS(remaining) / 1000U;
+        char message[96];
+        httpd_resp_set_status(request, "429 Too Many Requests");
+        httpd_resp_set_type(request, "text/plain");
+        snprintf(message, sizeof(message), "Too many failed attempts. Please wait %u seconds.", wait_seconds);
+        return httpd_resp_send(request, message, HTTPD_RESP_USE_STRLEN);
+    }
 
     while (received < request->content_len && received < (int)sizeof(body) - 1) {
         int ret = httpd_req_recv(request, body + received, MIN(request->content_len - received, (int)sizeof(body) - 1 - received));
@@ -1963,12 +1675,15 @@ static esp_err_t login_handler(httpd_req_t *request)
 
     form_value(body, "pin", pin, sizeof(pin));
     if (strcmp(pin, node_config.web_pin) != 0) {
+        login_record_failure(client_id);
         httpd_resp_set_status(request, "403 Forbidden");
         httpd_resp_set_type(request, "text/html");
         return httpd_resp_send(request, LOGIN_HTML, HTTPD_RESP_USE_STRLEN);
     }
 
-    snprintf(cookie, sizeof(cookie), "%s=%s; Path=/; HttpOnly; SameSite=Lax", SESSION_COOKIE_NAME, session_token);
+    login_record_success(client_id);
+    issue_session_for_client(client_id, token, sizeof(token));
+    snprintf(cookie, sizeof(cookie), "%s=%s; Path=/; HttpOnly; SameSite=Lax", SESSION_COOKIE_NAME, token);
     httpd_resp_set_hdr(request, "Set-Cookie", cookie);
     return send_redirect(request, "/");
 }
@@ -2001,6 +1716,12 @@ static esp_err_t setup_handler(httpd_req_t *request)
     if (new_config.node_id[0] == '\0') {
         copy_field(new_config.node_id, sizeof(new_config.node_id), node_id);
     }
+    // Phase 7 will reuse this gate for the Node ID wizard field.
+    if (node_id_collision_detected(new_config.node_id)) {
+        httpd_resp_set_status(request, "409 Conflict");
+        httpd_resp_set_type(request, "text/plain");
+        return httpd_resp_send(request, "Node ID is already in use on the mesh", HTTPD_RESP_USE_STRLEN);
+    }
     if (new_config.node_name[0] == '\0') {
         copy_field(new_config.node_name, sizeof(new_config.node_name), "Mesh Node");
     }
@@ -2011,13 +1732,13 @@ static esp_err_t setup_handler(httpd_req_t *request)
         copy_field(new_config.default_destination, sizeof(new_config.default_destination), "BRGY001");
     }
     if (new_config.web_pin[0] == '\0') {
-        copy_field(new_config.web_pin, sizeof(new_config.web_pin), DEFAULT_WEB_PIN);
+        copy_field(new_config.web_pin, sizeof(new_config.web_pin), node_config_get_web_pin());
     }
     if (new_config.network_key[0] == '\0') {
-        copy_field(new_config.network_key, sizeof(new_config.network_key), DEFAULT_NETWORK_KEY);
+        copy_field(new_config.network_key, sizeof(new_config.network_key), node_config_get_network_key());
     }
 
-    ESP_ERROR_CHECK(save_node_config(&new_config));
+    ESP_ERROR_CHECK(node_config_save(&new_config));
     httpd_resp_set_type(request, "text/html");
     httpd_resp_send(request, "<!doctype html><html><body><h2>Setup saved.</h2><p>Node is restarting.</p></body></html>", HTTPD_RESP_USE_STRLEN);
     vTaskDelay(pdMS_TO_TICKS(500));
@@ -2064,7 +1785,7 @@ static esp_err_t reset_handler(httpd_req_t *request)
         return session_result;
     }
 
-    erase_node_config();
+    node_config_erase();
     httpd_resp_set_type(request, "text/html");
     httpd_resp_send(request, "<!doctype html><html><body><h2>Factory reset complete.</h2><p>Node is restarting into setup mode.</p></body></html>", HTTPD_RESP_USE_STRLEN);
     vTaskDelay(pdMS_TO_TICKS(500));
@@ -2352,12 +2073,9 @@ static void start_wifi_ap(void)
     wifi_config.ap.ssid_len = strlen(ap_ssid);
     wifi_config.ap.channel = AP_CHANNEL;
     wifi_config.ap.max_connection = AP_MAX_CONNECTIONS;
-    wifi_config.ap.authmode = WIFI_AUTH_OPEN;
-
-    if (strlen(AP_PASSWORD) >= 8) {
-        copy_field((char *)wifi_config.ap.password, sizeof(wifi_config.ap.password), AP_PASSWORD);
-        wifi_config.ap.authmode = WIFI_AUTH_WPA2_PSK;
-    }
+    // This AP passphrase is distinct from the portal PIN and protects Wi-Fi association.
+    copy_field((char *)wifi_config.ap.password, sizeof(wifi_config.ap.password), node_config_get_ap_password());
+    wifi_config.ap.authmode = WIFI_AUTH_WPA2_PSK;
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
@@ -2383,13 +2101,13 @@ void app_main(void)
     ESP_ERROR_CHECK(lora_tx_queue == NULL ? ESP_ERR_NO_MEM : ESP_OK);
 
     init_identity();
-    init_session_token();
     load_packet_counter();
     load_highest_seen_id();
     rgb_led_init();
     init_factory_reset_button();
-    load_node_config();
+    node_config_load();
     lora_init();
+    xTaskCreate(mesh_control_rx_task, "mesh_control_rx_task", 4096, NULL, 6, NULL);
     xTaskCreate(lora_tx_worker_task, "lora_tx_worker_task", 4096, NULL, 6, NULL);
     xTaskCreate(boot_sync_task, "boot_sync_task", 4096, NULL, 4, NULL);
     xTaskCreate(retry_tracker_task, "retry_tracker_task", 4096, NULL, 3, NULL);
