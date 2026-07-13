@@ -60,6 +60,7 @@ The portal surfaces the current state of the node and nearby traffic.
 - Shows node identity, AP status, client count, and time-sync state.
 - Displays message threads and per-message status.
 - Tracks known peers on-device with online/offline staleness state.
+- Tracks learned routes on-device with hop distance and stale-state visibility.
 - Includes a mesh health section for current network visibility.
 - Warns about possible duplicate Node IDs on the mesh.
 

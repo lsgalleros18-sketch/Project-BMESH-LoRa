@@ -31,6 +31,7 @@
 #include "bems_crypto.h"
 #include "mesh_protocol.h"
 #include "roster.h"
+#include "route_table.h"
 #include "node_config.h"
 #include "lora_radio.h"
 
@@ -131,6 +132,7 @@ typedef struct {
 static void compute_thread_key(char *out, size_t out_size, const char *source, const char *destination);
 static void json_escape_string(char *destination, size_t destination_size, const char *source);
 static void update_message_status(uint32_t id, const char *source, const char *status);
+static int hops_for_priority(const char *priority);
 static void mesh_control_rx_task(void *parameter);
 static void retry_tracker_task(void *parameter);
 static void lora_tx_worker_task(void *parameter);
@@ -1329,15 +1331,37 @@ static void mesh_control_rx_task(void *parameter)
         }
 
         mesh_packet_t parsed;
+        char forward_buf[PACKET_LEN];
+        bool is_self_packet;
+        bool should_relay;
+
         if (!parse_mesh_packet(packet, &parsed)) {
             continue;
         }
 
         if (parsed.valid && strcmp(parsed.source, node_id) != 0) {
             roster_touch(parsed.source, &parsed.location, time_synced ? current_epoch_seconds() : 0);
+            route_table_learn(parsed.source, MAX(hops_for_priority(parsed.priority) - parsed.hops, 0));
         }
 
-        if (strcmp(parsed.type, "ID_CHECK") == 0 && strcmp(parsed.destination, node_id) == 0 && strcmp(parsed.source, node_id) != 0) {
+        is_self_packet = strcmp(parsed.source, node_id) == 0;
+        should_relay = parsed.hops > 0;
+        if (!is_self_packet) {
+            if (packet_seen(parsed.source, parsed.id)) {
+                continue;
+            }
+            remember_packet(parsed.source, parsed.id);
+        }
+
+        if (strcmp(parsed.type, "ACK") == 0) {
+            update_message_status(ack_id_from_payload(parsed.payload), parsed.source, "ACKED");
+        } else if (strcmp(parsed.type, "SYNC_REQ") == 0) {
+            send_sync_responses(&parsed);
+        } else if (strcmp(parsed.type, "SYNC_RESP") == 0) {
+            // TODO(route-table): not yet consumed
+        } else if (strcmp(parsed.type, "TIME_SYNC") == 0) {
+            apply_time_sync(time_sync_epoch_from_payload(parsed.payload), time_sync_dist_from_payload(parsed.payload));
+        } else if (strcmp(parsed.type, "ID_CHECK") == 0 && strcmp(parsed.destination, node_id) == 0 && !is_self_packet) {
             char reply[PACKET_LEN];
             char encoded_location[SITIO_LEN + BARANGAY_LEN + MUNICIPALITY_LEN + 2];
 
@@ -1354,7 +1378,20 @@ static void mesh_control_rx_task(void *parameter)
                      node_id);
             save_packet_counter();
             lora_transmit(reply);
+        } else if (strcmp(parsed.type, "ID_TAKEN") == 0) {
+            /* setup-time response only */
+        } else if (!is_control_packet_type(parsed.type)) {
+            store_received_packet(packet, &parsed, rssi, snr);
+            if (message_requires_delivery_ack(parsed.destination, parsed.priority) && strcmp(parsed.destination, node_id) == 0) {
+                send_ack_packet(&parsed);
+            }
         }
+
+        if (should_relay) {
+            build_forward_packet(&parsed, forward_buf, sizeof(forward_buf));
+            queue_lora_transmit(forward_buf);
+        }
+
     }
 }
 
@@ -2052,6 +2089,38 @@ static esp_err_t roster_handler(httpd_req_t *request)
     return httpd_resp_send_chunk(request, NULL, 0);
 }
 
+static esp_err_t routes_handler(httpd_req_t *request)
+{
+    route_entry_t snapshot[MAX_ROUTE_ENTRIES];
+    size_t snapshot_count;
+    bool first = true;
+    esp_err_t session_result = require_session(request);
+
+    if (session_result != ESP_OK) {
+        return session_result;
+    }
+
+    snapshot_count = route_table_get_snapshot(snapshot, MAX_ROUTE_ENTRIES);
+    httpd_resp_set_type(request, "application/json");
+    httpd_resp_send_chunk(request, "[", 1);
+    for (size_t i = 0; i < snapshot_count; i++) {
+        char escaped_node[FIELD_LEN * 2];
+        char json[160];
+
+        json_escape_string(escaped_node, sizeof(escaped_node), snapshot[i].node_id);
+        snprintf(json, sizeof(json),
+                 "%s{\"node_id\":\"%s\",\"best_hop_distance\":%d,\"stale\":%s}",
+                 first ? "" : ",",
+                 escaped_node,
+                 snapshot[i].best_hop_distance,
+                 snapshot[i].stale ? "true" : "false");
+        first = false;
+        httpd_resp_send_chunk(request, json, HTTPD_RESP_USE_STRLEN);
+    }
+    httpd_resp_send_chunk(request, "]", 1);
+    return httpd_resp_send_chunk(request, NULL, 0);
+}
+
 static esp_err_t captive_handler(httpd_req_t *request)
 {
     return send_redirect(request, "/");
@@ -2076,6 +2145,7 @@ static void start_http_server(void)
         {.uri = "/api/status", .method = HTTP_GET, .handler = status_handler},
         {.uri = "/api/messages", .method = HTTP_GET, .handler = messages_handler},
         {.uri = "/api/roster", .method = HTTP_GET, .handler = roster_handler},
+        {.uri = "/api/routes", .method = HTTP_GET, .handler = routes_handler},
         {.uri = "/generate_204", .method = HTTP_GET, .handler = captive_handler},
         {.uri = "/gen_204", .method = HTTP_GET, .handler = captive_handler},
         {.uri = "/hotspot-detect.html", .method = HTTP_GET, .handler = captive_handler},
@@ -2216,6 +2286,7 @@ void app_main(void)
     rgb_led_init();
     init_factory_reset_button();
     roster_init();
+    route_table_init();
     node_config_load();
     lora_init();
     xTaskCreate(mesh_control_rx_task, "mesh_control_rx_task", 4096, NULL, 6, NULL);

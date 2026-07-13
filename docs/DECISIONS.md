@@ -19,4 +19,5 @@
 - 2026-07-13 Phase 5: roster staleness is `ROSTER_STALE_MS = 300000` (5 minutes) so a live peer stays visible across short outages and normal traffic gaps without lingering for too long.
 - 2026-07-13 Phase 5: roster capacity is `MAX_ROSTER_ENTRIES = 32`, which is enough for the current deployment scale while keeping the snapshot bounded and the eviction policy simple.
 - 2026-07-13 Phase 5: roster and `data_mutex` must never be nested; callers must take and release them sequentially to avoid deadlock across the HTTP and radio paths.
+- 2026-07-13 Phase 6: route learning prefers a shorter hop distance when available, but replaces an older stale entry even if the new hop count is not shorter, so stale paths do not stay pinned forever.
 - Infra: `sdkconfig.esp32-s3-devkitm-1` now uses a custom `partitions.csv` with a single 3MB factory app, 4MB SPIFFS storage, and 64KB coredump area instead of the built-in single-app 1MB layout; OTA was intentionally not added because this project has no delivery path for firmware updates yet.
