@@ -14,6 +14,8 @@
 #define PACKET_LEN 320
 #define MAX_SEEN_PACKETS 4
 #define SEEN_PACKET_TTL_MS 60000
+#define MAX_ROSTER_ENTRIES 4
+#define ROSTER_STALE_MS 300000
 
 typedef struct {
     char sitio[SITIO_LEN];
@@ -42,9 +44,20 @@ typedef struct {
     char source[FIELD_LEN];
 } seen_packet_t;
 
+typedef struct {
+    char node_id[FIELD_LEN];
+    location_info_t location;
+    uint32_t last_seen_epoch;
+    uint32_t last_seen_tick_ms;
+    bool online;
+} roster_entry_t;
+
 static seen_packet_t seen_packets[MAX_SEEN_PACKETS];
 static size_t seen_packet_count;
 static uint32_t fake_tick;
+static roster_entry_t roster[MAX_ROSTER_ENTRIES];
+static size_t roster_count;
+static uint32_t fake_roster_now_ms;
 
 static void copy_field(char *destination, size_t destination_size, const char *source)
 {
@@ -275,11 +288,88 @@ static void remember_packet(const char *source, uint32_t id)
     copy_field(seen_packet->source, sizeof(seen_packet->source), source);
 }
 
+static uint32_t roster_now_ms(void)
+{
+    return fake_roster_now_ms;
+}
+
+static size_t roster_find_index(const char *node_id)
+{
+    for (size_t i = 0; i < roster_count; i++) {
+        if (strcmp(roster[i].node_id, node_id) == 0) {
+            return i;
+        }
+    }
+
+    return SIZE_MAX;
+}
+
+static bool roster_is_stale_at(const char *node_id, uint32_t now_ms)
+{
+    size_t index = roster_find_index(node_id);
+
+    if (index == SIZE_MAX) {
+        return true;
+    }
+
+    return (now_ms - roster[index].last_seen_tick_ms) >= ROSTER_STALE_MS;
+}
+
+static bool roster_is_stale(const char *node_id)
+{
+    return roster_is_stale_at(node_id, roster_now_ms());
+}
+
+static void roster_touch(const char *node_id, const location_info_t *location, uint32_t epoch_seconds)
+{
+    size_t index = roster_find_index(node_id);
+    uint32_t now_ms = roster_now_ms();
+
+    if (index == SIZE_MAX) {
+        if (roster_count < MAX_ROSTER_ENTRIES) {
+            index = roster_count++;
+        } else {
+            size_t oldest = 0;
+            for (size_t i = 1; i < roster_count; i++) {
+                if ((now_ms - roster[i].last_seen_tick_ms) > (now_ms - roster[oldest].last_seen_tick_ms)) {
+                    oldest = i;
+                }
+            }
+            index = oldest;
+        }
+    }
+
+    copy_field(roster[index].node_id, sizeof(roster[index].node_id), node_id);
+    if (location != NULL) {
+        roster[index].location = *location;
+    } else {
+        memset(&roster[index].location, 0, sizeof(roster[index].location));
+    }
+    roster[index].last_seen_epoch = epoch_seconds;
+    roster[index].last_seen_tick_ms = now_ms;
+    roster[index].online = true;
+}
+
+static size_t roster_get_snapshot(roster_entry_t *out, size_t out_capacity)
+{
+    size_t count = roster_count < out_capacity ? roster_count : out_capacity;
+
+    for (size_t i = 0; i < count; i++) {
+        roster[i].online = !roster_is_stale_at(roster[i].node_id, roster_now_ms());
+        out[i] = roster[i];
+    }
+
+    return count;
+}
+
 void setUp(void)
 {
     memset(seen_packets, 0, sizeof(seen_packets));
+    memset(roster, 0, sizeof(roster));
     seen_packet_count = 0;
+    roster_count = 0;
     fake_tick = 1000;
+    fake_roster_now_ms = 1000;
 }
 
 void tearDown(void)
@@ -386,6 +476,60 @@ static void test_packet_seen_expires_after_ttl(void)
     TEST_ASSERT_EQUAL_UINT(0, seen_packet_count);
 }
 
+static void test_roster_touch_inserts_and_updates(void)
+{
+    location_info_t loc = {0};
+    roster_entry_t snapshot[MAX_ROSTER_ENTRIES];
+    size_t count;
+
+    copy_field(loc.barangay, sizeof(loc.barangay), "San Isidro");
+    roster_touch("NODE01", &loc, 100);
+    TEST_ASSERT_FALSE(roster_is_stale("NODE01"));
+
+    fake_roster_now_ms += 1000;
+    roster_touch("NODE01", &loc, 200);
+
+    count = roster_get_snapshot(snapshot, MAX_ROSTER_ENTRIES);
+    TEST_ASSERT_EQUAL_UINT(1, count);
+    TEST_ASSERT_EQUAL_STRING("NODE01", snapshot[0].node_id);
+    TEST_ASSERT_EQUAL_UINT32(200, snapshot[0].last_seen_epoch);
+    TEST_ASSERT_TRUE(snapshot[0].online);
+}
+
+static void test_roster_touch_evicts_oldest_when_full(void)
+{
+    location_info_t loc = {0};
+    roster_entry_t snapshot[MAX_ROSTER_ENTRIES];
+    size_t count;
+
+    copy_field(loc.barangay, sizeof(loc.barangay), "San Isidro");
+    roster_touch("NODE01", &loc, 1);
+    fake_roster_now_ms += 10;
+    roster_touch("NODE02", &loc, 2);
+    fake_roster_now_ms += 10;
+    roster_touch("NODE03", &loc, 3);
+    fake_roster_now_ms += 10;
+    roster_touch("NODE04", &loc, 4);
+    fake_roster_now_ms += 10;
+    roster_touch("NODE05", &loc, 5);
+
+    count = roster_get_snapshot(snapshot, MAX_ROSTER_ENTRIES);
+    TEST_ASSERT_EQUAL_UINT(MAX_ROSTER_ENTRIES, count);
+    TEST_ASSERT_TRUE(roster_find_index("NODE01") == SIZE_MAX);
+    TEST_ASSERT_TRUE(roster_find_index("NODE05") != SIZE_MAX);
+}
+
+static void test_roster_is_stale_thresholds(void)
+{
+    location_info_t loc = {0};
+
+    copy_field(loc.barangay, sizeof(loc.barangay), "San Isidro");
+    roster_touch("NODE01", &loc, 100);
+    TEST_ASSERT_FALSE(roster_is_stale_at("NODE01", fake_roster_now_ms + ROSTER_STALE_MS - 1));
+    TEST_ASSERT_TRUE(roster_is_stale_at("NODE01", fake_roster_now_ms + ROSTER_STALE_MS));
+    TEST_ASSERT_TRUE(roster_is_stale("UNKNOWN"));
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -398,5 +542,8 @@ int main(void)
     RUN_TEST(test_parse_mesh_packet_sets_thread_key_for_direct_messages);
     RUN_TEST(test_packet_seen_uses_source_and_id);
     RUN_TEST(test_packet_seen_expires_after_ttl);
+    RUN_TEST(test_roster_touch_inserts_and_updates);
+    RUN_TEST(test_roster_touch_evicts_oldest_when_full);
+    RUN_TEST(test_roster_is_stale_thresholds);
     return UNITY_END();
 }

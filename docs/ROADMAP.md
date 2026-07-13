@@ -6,7 +6,6 @@ The implemented features are documented in [FEATURES.md](./FEATURES.md).
 
 - Phase 2: WiFi hardening
 - Phase 4: Buffer eviction + dedup scaling
-- Phase 5: Roster
 - Phase 6: Route table
 - Phase 6b: WHO_ONLINE discovery
 - Phase 7: Config wizard

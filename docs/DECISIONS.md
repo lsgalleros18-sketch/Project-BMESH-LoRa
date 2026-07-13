@@ -16,4 +16,7 @@
 - Phase 4: message-table eviction now prefers the oldest completed entry (`RX`, `ACKED`, or `FAILED`) and returns `NULL` when the table is full of active entries; the portal surfaces that as a queue-full warning instead of silently overwriting in-flight messages.
 - Phase 4: dedup lookup uses a 32-bucket hash table for 64 cached packets with a 60 second TTL, keeping the average bucket depth near 2 entries at capacity while preserving TTL pruning and oldest-in-bucket replacement when a bucket must be reused.
 - Phase 4: queue-full state is exposed through `/api/status` as `queue_full` and mirrored in the portal warning banner so operators can see why a message was not queued.
+- 2026-07-13 Phase 5: roster staleness is `ROSTER_STALE_MS = 300000` (5 minutes) so a live peer stays visible across short outages and normal traffic gaps without lingering for too long.
+- 2026-07-13 Phase 5: roster capacity is `MAX_ROSTER_ENTRIES = 32`, which is enough for the current deployment scale while keeping the snapshot bounded and the eviction policy simple.
+- 2026-07-13 Phase 5: roster and `data_mutex` must never be nested; callers must take and release them sequentially to avoid deadlock across the HTTP and radio paths.
 - Infra: `sdkconfig.esp32-s3-devkitm-1` now uses a custom `partitions.csv` with a single 3MB factory app, 4MB SPIFFS storage, and 64KB coredump area instead of the built-in single-app 1MB layout; OTA was intentionally not added because this project has no delivery path for firmware updates yet.

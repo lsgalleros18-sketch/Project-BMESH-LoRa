@@ -30,6 +30,7 @@
 #include "bems_common.h"
 #include "bems_crypto.h"
 #include "mesh_protocol.h"
+#include "roster.h"
 #include "node_config.h"
 #include "lora_radio.h"
 
@@ -400,7 +401,7 @@ static const char INDEX_HTML[] =
     "async function load(){let s=await fetch('/api/status').then(r=>r.json());"
     "document.getElementById('status').innerHTML='Node <b>'+s.node+'</b> | '+s.name+' | '+s.location+' | Relay <b>'+s.relay+'</b> | AP <b>'+s.ssid+'</b> | Clients <b>'+s.clients+'</b> | Time <b>'+(s.time_synced?(new Date(s.epoch*1000).toLocaleString()):'unknown')+'</b>';"
     "document.getElementById('warningBox').textContent=s.queue_full?'Message queue is full; active items must complete before new ones can be queued.':(s.duplicate_warning?'Possible duplicate node ID on the mesh':'');"
-    "let m=await fetch('/api/messages').then(r=>r.json());cachedThreads={};let peers={};m.forEach(x=>{let key=x.thread_key||'UNKNOWN';if(!cachedThreads[key])cachedThreads[key]={thread_key:key,label:key==='ANNOUNCEMENTS'?'Announcements':key,messages:[],lastSeen:0};cachedThreads[key].messages.push(x);cachedThreads[key].lastSeen=Math.max(cachedThreads[key].lastSeen,x.id||0);if(key==='ANNOUNCEMENTS')cachedThreads[key].label='Announcements';else if(!cachedThreads[key].label||cachedThreads[key].label===key)cachedThreads[key].label=key;if(x.source){let p=peers[x.source]||{id:x.source,lastSeen:0,location:''};p.lastSeen=Math.max(p.lastSeen,x.id||0);p.location=locText(x);peers[x.source]=p;}});if(!cachedThreads[activeThread]&&Object.keys(cachedThreads).length){activeThread=Object.keys(cachedThreads)[0];}renderThreads();renderThreadView();let health=document.getElementById('health');let roster=Object.values(peers).sort((a,b)=>b.lastSeen-a.lastSeen);health.innerHTML=roster.length?roster.map(p=>'<div class=msg><b>'+escapeHtml(p.id)+'</b><br><span class=muted>Last seen #'+p.lastSeen+'</span><br>'+escapeHtml(p.location||'Unknown')+'</div>').join(''):'No peers yet.';}"
+    "let m=await fetch('/api/messages').then(r=>r.json());let roster=await fetch('/api/roster').then(r=>r.json());cachedThreads={};m.forEach(x=>{let key=x.thread_key||'UNKNOWN';if(!cachedThreads[key])cachedThreads[key]={thread_key:key,label:key==='ANNOUNCEMENTS'?'Announcements':key,messages:[]};cachedThreads[key].messages.push(x);if(key==='ANNOUNCEMENTS')cachedThreads[key].label='Announcements';else if(!cachedThreads[key].label||cachedThreads[key].label===key)cachedThreads[key].label=key;});if(!cachedThreads[activeThread]&&Object.keys(cachedThreads).length){activeThread=Object.keys(cachedThreads)[0];}renderThreads();renderThreadView();let health=document.getElementById('health');health.innerHTML=roster.length?roster.map(p=>'<div class=msg><b>'+escapeHtml(p.node_id)+'</b><br><span class=muted>'+(p.online?'Online':'Offline')+'</span><br><span class=muted>Last seen epoch '+escapeHtml(p.last_seen_epoch||0)+'</span><br>'+escapeHtml([p.location?.sitio||'',p.location?.barangay||'',p.location?.municipality||''].filter(Boolean).join(' \xE2\x86\x92 ')||'Unknown')+'</div>').join(''):'No peers yet.';}"
     "load();setInterval(load,4000);</script></body></html>";
 
 static const char SETUP_HTML[] =
@@ -472,7 +473,6 @@ static emergency_message_t *next_message_slot(void)
     message_count--;
     message = &messages[message_count++];
     memset(message, 0, sizeof(*message));
-    // TODO(Phase 5): invalidate retry entry when roster[destination] goes stale
     return message;
 }
 
@@ -971,6 +971,11 @@ static void retry_tracker_task(void *parameter)
                     entry->active = false;
                     break;
                 }
+                if (roster_is_stale(entry->destination)) {
+                    copy_field(message->status, sizeof(message->status), "FAILED");
+                    entry->active = false;
+                    break;
+                }
                 if (entry->attempts >= entry->max_attempts) {
                     copy_field(message->status, sizeof(message->status), "FAILED");
                     entry->active = false;
@@ -1326,6 +1331,10 @@ static void mesh_control_rx_task(void *parameter)
         mesh_packet_t parsed;
         if (!parse_mesh_packet(packet, &parsed)) {
             continue;
+        }
+
+        if (parsed.valid && strcmp(parsed.source, node_id) != 0) {
+            roster_touch(parsed.source, &parsed.location, time_synced ? current_epoch_seconds() : 0);
         }
 
         if (strcmp(parsed.type, "ID_CHECK") == 0 && strcmp(parsed.destination, node_id) == 0 && strcmp(parsed.source, node_id) != 0) {
@@ -2001,6 +2010,48 @@ static esp_err_t messages_handler(httpd_req_t *request)
     return httpd_resp_send_chunk(request, NULL, 0);
 }
 
+static esp_err_t roster_handler(httpd_req_t *request)
+{
+    roster_entry_t snapshot[MAX_ROSTER_ENTRIES];
+    size_t snapshot_count;
+    bool first = true;
+    esp_err_t session_result = require_session(request);
+
+    if (session_result != ESP_OK) {
+        return session_result;
+    }
+
+    snapshot_count = roster_get_snapshot(snapshot, MAX_ROSTER_ENTRIES);
+    httpd_resp_set_type(request, "application/json");
+    httpd_resp_send_chunk(request, "[", 1);
+    for (size_t i = 0; i < snapshot_count; i++) {
+        char escaped_node[FIELD_LEN * 2];
+        char escaped_sitio[SITIO_LEN * 2];
+        char escaped_barangay[BARANGAY_LEN * 2];
+        char escaped_municipality[MUNICIPALITY_LEN * 2];
+        char json[320];
+
+        json_escape_string(escaped_node, sizeof(escaped_node), snapshot[i].node_id);
+        json_escape_string(escaped_sitio, sizeof(escaped_sitio), snapshot[i].location.sitio);
+        json_escape_string(escaped_barangay, sizeof(escaped_barangay), snapshot[i].location.barangay);
+        json_escape_string(escaped_municipality, sizeof(escaped_municipality), snapshot[i].location.municipality);
+
+        snprintf(json, sizeof(json),
+                 "%s{\"node_id\":\"%s\",\"sitio\":\"%s\",\"barangay\":\"%s\",\"municipality\":\"%s\",\"last_seen_epoch\":%lu,\"online\":%s}",
+                 first ? "" : ",",
+                 escaped_node,
+                 escaped_sitio,
+                 escaped_barangay,
+                 escaped_municipality,
+                 (unsigned long)snapshot[i].last_seen_epoch,
+                 snapshot[i].online ? "true" : "false");
+        first = false;
+        httpd_resp_send_chunk(request, json, HTTPD_RESP_USE_STRLEN);
+    }
+    httpd_resp_send_chunk(request, "]", 1);
+    return httpd_resp_send_chunk(request, NULL, 0);
+}
+
 static esp_err_t captive_handler(httpd_req_t *request)
 {
     return send_redirect(request, "/");
@@ -2010,7 +2061,7 @@ static void start_http_server(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = HTTP_PORT;
-    config.max_uri_handlers = 16;
+    config.max_uri_handlers = 17;
     config.uri_match_fn = httpd_uri_match_wildcard;
     config.stack_size = 16384;
 
@@ -2024,6 +2075,7 @@ static void start_http_server(void)
         {.uri = "/sync", .method = HTTP_POST, .handler = sync_handler},
         {.uri = "/api/status", .method = HTTP_GET, .handler = status_handler},
         {.uri = "/api/messages", .method = HTTP_GET, .handler = messages_handler},
+        {.uri = "/api/roster", .method = HTTP_GET, .handler = roster_handler},
         {.uri = "/generate_204", .method = HTTP_GET, .handler = captive_handler},
         {.uri = "/gen_204", .method = HTTP_GET, .handler = captive_handler},
         {.uri = "/hotspot-detect.html", .method = HTTP_GET, .handler = captive_handler},
@@ -2163,6 +2215,7 @@ void app_main(void)
     load_highest_seen_id();
     rgb_led_init();
     init_factory_reset_button();
+    roster_init();
     node_config_load();
     lora_init();
     xTaskCreate(mesh_control_rx_task, "mesh_control_rx_task", 4096, NULL, 6, NULL);
