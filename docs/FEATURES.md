@@ -71,30 +71,46 @@ Nodes can share a coarse time reference for consistent message timestamps.
 - Broadcasts time sync packets through the mesh.
 - Tracks whether the node is time synchronized.
 
+### 9. Active Mesh Discovery
+Operators can trigger an on-demand discovery round to refresh online node visibility.
+
+- Broadcasts `WHO_ONLINE` with a small hop budget.
+- Collects `WHO_ONLINE_REPLY` responses into the portal snapshot.
+- Refreshes the mesh health view from a live discovery pass.
+- Keeps discovery separate from passive routing and normal traffic.
+
+### 10. First-Boot Configuration Wizard
+The captive setup page now guides operators through the node's initial deployment settings.
+
+- Covers network membership, identity, location, and messaging defaults.
+- Makes security-critical fields visible up front so they are hard to miss.
+- Includes the AP password and node role alongside the existing PIN and network key fields.
+- Keeps the setup flow progressive instead of hard-blocking.
+
 ## Minor Features
 
-### 9. Wi-Fi Access Point Setup
+### 11. Wi-Fi Access Point Setup
 The device starts as a local configuration hotspot.
 
 - Creates a setup AP with a generated password.
 - Uses WPA2 for AP association.
 - Serves DNS redirection so common captive-portal checks resolve locally.
 
-### 10. Login Session Handling
+### 12. Login Session Handling
 Portal sessions are managed with in-memory login state.
 
 - Issues a session token on successful login.
 - Expires inactive sessions after an idle timeout.
 - Applies lockout delays after repeated failed PIN attempts.
 
-### 11. Hardware Control
+### 13. Hardware Control
 The firmware also manages a few device-level peripherals.
 
 - Controls the SX1278 radio through SPI.
 - Uses an RGB LED for visual feedback.
 - Supports a boot/factory-reset button.
 
-### 12. Built-in UI Convenience
+### 14. Built-in UI Convenience
 The portal includes small operator-friendly helpers.
 
 - Message templates for common emergency payloads.

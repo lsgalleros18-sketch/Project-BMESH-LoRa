@@ -142,6 +142,8 @@ static void apply_time_sync(uint32_t epoch, uint8_t distance);
 static void send_time_sync_packet(uint32_t epoch, uint8_t distance, uint8_t hops);
 static void broadcast_time_sync_if_synced(void);
 static void write_message_json_chunk(httpd_req_t *request, const emergency_message_t *message, bool first);
+static void send_online_discovery(uint8_t hops);
+static esp_err_t discover_handler(httpd_req_t *request);
 
 typedef struct {
     uint32_t id;
@@ -211,6 +213,8 @@ typedef struct {
 
 static session_record_t sessions[MAX_SESSIONS];
 static login_lockout_t lockouts[MAX_LOCKOUTS];
+static bool discovery_active;
+static uint8_t discovery_budget;
 
 #define node_config (*node_config_get())
 
@@ -382,7 +386,7 @@ static const char INDEX_HTML[] =
     "<label>Message<textarea id=payload name=payload maxlength=159 placeholder='Short emergency message'></textarea></label>"
     "<button type=submit>Queue / Transmit Message</button></form><p class=muted>The portal sends through the SX1278 using GPIO 5/7/6/8/4/16 at 433 MHz.</p></section>"
     "<section class=card><h3>Messages</h3><div class=messenger><div class=thread-list><div class=muted>Loading threads...</div></div><div class=thread-view><div class=muted>Loading messages...</div></div></div></section>"
-    "<section class=card><h3>Mesh Health</h3><div id=health class=muted>Loading node roster...</div></section>"
+    "<section class=card><h3>Mesh Health</h3><button id=discoverBtn type=button>Refresh Mesh</button><div id=health class=muted>Loading node roster...</div></section>"
     "<section class=card><h3>Portal</h3><p class=muted id=warningBox></p><p class=muted>Connect to this Wi-Fi when offline, then open http://192.168.4.1. Android/iOS captive checks are redirected here automatically.</p>"
     "<form method=post action=/settime><label>Set time<input name=epoch id=epochInput readonly></label><button type=submit>Sync Clock</button></form>"
     "<form method=post action=/sync><button type=submit>Sync Messages from Mesh</button></form>"
@@ -403,30 +407,36 @@ static const char INDEX_HTML[] =
     "async function load(){let s=await fetch('/api/status').then(r=>r.json());"
     "document.getElementById('status').innerHTML='Node <b>'+s.node+'</b> | '+s.name+' | '+s.location+' | Relay <b>'+s.relay+'</b> | AP <b>'+s.ssid+'</b> | Clients <b>'+s.clients+'</b> | Time <b>'+(s.time_synced?(new Date(s.epoch*1000).toLocaleString()):'unknown')+'</b>';"
     "document.getElementById('warningBox').textContent=s.queue_full?'Message queue is full; active items must complete before new ones can be queued.':(s.duplicate_warning?'Possible duplicate node ID on the mesh':'');"
-    "let m=await fetch('/api/messages').then(r=>r.json());let roster=await fetch('/api/roster').then(r=>r.json());cachedThreads={};m.forEach(x=>{let key=x.thread_key||'UNKNOWN';if(!cachedThreads[key])cachedThreads[key]={thread_key:key,label:key==='ANNOUNCEMENTS'?'Announcements':key,messages:[]};cachedThreads[key].messages.push(x);if(key==='ANNOUNCEMENTS')cachedThreads[key].label='Announcements';else if(!cachedThreads[key].label||cachedThreads[key].label===key)cachedThreads[key].label=key;});if(!cachedThreads[activeThread]&&Object.keys(cachedThreads).length){activeThread=Object.keys(cachedThreads)[0];}renderThreads();renderThreadView();let health=document.getElementById('health');health.innerHTML=roster.length?roster.map(p=>'<div class=msg><b>'+escapeHtml(p.node_id)+'</b><br><span class=muted>'+(p.online?'Online':'Offline')+'</span><br><span class=muted>Last seen epoch '+escapeHtml(p.last_seen_epoch||0)+'</span><br>'+escapeHtml([p.location?.sitio||'',p.location?.barangay||'',p.location?.municipality||''].filter(Boolean).join(' \xE2\x86\x92 ')||'Unknown')+'</div>').join(''):'No peers yet.';}"
-    "load();setInterval(load,4000);</script></body></html>";
+    "let m=await fetch('/api/messages').then(r=>r.json());cachedThreads={};m.forEach(x=>{let key=x.thread_key||'UNKNOWN';if(!cachedThreads[key])cachedThreads[key]={thread_key:key,label:key==='ANNOUNCEMENTS'?'Announcements':key,messages:[]};cachedThreads[key].messages.push(x);if(key==='ANNOUNCEMENTS')cachedThreads[key].label='Announcements';else if(!cachedThreads[key].label||cachedThreads[key].label===key)cachedThreads[key].label=key;});if(!cachedThreads[activeThread]&&Object.keys(cachedThreads).length){activeThread=Object.keys(cachedThreads)[0];}renderThreads();renderThreadView();let roster=await fetch('/discover').then(r=>r.json());let health=document.getElementById('health');health.innerHTML=roster.length?roster.map(p=>'<div class=msg><b>'+escapeHtml(p.node_id)+'</b><br><span class=muted>'+(p.online?'Online':'Offline')+'</span><br><span class=muted>Last seen epoch '+escapeHtml(p.last_seen_epoch||0)+'</span><br>'+escapeHtml([p.location?.sitio||'',p.location?.barangay||'',p.location?.municipality||''].filter(Boolean).join(' \xE2\x86\x92 ')||'Unknown')+'</div>').join(''):'No peers yet.';}"
+    "document.getElementById('discoverBtn').addEventListener('click',load);load();setInterval(load,15000);</script></body></html>";
 
 static const char SETUP_HTML[] =
     "<!doctype html><html><head><meta name=viewport content='width=device-width,initial-scale=1'>"
     "<title>Setup Barangay Mesh</title><style>"
-    ":root{font-family:Arial,sans-serif;color:#17202a;background:#f5f7f9}"
-    "body{margin:0}.top{background:#1f6f5b;color:white;padding:16px}.wrap{max-width:720px;margin:auto;padding:16px}"
-    ".card{background:white;border:1px solid #d8dee4;border-radius:8px;padding:16px;margin:12px 0}"
-    "label{display:block;font-weight:700;margin-top:12px}input,button{box-sizing:border-box;width:100%;font:inherit;padding:12px;margin-top:6px;border-radius:6px;border:1px solid #b8c0cc}"
-    "button{background:#1f6f5b;color:white;border:0;font-weight:700;margin-top:16px}.muted{color:#5f6b7a;font-size:14px}"
+    ":root{font-family:Arial,sans-serif;color:#17202a;background:linear-gradient(180deg,#eef5f0 0,#f7f9fb 100%)}"
+    "body{margin:0}.top{background:#1f6f5b;color:white;padding:16px}.wrap{max-width:900px;margin:auto;padding:16px}"
+    ".card{background:white;border:1px solid #d8dee4;border-radius:10px;padding:16px;margin:12px 0;box-shadow:0 1px 0 rgba(15,23,42,.03)}"
+    ".grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.full{grid-column:1/-1}"
+    "label{display:block;font-weight:700;margin-top:12px}input,select,button{box-sizing:border-box;width:100%;font:inherit;padding:12px;margin-top:6px;border-radius:8px;border:1px solid #b8c0cc;background:white}"
+    "button{background:#1f6f5b;color:white;border:0;font-weight:700;margin-top:16px;cursor:pointer}"
+    ".muted{color:#5f6b7a;font-size:14px}.warn{background:#fff7d6;border:1px solid #f0d58b;color:#6b4e00;padding:10px 12px;border-radius:8px;margin-top:10px}"
+    ".section{border-left:4px solid #1f6f5b;padding-left:12px;margin:14px 0 6px 0;font-weight:800}.small{font-size:12px}"
+    ".row{display:flex;gap:12px;flex-wrap:wrap}.row label{font-weight:600;margin-top:0}"
     "</style></head><body><div class=top><div class=wrap><h2>First-Time Node Setup</h2>"
-    "<p>Configure this universal mesh node once. All nodes still send, receive, and relay.</p></div></div>"
-    "<main class=wrap><section class=card><form method=post action=/setup>"
-    "<label>Node ID<input name=node_id maxlength=31 placeholder='Example: BRGY001, HH023, RELAY04' required></label>"
-    "<label>Node Name<input name=node_name maxlength=31 placeholder='Example: Barangay Hall or House 23' required></label>"
-    "<label>Sitio / Landmark<input name=sitio maxlength=23 placeholder='Example: Purok 3, Chapel Roof'></label>"
-    "<label>Barangay<input name=barangay maxlength=23 placeholder='Example: San Isidro' required></label>"
-    "<label>Municipality<input name=municipality maxlength=23 placeholder='Example: Cabuyao'></label>"
-    "<label>Default Destination<input name=default_destination maxlength=31 value='BRGY001' placeholder='Example: ALL or BRGY001'></label>"
-    "<label>Web PIN<input name=web_pin maxlength=31 placeholder='Generated on first boot' required></label>"
-    "<label>Network Key<input name=network_key maxlength=31 placeholder='Generated on first boot or enter pairing key' required></label>"
+    "<p>Progressive wizard mode: keep the node usable, but set the security fields before deploying.</p></div></div>"
+    "<main class=wrap><section class=card><div class=warn id=setupWarn>Fill the security fields below before you hand this node to an operator.</div>"
+    "<form method=post action=/setup><div class=section>1. Network membership</div>"
+    "<div class=row><label><input type=radio name=join_mode value=create checked> Create new network</label><label><input type=radio name=join_mode value=join> Join existing network</label></div>"
+    "<div class=grid><label>Network Key<input name=network_key maxlength=31 placeholder='Generated on first boot or enter pairing key' required></label><label>Web PIN<input name=web_pin maxlength=31 placeholder='Generated on first boot' required></label><label>Wi-Fi AP Password<input name=ap_password maxlength=31 placeholder='Generated on first boot' required></label></div>"
+    "<div class=section>2. Identity</div><div class=grid><label>Node ID<input name=node_id maxlength=31 placeholder='BRGY-SANISIDRO-01' required></label><label>Node Name<input name=node_name maxlength=31 placeholder='Barangay Hall or House 23' required></label><label>Node Role<select name=node_role><option>relay-only</option><option>relay+message-origin</option><option>gateway</option></select></label><label class=muted>Join mode is selected above and does not need a separate save field.</label></div>"
+    "<div class=section>3. Location</div><div class=grid><label>Sitio / Landmark<input name=sitio maxlength=23 placeholder='Purok 3, Chapel Roof'></label><label>Barangay<input name=barangay maxlength=23 placeholder='San Isidro' required></label><label>Municipality<input name=municipality maxlength=23 placeholder='Cabuyao'></label></div>"
+    "<div class=section>4. Messaging defaults</div><div class=grid><label>Default Destination<input name=default_destination maxlength=31 value='BRGY001' placeholder='ALL or BRGY001'></label><label>Default Priority<select name=default_priority><option>HIGH</option><option selected>NORMAL</option><option>LOW</option></select></label></div>"
+    "<div class=section>5. Advanced</div><div class=grid><label>TX Power Ceiling<input name=tx_power_ceiling maxlength=5 placeholder='Optional'></label><label>Low Battery Threshold<input name=low_battery_threshold maxlength=5 placeholder='Optional'></label></div>"
+    "<p class='muted small'>This wizard keeps the radio profile fixed. Use the fields above for identity and deployment defaults only.</p>"
     "<button type=submit>Save Setup and Reboot</button></form>"
-    "<p class=muted>Factory reset later by holding BOOT for 10 seconds during startup.</p></section></main></body></html>";
+    "<form method=post action=/reset onsubmit='return confirm(\"Factory reset this node and run setup again?\")'><button type=submit style='background:#991b1b'>Factory Reset Node</button></form>"
+    "<p class=muted>Factory reset later by holding BOOT for 10 seconds during startup.</p></section></main>"
+    "<script>const warn=document.getElementById('setupWarn');function updateWarn(){const needed=['network_key','web_pin','ap_password','node_id'];const missing=needed.filter(n=>!document.querySelector('[name='+n+']').value.trim());warn.textContent=missing.length?'Fill: '+missing.join(', '):'Ready to save.';}document.querySelectorAll('input,select').forEach(el=>el.addEventListener('input',updateWarn));updateWarn();</script></body></html>";
 
 static const char LOGIN_HTML[] =
     "<!doctype html><html><head><meta name=viewport content='width=device-width,initial-scale=1'>"
@@ -519,7 +529,8 @@ static uint32_t ack_id_from_payload(const char *payload)
 
 static bool is_control_packet_type(const char *type)
 {
-    return strcmp(type, "ACK") == 0 || strcmp(type, "SYNC_REQ") == 0 || strcmp(type, "SYNC_RESP") == 0 || strcmp(type, "TIME_SYNC") == 0;
+    return strcmp(type, "ACK") == 0 || strcmp(type, "SYNC_REQ") == 0 || strcmp(type, "SYNC_RESP") == 0 || strcmp(type, "TIME_SYNC") == 0 ||
+           strcmp(type, "WHO_ONLINE") == 0 || strcmp(type, "WHO_ONLINE_REPLY") == 0 || strcmp(type, "ONLINE_ROSTER") == 0;
 }
 
 static uint32_t current_epoch_seconds(void)
@@ -1292,6 +1303,16 @@ static void send_control_packet(const char *type, const char *destination, const
     lora_transmit(packet);
 }
 
+static void send_online_discovery(uint8_t hops)
+{
+    char payload[FIELD_LEN];
+
+    snprintf(payload, sizeof(payload), "budget=%u", hops);
+    discovery_budget = hops;
+    discovery_active = true;
+    send_control_packet("WHO_ONLINE", "ALL", payload);
+}
+
 static bool node_id_collision_detected(const char *proposed_id)
 {
     char packet[PACKET_LEN];
@@ -1361,6 +1382,25 @@ static void mesh_control_rx_task(void *parameter)
             // TODO(route-table): not yet consumed
         } else if (strcmp(parsed.type, "TIME_SYNC") == 0) {
             apply_time_sync(time_sync_epoch_from_payload(parsed.payload), time_sync_dist_from_payload(parsed.payload));
+        } else if (strcmp(parsed.type, "WHO_ONLINE") == 0) {
+            if (!is_self_packet && parsed.hops > 0) {
+                char reply[PACKET_LEN];
+                char encoded_location[SITIO_LEN + BARANGAY_LEN + MUNICIPALITY_LEN + 2];
+
+                vTaskDelay(pdMS_TO_TICKS(200 + (esp_random() % 1001)));
+                location_encode(&node_config.location, encoded_location, sizeof(encoded_location));
+                snprintf(reply, sizeof(reply), "BEMS|%lu|%.*s|%.*s|WHO_ONLINE_REPLY|NORMAL|HOPS=0|RELAY=0|LOC=%s|%.*s",
+                         (unsigned long)++packet_counter,
+                         31,
+                         node_id,
+                         31,
+                         parsed.source,
+                         encoded_location,
+                         31,
+                         node_id);
+                save_packet_counter();
+                lora_transmit(reply);
+            }
         } else if (strcmp(parsed.type, "ID_CHECK") == 0 && strcmp(parsed.destination, node_id) == 0 && !is_self_packet) {
             char reply[PACKET_LEN];
             char encoded_location[SITIO_LEN + BARANGAY_LEN + MUNICIPALITY_LEN + 2];
@@ -1384,6 +1424,10 @@ static void mesh_control_rx_task(void *parameter)
             store_received_packet(packet, &parsed, rssi, snr);
             if (message_requires_delivery_ack(parsed.destination, parsed.priority) && strcmp(parsed.destination, node_id) == 0) {
                 send_ack_packet(&parsed);
+            }
+        } else if (strcmp(parsed.type, "WHO_ONLINE_REPLY") == 0) {
+            if (parsed.valid && strcmp(parsed.source, node_id) != 0) {
+                roster_mark_active(parsed.source);
             }
         }
 
@@ -1809,12 +1853,15 @@ static esp_err_t setup_handler(httpd_req_t *request)
     form_value(body, "node_id", raw_node_id, sizeof(raw_node_id));
     copy_node_id(new_config.node_id, sizeof(new_config.node_id), raw_node_id);
     form_value(body, "node_name", new_config.node_name, sizeof(new_config.node_name));
+    form_value(body, "node_role", new_config.node_role, sizeof(new_config.node_role));
     form_value(body, "sitio", new_config.location.sitio, sizeof(new_config.location.sitio));
     form_value(body, "barangay", new_config.location.barangay, sizeof(new_config.location.barangay));
     form_value(body, "municipality", new_config.location.municipality, sizeof(new_config.location.municipality));
     form_value(body, "default_destination", new_config.default_destination, sizeof(new_config.default_destination));
+    form_value(body, "default_priority", new_config.default_priority, sizeof(new_config.default_priority));
     form_value(body, "web_pin", new_config.web_pin, sizeof(new_config.web_pin));
     form_value(body, "network_key", new_config.network_key, sizeof(new_config.network_key));
+    form_value(body, "ap_password", new_config.ap_password, sizeof(new_config.ap_password));
     new_config.configured = true;
     if (new_config.node_id[0] == '\0') {
         copy_field(new_config.node_id, sizeof(new_config.node_id), node_id);
@@ -1828,17 +1875,26 @@ static esp_err_t setup_handler(httpd_req_t *request)
     if (new_config.node_name[0] == '\0') {
         copy_field(new_config.node_name, sizeof(new_config.node_name), "Mesh Node");
     }
+    if (new_config.node_role[0] == '\0') {
+        copy_field(new_config.node_role, sizeof(new_config.node_role), "relay-only");
+    }
     if (new_config.location.barangay[0] == '\0') {
         copy_field(new_config.location.barangay, sizeof(new_config.location.barangay), "Unknown");
     }
     if (new_config.default_destination[0] == '\0') {
         copy_field(new_config.default_destination, sizeof(new_config.default_destination), "BRGY001");
     }
+    if (new_config.default_priority[0] == '\0') {
+        copy_field(new_config.default_priority, sizeof(new_config.default_priority), "NORMAL");
+    }
     if (new_config.web_pin[0] == '\0') {
         copy_field(new_config.web_pin, sizeof(new_config.web_pin), node_config_get_web_pin());
     }
     if (new_config.network_key[0] == '\0') {
         copy_field(new_config.network_key, sizeof(new_config.network_key), node_config_get_network_key());
+    }
+    if (new_config.ap_password[0] == '\0') {
+        copy_field(new_config.ap_password, sizeof(new_config.ap_password), node_config_get_ap_password());
     }
 
     ESP_ERROR_CHECK(node_config_save(&new_config));
@@ -2121,6 +2177,53 @@ static esp_err_t routes_handler(httpd_req_t *request)
     return httpd_resp_send_chunk(request, NULL, 0);
 }
 
+static esp_err_t discover_handler(httpd_req_t *request)
+{
+    roster_entry_t snapshot[MAX_ROSTER_ENTRIES];
+    size_t snapshot_count;
+    TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(2500);
+    esp_err_t session_result = require_session(request);
+
+    if (session_result != ESP_OK) {
+        return session_result;
+    }
+
+    send_online_discovery(4);
+    while (xTaskGetTickCount() < deadline) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    discovery_active = false;
+
+    snapshot_count = roster_get_snapshot(snapshot, MAX_ROSTER_ENTRIES);
+    httpd_resp_set_type(request, "application/json");
+    httpd_resp_send_chunk(request, "[", 1);
+    for (size_t i = 0; i < snapshot_count; i++) {
+        char escaped_node[FIELD_LEN * 2];
+        char escaped_sitio[SITIO_LEN * 2];
+        char escaped_barangay[BARANGAY_LEN * 2];
+        char escaped_municipality[MUNICIPALITY_LEN * 2];
+        char json[320];
+
+        json_escape_string(escaped_node, sizeof(escaped_node), snapshot[i].node_id);
+        json_escape_string(escaped_sitio, sizeof(escaped_sitio), snapshot[i].location.sitio);
+        json_escape_string(escaped_barangay, sizeof(escaped_barangay), snapshot[i].location.barangay);
+        json_escape_string(escaped_municipality, sizeof(escaped_municipality), snapshot[i].location.municipality);
+
+        snprintf(json, sizeof(json),
+                 "%s{\"node_id\":\"%s\",\"sitio\":\"%s\",\"barangay\":\"%s\",\"municipality\":\"%s\",\"last_seen_epoch\":%lu,\"online\":%s}",
+                 i == 0 ? "" : ",",
+                 escaped_node,
+                 escaped_sitio,
+                 escaped_barangay,
+                 escaped_municipality,
+                 (unsigned long)snapshot[i].last_seen_epoch,
+                 snapshot[i].online ? "true" : "false");
+        httpd_resp_send_chunk(request, json, HTTPD_RESP_USE_STRLEN);
+    }
+    httpd_resp_send_chunk(request, "]", 1);
+    return httpd_resp_send_chunk(request, NULL, 0);
+}
+
 static esp_err_t captive_handler(httpd_req_t *request)
 {
     return send_redirect(request, "/");
@@ -2130,7 +2233,7 @@ static void start_http_server(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = HTTP_PORT;
-    config.max_uri_handlers = 17;
+    config.max_uri_handlers = 18;
     config.uri_match_fn = httpd_uri_match_wildcard;
     config.stack_size = 16384;
 
@@ -2146,6 +2249,7 @@ static void start_http_server(void)
         {.uri = "/api/messages", .method = HTTP_GET, .handler = messages_handler},
         {.uri = "/api/roster", .method = HTTP_GET, .handler = roster_handler},
         {.uri = "/api/routes", .method = HTTP_GET, .handler = routes_handler},
+        {.uri = "/discover", .method = HTTP_GET, .handler = discover_handler},
         {.uri = "/generate_204", .method = HTTP_GET, .handler = captive_handler},
         {.uri = "/gen_204", .method = HTTP_GET, .handler = captive_handler},
         {.uri = "/hotspot-detect.html", .method = HTTP_GET, .handler = captive_handler},
