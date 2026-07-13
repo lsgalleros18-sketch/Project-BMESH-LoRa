@@ -167,7 +167,6 @@ static char ap_ssid[FIELD_LEN];
 static emergency_message_t messages[MAX_MESSAGES];
 static retry_entry_t retry_entries[MAX_MESSAGES];
 static size_t message_count;
-static size_t seen_packet_count;
 static uint32_t packet_counter;
 static uint32_t highest_seen_id;
 static TickType_t last_send_tick;
@@ -181,6 +180,8 @@ static rmt_encoder_handle_t rgb_led_encoder;
 static bool rgb_led_ready;
 static bool duplicate_node_id_warning;
 static TickType_t duplicate_node_id_warning_tick;
+static bool queue_full_warning;
+static TickType_t queue_full_warning_tick;
 static QueueHandle_t lora_tx_queue;
 static SemaphoreHandle_t data_mutex;
 
@@ -241,6 +242,26 @@ static bool duplicate_node_id_warning_active(void)
 
     if ((xTaskGetTickCount() - duplicate_node_id_warning_tick) > pdMS_TO_TICKS(DUPLICATE_NODE_ID_WARNING_MS)) {
         duplicate_node_id_warning = false;
+        return false;
+    }
+
+    return true;
+}
+
+static void set_queue_full_warning(void)
+{
+    queue_full_warning = true;
+    queue_full_warning_tick = xTaskGetTickCount();
+}
+
+static bool queue_full_warning_active(void)
+{
+    if (!queue_full_warning) {
+        return false;
+    }
+
+    if ((xTaskGetTickCount() - queue_full_warning_tick) > pdMS_TO_TICKS(10000)) {
+        queue_full_warning = false;
         return false;
     }
 
@@ -378,7 +399,7 @@ static const char INDEX_HTML[] =
     "document.getElementById('epochInput').value=Math.floor(Date.now()/1000);"
     "async function load(){let s=await fetch('/api/status').then(r=>r.json());"
     "document.getElementById('status').innerHTML='Node <b>'+s.node+'</b> | '+s.name+' | '+s.location+' | Relay <b>'+s.relay+'</b> | AP <b>'+s.ssid+'</b> | Clients <b>'+s.clients+'</b> | Time <b>'+(s.time_synced?(new Date(s.epoch*1000).toLocaleString()):'unknown')+'</b>';"
-    "document.getElementById('warningBox').textContent=s.duplicate_warning?'Possible duplicate node ID on the mesh':'';"
+    "document.getElementById('warningBox').textContent=s.queue_full?'Message queue is full; active items must complete before new ones can be queued.':(s.duplicate_warning?'Possible duplicate node ID on the mesh':'');"
     "let m=await fetch('/api/messages').then(r=>r.json());cachedThreads={};let peers={};m.forEach(x=>{let key=x.thread_key||'UNKNOWN';if(!cachedThreads[key])cachedThreads[key]={thread_key:key,label:key==='ANNOUNCEMENTS'?'Announcements':key,messages:[],lastSeen:0};cachedThreads[key].messages.push(x);cachedThreads[key].lastSeen=Math.max(cachedThreads[key].lastSeen,x.id||0);if(key==='ANNOUNCEMENTS')cachedThreads[key].label='Announcements';else if(!cachedThreads[key].label||cachedThreads[key].label===key)cachedThreads[key].label=key;if(x.source){let p=peers[x.source]||{id:x.source,lastSeen:0,location:''};p.lastSeen=Math.max(p.lastSeen,x.id||0);p.location=locText(x);peers[x.source]=p;}});if(!cachedThreads[activeThread]&&Object.keys(cachedThreads).length){activeThread=Object.keys(cachedThreads)[0];}renderThreads();renderThreadView();let health=document.getElementById('health');let roster=Object.values(peers).sort((a,b)=>b.lastSeen-a.lastSeen);health.innerHTML=roster.length?roster.map(p=>'<div class=msg><b>'+escapeHtml(p.id)+'</b><br><span class=muted>Last seen #'+p.lastSeen+'</span><br>'+escapeHtml(p.location||'Unknown')+'</div>').join(''):'No peers yet.';}"
     "load();setInterval(load,4000);</script></body></html>";
 
@@ -417,18 +438,41 @@ static const char LOGIN_HTML[] =
     "<label>Portal PIN<input name=pin maxlength=31 type=password required></label>"
     "<button type=submit>Unlock Portal</button></form><p class=muted>Use the shared PIN configured for this node.</p></section></main></body></html>";
 
+static bool message_is_completed(const emergency_message_t *message)
+{
+    return strcmp(message->direction, "RX") == 0 || strcmp(message->status, "ACKED") == 0 || strcmp(message->status, "FAILED") == 0;
+}
+
 static emergency_message_t *next_message_slot(void)
 {
     emergency_message_t *message;
+    size_t evict_index = SIZE_MAX;
 
     if (message_count < MAX_MESSAGES) {
         message = &messages[message_count++];
-    } else {
-        memmove(&messages[0], &messages[1], sizeof(messages[0]) * (MAX_MESSAGES - 1));
-        message = &messages[MAX_MESSAGES - 1];
+        memset(message, 0, sizeof(*message));
+        return message;
     }
 
+    for (size_t i = 0; i < message_count; i++) {
+        if (message_is_completed(&messages[i])) {
+            evict_index = i;
+            break;
+        }
+    }
+
+    if (evict_index == SIZE_MAX) {
+        return NULL;
+    }
+
+    if (evict_index + 1 < message_count) {
+        memmove(&messages[evict_index], &messages[evict_index + 1], sizeof(messages[0]) * (message_count - evict_index - 1));
+    }
+
+    message_count--;
+    message = &messages[message_count++];
     memset(message, 0, sizeof(*message));
+    // TODO(Phase 5): invalidate retry entry when roster[destination] goes stale
     return message;
 }
 
@@ -729,6 +773,12 @@ static void store_received_packet(const char *packet, const mesh_packet_t *parse
     data_lock();
     emergency_message_t *message = next_message_slot();
     bool counter_changed = false;
+
+    if (message == NULL) {
+        ESP_LOGW(TAG, "Message table full of active entries; dropping RX packet");
+        data_unlock();
+        return;
+    }
 
     if (parsed->valid) {
         message->id = parsed->id;
@@ -1390,6 +1440,13 @@ static void queue_message(const char *destination, const char *type, const char 
     data_lock();
     emergency_message_t *message = next_message_slot();
 
+    if (message == NULL) {
+        set_queue_full_warning();
+        data_unlock();
+        ESP_LOGW(TAG, "Message table full of active entries; queueing blocked");
+        return;
+    }
+
     message->id = ++packet_counter;
     copy_field(message->direction, sizeof(message->direction), "TX");
     copy_field(message->source, sizeof(message->source), node_id);
@@ -1892,7 +1949,7 @@ static esp_err_t status_handler(httpd_req_t *request)
     duplicate_warning = duplicate_node_id_warning_active();
 
     snprintf(response, sizeof(response),
-             "{\"node\":\"%s\",\"name\":\"%s\",\"location\":\"%s\",\"ssid\":\"%s\",\"clients\":%u,\"messages\":%u,\"configured\":%s,\"relay\":\"%s\",\"duplicate_warning\":%s,\"time_synced\":%s,\"epoch\":%lu}",
+             "{\"node\":\"%s\",\"name\":\"%s\",\"location\":\"%s\",\"ssid\":\"%s\",\"clients\":%u,\"messages\":%u,\"configured\":%s,\"relay\":\"%s\",\"duplicate_warning\":%s,\"queue_full\":%s,\"time_synced\":%s,\"epoch\":%lu}",
              escaped_node,
              escaped_name,
              escaped_location,
@@ -1902,6 +1959,7 @@ static esp_err_t status_handler(httpd_req_t *request)
              node_config.configured ? "true" : "false",
              escaped_relay,
              duplicate_warning ? "true" : "false",
+             queue_full_warning_active() ? "true" : "false",
              time_synced ? "true" : "false",
              (unsigned long)current_epoch_seconds());
 

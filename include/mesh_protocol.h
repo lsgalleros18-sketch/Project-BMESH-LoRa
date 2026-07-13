@@ -8,6 +8,7 @@
 #define PACKET_LEN 320
 #define MAX_SEEN_PACKETS 64
 #define SEEN_PACKET_TTL_MS 60000
+#define MAX_SEEN_BUCKETS 32
 
 typedef struct {
     bool valid;
