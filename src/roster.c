@@ -119,8 +119,26 @@ void roster_touch(const char *node_id, const location_info_t *location, uint32_t
     }
     roster[index].last_seen_epoch = epoch_seconds;
     roster[index].last_seen_tick_ms = now;
+    roster[index].learned_passively = true;
     refresh_online_state(&roster[index], now);
 
+    roster_unlock();
+}
+
+void roster_mark_active(const char *node_id)
+{
+    size_t index;
+
+    if (node_id == NULL || node_id[0] == '\0') {
+        return;
+    }
+
+    roster_init();
+    roster_lock();
+    index = find_roster_index(node_id);
+    if (index != SIZE_MAX) {
+        roster[index].learned_passively = false;
+    }
     roster_unlock();
 }
 
