@@ -117,6 +117,27 @@ static void lora_write_fifo(const uint8_t *data, size_t length)
     lora_transfer(REG_FIFO | 0x80, data, NULL, length);
 }
 
+static bool lora_wait_for_tx_done(uint32_t timeout_ms)
+{
+    uint8_t irq_flags;
+
+    if (lora_rx_semaphore == NULL) {
+        return false;
+    }
+
+    if (xSemaphoreTake(lora_rx_semaphore, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
+        return false;
+    }
+
+    irq_flags = lora_read_reg(REG_IRQ_FLAGS);
+    if ((irq_flags & 0x08) == 0) {
+        return false;
+    }
+
+    lora_write_reg(REG_IRQ_FLAGS, 0xFF);
+    return true;
+}
+
 bool lora_channel_clear(void)
 {
     for (int attempt = 0; attempt < 3; attempt++) {
@@ -326,6 +347,10 @@ bool lora_transmit(const char *packet)
     lora_write_fifo(frame, length);
     lora_write_reg(REG_PAYLOAD_LENGTH, length);
     lora_write_reg(REG_OP_MODE, MODE_LONG_RANGE_MODE | MODE_TX);
+    if (!lora_wait_for_tx_done(500)) {
+        lora_receive_mode();
+        return false;
+    }
     lora_receive_mode();
     return true;
 }

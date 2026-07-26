@@ -1492,6 +1492,10 @@ static bool form_value(const char *body, const char *key, char *output, size_t o
     const size_t key_len = strlen(key);
     const char *cursor = body;
 
+    if (output_size == 0) {
+        return false;
+    }
+
     while (cursor != NULL && *cursor != '\0') {
         if (strncmp(cursor, key, key_len) == 0 && cursor[key_len] == '=') {
             const char *value_start = cursor + key_len + 1;
