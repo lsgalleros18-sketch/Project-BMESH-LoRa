@@ -56,67 +56,6 @@
 #define SESSION_TOKEN_LEN 17
 #define LOW_MESSAGE_TTL_MS (24ULL * 60ULL * 60ULL * 1000ULL)
 
-#define LORA_MISO_GPIO 5
-#define LORA_DIO0_GPIO 16
-#define LORA_SCK_GPIO 7
-#define LORA_MOSI_GPIO 6
-#define LORA_RST_GPIO 4
-#define LORA_NSS_GPIO 8
-#define LORA_SPI_HOST SPI2_HOST
-#define LORA_FREQUENCY_HZ 433000000UL
-#define LORA_MAX_PAYLOAD 255
-
-#define REG_FIFO 0x00
-#define REG_OP_MODE 0x01
-#define REG_FRF_MSB 0x06
-#define REG_FRF_MID 0x07
-#define REG_FRF_LSB 0x08
-#define REG_PA_CONFIG 0x09
-#define REG_LNA 0x0C
-#define REG_FIFO_ADDR_PTR 0x0D
-#define REG_FIFO_TX_BASE_ADDR 0x0E
-#define REG_FIFO_RX_BASE_ADDR 0x0F
-#define REG_FIFO_RX_CURRENT_ADDR 0x10
-#define REG_IRQ_FLAGS 0x12
-#define REG_RX_NB_BYTES 0x13
-#define REG_PKT_SNR_VALUE 0x19
-#define REG_PKT_RSSI_VALUE 0x1A
-#define REG_MODEM_CONFIG_1 0x1D
-#define REG_MODEM_CONFIG_2 0x1E
-#define REG_PREAMBLE_MSB 0x20
-#define REG_PREAMBLE_LSB 0x21
-#define REG_PAYLOAD_LENGTH 0x22
-#define REG_MODEM_CONFIG_3 0x26
-#define REG_SYNC_WORD 0x39
-#define REG_DIO_MAPPING_1 0x40
-#define REG_IRQ_FLAGS_1 0x3E
-#define REG_VERSION 0x42
-
-#define MODE_LONG_RANGE_MODE 0x80
-#define MODE_SLEEP 0x00
-#define MODE_STDBY 0x01
-#define MODE_TX 0x03
-#define MODE_RX_CONTINUOUS 0x05
-
-#define IRQ_TX_DONE_MASK 0x08
-#define IRQ_PAYLOAD_CRC_ERROR_MASK 0x20
-#define IRQ_RX_DONE_MASK 0x40
-
-#define IRQ1_CAD_DONE_MASK 0x04
-#define IRQ1_CAD_DETECTED_MASK 0x01
-
-#define LORA_BW_125_KHZ 0x70
-#define LORA_CR_4_5 0x02
-#define LORA_EXPLICIT_HEADER_MODE 0x00
-#define LORA_SPREADING_FACTOR 7
-#define LORA_TX_CONTINUOUS_MODE 0x00
-#define LORA_RX_PAYLOAD_CRC_ON 0x04
-#define LORA_LOW_DATA_RATE_OPTIMIZE_OFF 0x00
-#define LORA_AGC_AUTO_ON 0x04
-#define LORA_MODEM_CONFIG_1 (LORA_BW_125_KHZ | LORA_CR_4_5 | LORA_EXPLICIT_HEADER_MODE)
-#define LORA_MODEM_CONFIG_2 ((LORA_SPREADING_FACTOR << 4) | LORA_TX_CONTINUOUS_MODE | LORA_RX_PAYLOAD_CRC_ON)
-#define LORA_MODEM_CONFIG_3 (LORA_LOW_DATA_RATE_OPTIMIZE_OFF | LORA_AGC_AUTO_ON)
-
 typedef struct {
     uint32_t id;
     char direction[8];
@@ -137,9 +76,8 @@ static void json_escape_string(char *destination, size_t destination_size, const
 static void update_message_status(uint32_t id, const char *source, const char *status);
 static int hops_for_priority(const char *priority);
 static int compute_health_score_for_node(const char *node_id_value, const roster_entry_t *entry);
-static void mesh_control_rx_task(void *parameter);
+static void radio_task(void *parameter);
 static void retry_tracker_task(void *parameter);
-static void lora_tx_worker_task(void *parameter);
 static void time_sync_task(void *parameter);
 static void adjust_radio_policy(void);
 static uint32_t current_epoch_seconds(void);
@@ -154,6 +92,7 @@ static esp_err_t export_handler(httpd_req_t *request);
 static esp_err_t ota_handler(httpd_req_t *request);
 static bool message_is_low_and_expired(const emergency_message_t *message);
 static int roster_health_score(const roster_entry_t *entry);
+static bool pin_matches(const char *submitted, const char *stored);
 
 typedef struct {
     uint32_t id;
@@ -235,7 +174,7 @@ typedef struct {
 static mailbox_entry_t mailbox[MAX_MAILBOX_ENTRIES];
 static bool discovery_active;
 static uint8_t discovery_budget;
-static uint8_t adaptive_spreading_factor = LORA_SPREADING_FACTOR;
+static uint8_t adaptive_spreading_factor = 7;
 static uint8_t adaptive_tx_power = 0x8F;
 
 #define node_config (*node_config_get())
@@ -746,7 +685,7 @@ static void send_time_sync_packet(uint32_t epoch, uint8_t distance, uint8_t hops
              encoded_location,
              (unsigned long)epoch,
              distance);
-    lora_transmit(packet);
+    queue_lora_transmit(packet);
 }
 
 static void broadcast_time_sync_if_synced(void)
@@ -1205,22 +1144,6 @@ static void retry_tracker_task(void *parameter)
     }
 }
 
-static void lora_tx_worker_task(void *parameter)
-{
-    tx_queue_item_t item;
-
-    while (true) {
-        if (lora_tx_queue == NULL) {
-            vTaskDelay(pdMS_TO_TICKS(1000));
-            continue;
-        }
-
-        if (xQueueReceive(lora_tx_queue, &item, portMAX_DELAY) == pdTRUE) {
-            lora_transmit(item.packet);
-        }
-    }
-}
-
 static void time_sync_task(void *parameter)
 {
     while (true) {
@@ -1545,7 +1468,7 @@ static void send_control_packet(const char *type, const char *destination, const
              encoded_location,
              payload != NULL ? payload : "");
 
-    lora_transmit(packet);
+    queue_lora_transmit(packet);
 }
 
 static void send_online_discovery(uint8_t hops)
@@ -1565,7 +1488,24 @@ static bool node_id_collision_detected(const char *proposed_id)
     int snr = 0;
     int64_t start_us = esp_timer_get_time();
 
-    send_control_packet("ID_CHECK", "ALL", proposed_id);
+    {
+        char encoded_location[SITIO_LEN + BARANGAY_LEN + MUNICIPALITY_LEN + 2];
+        uint32_t message_id;
+
+        data_lock();
+        message_id = ++packet_counter;
+        save_packet_counter();
+        data_unlock();
+
+        build_location_string(encoded_location, sizeof(encoded_location));
+        snprintf(packet, sizeof(packet), "BEMS|%lu|%.*s|ALL|ID_CHECK|NORMAL|HOPS=1|RELAY=0|LOC=%s|%s",
+                 (unsigned long)message_id,
+                 31,
+                 node_id,
+                 encoded_location,
+                 proposed_id);
+        queue_lora_transmit(packet);
+    }
 
     while ((esp_timer_get_time() - start_us) < 2500000LL) {
         if (!lora_receive_plain_packet(packet, sizeof(packet), &rssi, &snr, 250)) {
@@ -1585,74 +1525,47 @@ static bool node_id_collision_detected(const char *proposed_id)
     return false;
 }
 
-static void mesh_control_rx_task(void *parameter)
+static void handle_received_packet(const char *packet, int rssi, int snr)
 {
-    char packet[PACKET_LEN];
-    int rssi = 0;
-    int snr = 0;
+    mesh_packet_t parsed;
+    char forward_buf[PACKET_LEN];
+    bool is_self_packet;
+    bool should_relay;
 
-    while (true) {
-        if (!lora_receive_plain_packet(packet, sizeof(packet), &rssi, &snr, 1000)) {
-            continue;
+    if (!parse_mesh_packet(packet, &parsed)) {
+        return;
+    }
+
+    if (parsed.valid && strcmp(parsed.source, node_id) != 0) {
+        roster_touch(parsed.source, &parsed.location, time_synced ? current_epoch_seconds() : 0, rssi, snr);
+        route_table_learn(parsed.source, MAX(hops_for_priority(parsed.priority) - parsed.hops, 0), rssi);
+    }
+
+    is_self_packet = strcmp(parsed.source, node_id) == 0;
+    should_relay = parsed.hops > 0;
+    if (!is_self_packet) {
+        if (packet_seen(parsed.source, parsed.id)) {
+            return;
         }
+        remember_packet(parsed.source, parsed.id);
+    }
 
-        mesh_packet_t parsed;
-        char forward_buf[PACKET_LEN];
-        bool is_self_packet;
-        bool should_relay;
-
-        if (!parse_mesh_packet(packet, &parsed)) {
-            continue;
-        }
-
-        if (parsed.valid && strcmp(parsed.source, node_id) != 0) {
-            roster_touch(parsed.source, &parsed.location, time_synced ? current_epoch_seconds() : 0, rssi, snr);
-            route_table_learn(parsed.source, MAX(hops_for_priority(parsed.priority) - parsed.hops, 0), rssi);
-        }
-
-        is_self_packet = strcmp(parsed.source, node_id) == 0;
-        should_relay = parsed.hops > 0;
-        if (!is_self_packet) {
-            if (packet_seen(parsed.source, parsed.id)) {
-                continue;
-            }
-            remember_packet(parsed.source, parsed.id);
-        }
-
-        if (strcmp(parsed.type, "ACK") == 0) {
-            update_message_status(ack_id_from_payload(parsed.payload), parsed.source, "ACKED");
-        } else if (strcmp(parsed.type, "SYNC_REQ") == 0) {
-            send_sync_responses(&parsed);
-        } else if (strcmp(parsed.type, "SYNC_RESP") == 0) {
-            // TODO(route-table): not yet consumed
-        } else if (strcmp(parsed.type, "TIME_SYNC") == 0) {
-            apply_time_sync(time_sync_epoch_from_payload(parsed.payload), time_sync_dist_from_payload(parsed.payload));
-        } else if (strcmp(parsed.type, "WHO_ONLINE") == 0) {
-            if (!is_self_packet && parsed.hops > 0) {
-                char reply[PACKET_LEN];
-                char encoded_location[SITIO_LEN + BARANGAY_LEN + MUNICIPALITY_LEN + 2];
-
-                vTaskDelay(pdMS_TO_TICKS(200 + (esp_random() % 1001)));
-                location_encode(&node_config.location, encoded_location, sizeof(encoded_location));
-                snprintf(reply, sizeof(reply), "BEMS|%lu|%.*s|%.*s|WHO_ONLINE_REPLY|NORMAL|HOPS=0|RELAY=0|LOC=%s|%.*s",
-                         (unsigned long)++packet_counter,
-                         31,
-                         node_id,
-                         31,
-                         parsed.source,
-                         encoded_location,
-                         31,
-                         node_id);
-                save_packet_counter();
-                lora_transmit(reply);
-            }
-        } else if (strcmp(parsed.type, "ID_CHECK") == 0 && strcmp(parsed.destination, node_id) == 0 && !is_self_packet) {
+    if (strcmp(parsed.type, "ACK") == 0) {
+        update_message_status(ack_id_from_payload(parsed.payload), parsed.source, "ACKED");
+    } else if (strcmp(parsed.type, "SYNC_REQ") == 0) {
+        send_sync_responses(&parsed);
+    } else if (strcmp(parsed.type, "SYNC_RESP") == 0) {
+        // TODO(route-table): not yet consumed
+    } else if (strcmp(parsed.type, "TIME_SYNC") == 0) {
+        apply_time_sync(time_sync_epoch_from_payload(parsed.payload), time_sync_dist_from_payload(parsed.payload));
+    } else if (strcmp(parsed.type, "WHO_ONLINE") == 0) {
+        if (!is_self_packet && parsed.hops > 0) {
             char reply[PACKET_LEN];
             char encoded_location[SITIO_LEN + BARANGAY_LEN + MUNICIPALITY_LEN + 2];
 
             vTaskDelay(pdMS_TO_TICKS(200 + (esp_random() % 1001)));
-            build_location_string(encoded_location, sizeof(encoded_location));
-            snprintf(reply, sizeof(reply), "BEMS|%lu|%.*s|%.*s|ID_TAKEN|NORMAL|HOPS=0|RELAY=0|LOC=%s|%.*s",
+            location_encode(&node_config.location, encoded_location, sizeof(encoded_location));
+            snprintf(reply, sizeof(reply), "BEMS|%lu|%.*s|%.*s|WHO_ONLINE_REPLY|NORMAL|HOPS=0|RELAY=0|LOC=%s|%.*s",
                      (unsigned long)++packet_counter,
                      31,
                      node_id,
@@ -1662,26 +1575,61 @@ static void mesh_control_rx_task(void *parameter)
                      31,
                      node_id);
             save_packet_counter();
-            lora_transmit(reply);
-        } else if (strcmp(parsed.type, "ID_TAKEN") == 0) {
-            /* setup-time response only */
-        } else if (!is_control_packet_type(parsed.type)) {
-            store_received_packet(packet, &parsed, rssi, snr);
-            if (message_requires_delivery_ack(parsed.destination, parsed.priority) && strcmp(parsed.destination, node_id) == 0) {
-                send_ack_packet(&parsed);
-            }
-        } else if (strcmp(parsed.type, "WHO_ONLINE_REPLY") == 0) {
-            if (parsed.valid && strcmp(parsed.source, node_id) != 0) {
-                roster_mark_active(parsed.source);
-                mailbox_flush_destination(parsed.source);
-            }
+            queue_lora_transmit(reply);
+        }
+    } else if (strcmp(parsed.type, "ID_CHECK") == 0 && strcmp(parsed.destination, node_id) == 0 && !is_self_packet) {
+        char reply[PACKET_LEN];
+        char encoded_location[SITIO_LEN + BARANGAY_LEN + MUNICIPALITY_LEN + 2];
+
+        vTaskDelay(pdMS_TO_TICKS(200 + (esp_random() % 1001)));
+        build_location_string(encoded_location, sizeof(encoded_location));
+        snprintf(reply, sizeof(reply), "BEMS|%lu|%.*s|%.*s|ID_TAKEN|NORMAL|HOPS=0|RELAY=0|LOC=%s|%.*s",
+                 (unsigned long)++packet_counter,
+                 31,
+                 node_id,
+                 31,
+                 parsed.source,
+                 encoded_location,
+                 31,
+                 node_id);
+        save_packet_counter();
+        queue_lora_transmit(reply);
+    } else if (strcmp(parsed.type, "ID_TAKEN") == 0) {
+        /* setup-time response only */
+    } else if (!is_control_packet_type(parsed.type)) {
+        store_received_packet(packet, &parsed, rssi, snr);
+        if (message_requires_delivery_ack(parsed.destination, parsed.priority) && strcmp(parsed.destination, node_id) == 0) {
+            send_ack_packet(&parsed);
+        }
+    } else if (strcmp(parsed.type, "WHO_ONLINE_REPLY") == 0) {
+        if (parsed.valid && strcmp(parsed.source, node_id) != 0) {
+            roster_mark_active(parsed.source);
+            mailbox_flush_destination(parsed.source);
+        }
+    }
+
+    if (should_relay) {
+        build_forward_packet(&parsed, forward_buf, sizeof(forward_buf));
+        queue_lora_transmit(forward_buf);
+    }
+}
+
+static void radio_task(void *parameter)
+{
+    tx_queue_item_t item;
+    char packet[PACKET_LEN];
+    int rssi = 0;
+    int snr = 0;
+
+    while (true) {
+        if (lora_tx_queue != NULL && xQueueReceive(lora_tx_queue, &item, 0) == pdTRUE) {
+            lora_transmit(item.packet);
+            continue;
         }
 
-        if (should_relay) {
-            build_forward_packet(&parsed, forward_buf, sizeof(forward_buf));
-            queue_lora_transmit(forward_buf);
+        if (lora_receive_plain_packet(packet, sizeof(packet), &rssi, &snr, 100)) {
+            handle_received_packet(packet, rssi, snr);
         }
-
     }
 }
 
@@ -2120,7 +2068,10 @@ static esp_err_t login_handler(httpd_req_t *request)
     }
 
     form_value(body, "pin", pin, sizeof(pin));
-    if (strcmp(pin, node_config.web_pin) != 0 && strcmp(pin, node_config_get_duress_pin()) != 0) {
+    bool matches_web = pin_matches(pin, node_config.web_pin);
+    bool matches_duress = pin_matches(pin, node_config_get_duress_pin());
+
+    if (!matches_web && !matches_duress) {
         TickType_t remaining_after_failure = 0;
         unsigned int attempts_left;
         char message[96];
@@ -2139,10 +2090,20 @@ static esp_err_t login_handler(httpd_req_t *request)
     }
 
     login_record_success(client_id);
-    issue_session_for_client(client_id, strcmp(pin, node_config_get_duress_pin()) == 0, token, sizeof(token));
+    issue_session_for_client(client_id, matches_duress, token, sizeof(token));
     snprintf(cookie, sizeof(cookie), "%s=%s; Path=/; HttpOnly; SameSite=Lax", SESSION_COOKIE_NAME, token);
     httpd_resp_set_hdr(request, "Set-Cookie", cookie);
     return send_redirect(request, "/");
+}
+
+static bool pin_matches(const char *submitted, const char *stored)
+{
+    char padded_submitted[FIELD_LEN] = {0};
+    char padded_stored[FIELD_LEN] = {0};
+
+    copy_field(padded_submitted, sizeof(padded_submitted), submitted);
+    copy_field(padded_stored, sizeof(padded_stored), stored);
+    return constant_time_equal((const uint8_t *)padded_submitted, (const uint8_t *)padded_stored, FIELD_LEN);
 }
 
 static esp_err_t setup_handler(httpd_req_t *request)
@@ -2810,8 +2771,7 @@ void app_main(void)
     route_table_init();
     node_config_load();
     lora_init();
-    xTaskCreate(mesh_control_rx_task, "mesh_control_rx_task", 4096, NULL, 6, NULL);
-    xTaskCreate(lora_tx_worker_task, "lora_tx_worker_task", 4096, NULL, 6, NULL);
+    xTaskCreate(radio_task, "radio_task", 4096, NULL, 6, NULL);
     xTaskCreate(boot_sync_task, "boot_sync_task", 4096, NULL, 4, NULL);
     xTaskCreate(retry_tracker_task, "retry_tracker_task", 4096, NULL, 3, NULL);
     xTaskCreate(time_sync_task, "time_sync_task", 3072, NULL, 2, NULL);
