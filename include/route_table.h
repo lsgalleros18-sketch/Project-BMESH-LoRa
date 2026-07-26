@@ -12,11 +12,12 @@
 typedef struct {
     char node_id[FIELD_LEN];
     int best_hop_distance;
+    int best_rssi;
     uint32_t last_seen_tick_ms;
     bool stale;
 } route_entry_t;
 
 void route_table_init(void);
-void route_table_learn(const char *node_id, int hop_distance_from_origin);
+void route_table_learn(const char *node_id, int hop_distance_from_origin, int rssi);
 bool route_table_lookup(const char *node_id, route_entry_t *out);
 size_t route_table_get_snapshot(route_entry_t *out, size_t out_capacity);

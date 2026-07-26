@@ -26,6 +26,7 @@
 #include "lwip/sockets.h"
 #include "nvs.h"
 #include "nvs_flash.h"
+#include "esp_ota_ops.h"
 #include "psa/crypto.h"
 #include "bems_common.h"
 #include "bems_crypto.h"
@@ -40,6 +41,7 @@
 #define DNS_PORT 53
 #define HTTP_PORT 80
 #define MAX_MESSAGES 16
+#define MAX_MAILBOX_ENTRIES 8
 #define PAYLOAD_LEN 140
 #define PACKET_LEN 320
 #define BOOT_BUTTON_GPIO 0
@@ -52,6 +54,7 @@
 #define HIGHEST_SEEN_ID_KEY "highest_seen"
 #define SESSION_COOKIE_NAME "BMESH_SESSION"
 #define SESSION_TOKEN_LEN 17
+#define LOW_MESSAGE_TTL_MS (24ULL * 60ULL * 60ULL * 1000ULL)
 
 #define LORA_MISO_GPIO 5
 #define LORA_DIO0_GPIO 16
@@ -133,10 +136,12 @@ static void compute_thread_key(char *out, size_t out_size, const char *source, c
 static void json_escape_string(char *destination, size_t destination_size, const char *source);
 static void update_message_status(uint32_t id, const char *source, const char *status);
 static int hops_for_priority(const char *priority);
+static int compute_health_score_for_node(const char *node_id_value, const roster_entry_t *entry);
 static void mesh_control_rx_task(void *parameter);
 static void retry_tracker_task(void *parameter);
 static void lora_tx_worker_task(void *parameter);
 static void time_sync_task(void *parameter);
+static void adjust_radio_policy(void);
 static uint32_t current_epoch_seconds(void);
 static void apply_time_sync(uint32_t epoch, uint8_t distance);
 static void send_time_sync_packet(uint32_t epoch, uint8_t distance, uint8_t hops);
@@ -144,6 +149,11 @@ static void broadcast_time_sync_if_synced(void);
 static void write_message_json_chunk(httpd_req_t *request, const emergency_message_t *message, bool first);
 static void send_online_discovery(uint8_t hops);
 static esp_err_t discover_handler(httpd_req_t *request);
+static void queue_message(const char *destination, const char *type, const char *priority, const char *payload);
+static esp_err_t export_handler(httpd_req_t *request);
+static esp_err_t ota_handler(httpd_req_t *request);
+static bool message_is_low_and_expired(const emergency_message_t *message);
+static int roster_health_score(const roster_entry_t *entry);
 
 typedef struct {
     uint32_t id;
@@ -189,13 +199,16 @@ static bool queue_full_warning;
 static TickType_t queue_full_warning_tick;
 static QueueHandle_t lora_tx_queue;
 static SemaphoreHandle_t data_mutex;
+static bool current_request_duress;
 
 typedef struct {
     bool active;
     char token[SESSION_TOKEN_LEN];
     char ip[40];
     TickType_t last_seen;
+    bool duress;
 } session_record_t;
+static session_record_t *session_find_by_token(const char *token);
 
 typedef struct {
     bool active;
@@ -213,8 +226,17 @@ typedef struct {
 
 static session_record_t sessions[MAX_SESSIONS];
 static login_lockout_t lockouts[MAX_LOCKOUTS];
+typedef struct {
+    bool active;
+    char destination[FIELD_LEN];
+    emergency_message_t message;
+    TickType_t created_tick;
+} mailbox_entry_t;
+static mailbox_entry_t mailbox[MAX_MAILBOX_ENTRIES];
 static bool discovery_active;
 static uint8_t discovery_budget;
+static uint8_t adaptive_spreading_factor = LORA_SPREADING_FACTOR;
+static uint8_t adaptive_tx_power = 0x8F;
 
 #define node_config (*node_config_get())
 
@@ -369,12 +391,12 @@ static const char INDEX_HTML[] =
     "label{display:block;font-weight:700;margin-top:12px}input,select,textarea,button{box-sizing:border-box;width:100%;font:inherit;padding:12px;margin-top:6px;border-radius:6px;border:1px solid #b8c0cc}"
     "textarea{min-height:94px}button{background:#b91c1c;color:white;border:0;font-weight:700;margin-top:16px}"
     ".row{display:grid;grid-template-columns:1fr 1fr;gap:10px}.muted{color:#5f6b7a;font-size:14px}.msg{border-top:1px solid #e5e7eb;padding:10px 0;word-break:break-word}"
-    ".messenger{display:grid;grid-template-columns:280px 1fr;gap:12px}.thread-list{border-right:1px solid #eef2f7;padding-right:8px}.thread-item{padding:10px 12px;border-radius:8px;cursor:pointer;border:1px solid transparent;margin-bottom:8px;background:#f8fafc}.thread-item.active{border-color:#b91c1c;background:#fff1f2}.thread-item small{display:block;color:#5f6b7a;margin-top:4px}.thread-view{min-height:220px}.bubble{background:#fff;border:1px solid #dbe2ea;border-radius:12px;padding:10px 12px;margin:10px 0}.bubble .meta{font-size:12px;color:#5f6b7a;margin-bottom:6px}.location{font-size:12px;color:#475569;margin-top:6px}"
+    ".messenger{display:grid;grid-template-columns:280px 1fr;gap:12px}.thread-list{border-right:1px solid #eef2f7;padding-right:8px}.thread-item{padding:10px 12px;border-radius:8px;cursor:pointer;border:1px solid transparent;margin-bottom:8px;background:#f8fafc}.thread-item.active{border-color:#b91c1c;background:#fff1f2}.thread-item .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:8px;vertical-align:middle}.thread-item.pri-high .dot,.bubble.pri-high{background:#fee2e2}.thread-item.pri-normal .dot,.bubble.pri-normal{background:#fef3c7}.thread-item.pri-low .dot,.bubble.pri-low{background:#d1fae5}.thread-item small{display:block;color:#5f6b7a;margin-top:4px}.thread-view{min-height:220px}.bubble{background:#fff;border:1px solid #dbe2ea;border-radius:12px;padding:10px 12px;margin:10px 0}.bubble .meta{font-size:12px;color:#5f6b7a;margin-bottom:6px}.bubble .debug{font-family:monospace;font-size:12px;white-space:pre-wrap;word-break:break-all;background:#f8fafc;padding:8px;border-radius:8px;margin-top:8px}.location{font-size:12px;color:#475569;margin-top:6px}.toast{position:fixed;right:16px;bottom:16px;background:#17202a;color:#fff;padding:12px 14px;border-radius:10px;box-shadow:0 12px 28px rgba(0,0,0,.18);opacity:0;transform:translateY(12px);transition:.2s;pointer-events:none}.toast.show{opacity:1;transform:translateY(0)}"
     "@media(max-width:620px){.row{grid-template-columns:1fr}}"
     "@media(max-width:860px){.messenger{grid-template-columns:1fr}.thread-list{border-right:0;padding-right:0}}"
     "</style></head><body><div class=top><div class=wrap><h2>Barangay Emergency Mesh</h2>"
     "<div id=status>Loading status...</div></div></div><main class=wrap>"
-    "<section class=card><h3>Send Message</h3><button id=langBtn type=button>Tagalog</button><form method=post action=/send>"
+    "<section class=card><h3>Send Message</h3><button id=langBtn type=button>Tagalog</button><form id=sendForm method=post action=/send>"
     "<div class=row><label>Your name<input name=sender_name maxlength=31 placeholder='Optional name for accountability'></label><label>Quick templates<select id=template><option value=''>Choose a template</option><option value='Need medical evacuation|MEDICAL|HIGH'>Need medical evacuation</option><option value='Road impassable|EVACUATION|HIGH'>Road impassable</option><option value='All clear|TEST|LOW'>All clear</option></select></label></div>"
     "<fieldset style='border:0;padding:0;margin:0 0 8px 0'><legend style='font-weight:700'>Message scope</legend>"
     "<label><input type=radio name=scope value=announcement checked> Announcement (all nodes)</label>"
@@ -384,31 +406,30 @@ static const char INDEX_HTML[] =
     "<div class=row><label>Emergency Type<select name=type><option>FLOOD</option><option>FIRE</option><option>MEDICAL</option><option>SECURITY</option><option>EVACUATION</option><option>TEST</option></select></label>"
     "<label>Priority<select name=priority><option>HIGH</option><option>NORMAL</option><option>LOW</option></select></label></div>"
     "<label>Message<textarea id=payload name=payload maxlength=159 placeholder='Short emergency message'></textarea></label>"
-    "<button type=submit>Queue / Transmit Message</button></form><p class=muted>The portal sends through the SX1278 using GPIO 5/7/6/8/4/16 at 433 MHz.</p></section>"
+    "<button type=submit>Queue / Transmit Message</button></form><p class=muted>The portal sends through the SX1278 using GPIO 5/7/6/8/4/16 at 433 MHz.</p><button id=debugToggle type=button>Show Raw Packet Debug</button></section>"
     "<section class=card><h3>Messages</h3><div class=messenger><div class=thread-list><div class=muted>Loading threads...</div></div><div class=thread-view><div class=muted>Loading messages...</div></div></div></section>"
-    "<section class=card><h3>Mesh Health</h3><button id=discoverBtn type=button>Refresh Mesh</button><div id=health class=muted>Loading node roster...</div></section>"
+    "<section class=card><h3>Mesh Health</h3><button id=discoverBtn type=button>Refresh Mesh</button><div id=health class=muted>Loading node roster...</div><div id=routes class=muted style='margin-top:12px'>Loading routes...</div></section>"
     "<section class=card><h3>Portal</h3><p class=muted id=warningBox></p><p class=muted>Connect to this Wi-Fi when offline, then open http://192.168.4.1. Android/iOS captive checks are redirected here automatically.</p>"
     "<form method=post action=/settime><label>Set time<input name=epoch id=epochInput readonly></label><button type=submit>Sync Clock</button></form>"
     "<form method=post action=/sync><button type=submit>Sync Messages from Mesh</button></form>"
+    "<p><a href=/api/export>Download incident log</a></p>"
+    "<form method=post action=/ota enctype='application/octet-stream'><label>OTA image<input id=otaFile type=file accept='.bin'></label><button id=otaBtn type=button>Upload OTA</button></form>"
     "<form method=post action=/reset onsubmit='return confirm(\"Factory reset this node and run setup again?\")'><button type=submit>Factory Reset Node</button></form></section>"
     "</main><script>"
-    "const scopeRadios=[...document.querySelectorAll('input[name=scope]')];const destWrap=document.getElementById('destWrap');const dest=document.getElementById('destination');const announcementDest=document.getElementById('announcementDest');const template=document.getElementById('template');const payload=document.getElementById('payload');const langBtn=document.getElementById('langBtn');"
+    "const scopeRadios=[...document.querySelectorAll('input[name=scope]')];const destWrap=document.getElementById('destWrap');const dest=document.getElementById('destination');const announcementDest=document.getElementById('announcementDest');const template=document.getElementById('template');const payload=document.getElementById('payload');const langBtn=document.getElementById('langBtn');const debugToggle=document.getElementById('debugToggle');const sendForm=document.getElementById('sendForm');const toast=document.createElement('div');toast.className='toast';document.body.appendChild(toast);let showRawPacket=false;"
     "function syncScope(){let direct=scopeRadios.some(r=>r.checked&&r.value==='direct');destWrap.style.display=direct?'block':'none';dest.required=direct;dest.disabled=!direct;announcementDest.disabled=direct;if(!direct){announcementDest.value='ALL';}}"
     "template.addEventListener('change',()=>{if(!template.value)return;let parts=template.value.split('|');payload.value=parts[0];document.querySelector('select[name=type]').value=parts[1]||'TEST';document.querySelector('select[name=priority]').value=parts[2]||'NORMAL';template.value='';});"
     "scopeRadios.forEach(r=>r.addEventListener('change',syncScope));syncScope();"
     "let activeThread='ANNOUNCEMENTS';let cachedThreads={};"
     "function escapeHtml(v){return String(v).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('\"','&quot;');}"
     "function locText(x){return [x.location?.sitio||'',x.location?.barangay||'',x.location?.municipality||''].filter(Boolean).join(' \xE2\x86\x92 ');}"
-    "function renderThreads(){let list=document.querySelector('.thread-list');let entries=Object.values(cachedThreads).sort((a,b)=>{if(a.thread_key==='ANNOUNCEMENTS')return -1;if(b.thread_key==='ANNOUNCEMENTS')return 1;return (b.lastSeen||0)-(a.lastSeen||0);});if(!entries.length){list.innerHTML='<div class=muted>No messages yet.</div>';return;}list.innerHTML=entries.map(t=>'<div class=thread-item'+(t.thread_key===activeThread?' active':'')+' data-thread=\"'+escapeHtml(t.thread_key)+'\"><b>'+escapeHtml(t.label)+'</b><small>'+t.messages.length+' message(s)</small></div>').join('');list.querySelectorAll('.thread-item').forEach(el=>el.addEventListener('click',()=>{activeThread=el.dataset.thread;renderThreads();renderThreadView();}));}"
+    "function renderThreads(){let list=document.querySelector('.thread-list');let entries=Object.values(cachedThreads).sort((a,b)=>{if(a.thread_key==='ANNOUNCEMENTS')return -1;if(b.thread_key==='ANNOUNCEMENTS')return 1;return (b.lastSeen||0)-(a.lastSeen||0);});if(!entries.length){list.innerHTML='<div class=muted>No messages yet.</div>';return;}list.innerHTML=entries.map(t=>'<div class=thread-item pri-'+(t.highestPriority||'low')+(t.thread_key===activeThread?' active':'')+' data-thread=\"'+escapeHtml(t.thread_key)+'\"><span class=dot></span><b>'+escapeHtml(t.label)+'</b><small>'+t.messages.length+' message(s)</small></div>').join('');list.querySelectorAll('.thread-item').forEach(el=>el.addEventListener('click',()=>{activeThread=el.dataset.thread;renderThreads();renderThreadView();}));}"
     "function fmtEpoch(e){return e?new Date(e*1000).toLocaleString():'time unknown';}"
-    "function renderThreadView(){let view=document.querySelector('.thread-view');let thread=cachedThreads[activeThread]||Object.values(cachedThreads)[0];if(!thread){view.innerHTML='<div class=muted>No messages yet.</div>';return;}view.innerHTML='<h4>'+escapeHtml(thread.label)+'</h4>'+thread.messages.map(x=>'<div class=bubble><div class=meta>'+escapeHtml(x.direction)+' #'+x.id+' | '+escapeHtml(x.type)+' | '+escapeHtml(x.priority)+' | '+escapeHtml(x.thread_key)+' | Status: '+escapeHtml(x.status||'UNKNOWN')+' | '+escapeHtml(fmtEpoch(x.stored_epoch))+'</div><div><b>From:</b> '+escapeHtml(x.source)+'<br><b>To:</b> '+escapeHtml(x.destination)+'<br><b>Payload:</b> '+escapeHtml(x.payload)+'</div><div class=location><b>Location:</b> '+escapeHtml(locText(x))+'</div>'+((x.thread_key==='ANNOUNCEMENTS')?'<div class=location><b>Sender:</b> '+escapeHtml(x.source)+'</div>':'')+'</div>').join('');}"
-    "const strings={en:{scope:'Message scope',announcement:'Announcement (all nodes)',direct:'Direct message (specific node)',messages:'Messages',health:'Mesh Health',portal:'Portal',send:'Queue / Transmit Message',toggle:'Tagalog'},tl:{scope:'Layunin ng mensahe',announcement:'Anunsyo (lahat ng node)',direct:'Direktang mensahe (tiyak na node)',messages:'Mga Mensahe',health:'Kalagayan ng Mesh',portal:'Portal',send:'Ipadala ang Mensahe',toggle:'English'}};let lang='en';function applyLang(){let s=strings[lang];document.querySelector('legend').textContent=s.scope;document.querySelectorAll('label')[2].childNodes[1].textContent=' '+s.announcement;document.querySelectorAll('label')[3].childNodes[1].textContent=' '+s.direct;document.querySelectorAll('section.card h3')[1].textContent=s.messages;document.querySelectorAll('section.card h3')[2].textContent=s.health;document.querySelectorAll('section.card h3')[3].textContent=s.portal;document.querySelector('button[type=submit]').textContent=s.send;langBtn.textContent=s.toggle;}langBtn.addEventListener('click',()=>{lang=lang==='en'?'tl':'en';applyLang();});applyLang();"
+    "function renderThreadView(){let view=document.querySelector('.thread-view');let thread=cachedThreads[activeThread]||Object.values(cachedThreads)[0];if(!thread){view.innerHTML='<div class=muted>No messages yet.</div>';return;}view.innerHTML='<h4>'+escapeHtml(thread.label)+'</h4>'+thread.messages.map(x=>'<div class=bubble pri-'+String(x.priority||'LOW').toLowerCase()+'><div class=meta>'+escapeHtml(x.direction)+' #'+x.id+' | '+escapeHtml(x.type)+' | '+escapeHtml(x.priority)+' | '+escapeHtml(x.thread_key)+' | Status: '+escapeHtml(x.status||'UNKNOWN')+' | '+escapeHtml(fmtEpoch(x.stored_epoch))+(x.status==='SENT'&&x.attempts&&x.max_attempts?' | attempt '+x.attempts+'/'+x.max_attempts:'')+'</div><div><b>From:</b> '+escapeHtml(x.source)+'<br><b>To:</b> '+escapeHtml(x.destination)+'<br><b>Payload:</b> '+escapeHtml(x.payload)+'</div><div class=location><b>Location:</b> '+escapeHtml(locText(x))+'</div>'+((x.thread_key==='ANNOUNCEMENTS')?'<div class=location><b>Sender:</b> '+escapeHtml(x.source)+'</div>':'')+(showRawPacket?'<div class=debug>'+escapeHtml(x.packet)+'</div>':'')+'</div>').join('');}"
+    "const strings={en:{scope:'Message scope',announcement:'Announcement (all nodes)',direct:'Direct message (specific node)',messages:'Messages',health:'Mesh Health',portal:'Portal',send:'Queue / Transmit Message',toggle:'Tagalog',debug:'Show Raw Packet Debug',debugHide:'Hide Raw Packet Debug'},tl:{scope:'Layunin ng mensahe',announcement:'Anunsyo (lahat ng node)',direct:'Direktang mensahe (tiyak na node)',messages:'Mga Mensahe',health:'Kalagayan ng Mesh',portal:'Portal',send:'Ipadala ang Mensahe',toggle:'English',debug:'Ipakita ang Raw Packet Debug',debugHide:'Itago ang Raw Packet Debug'}};let lang='en';function applyLang(){let s=strings[lang];document.querySelector('legend').textContent=s.scope;document.querySelectorAll('label')[2].childNodes[1].textContent=' '+s.announcement;document.querySelectorAll('label')[3].childNodes[1].textContent=' '+s.direct;document.querySelectorAll('section.card h3')[1].textContent=s.messages;document.querySelectorAll('section.card h3')[2].textContent=s.health;document.querySelectorAll('section.card h3')[3].textContent=s.portal;document.querySelector('button[type=submit]').textContent=s.send;langBtn.textContent=s.toggle;debugToggle.textContent=showRawPacket?s.debugHide:s.debug;renderThreads();renderThreadView();}langBtn.addEventListener('click',()=>{lang=lang==='en'?'tl':'en';applyLang();});debugToggle.addEventListener('click',()=>{showRawPacket=!showRawPacket;applyLang();});applyLang();"
     "document.getElementById('epochInput').value=Math.floor(Date.now()/1000);"
-    "async function load(){let s=await fetch('/api/status').then(r=>r.json());"
-    "document.getElementById('status').innerHTML='Node <b>'+s.node+'</b> | '+s.name+' | '+s.location+' | Relay <b>'+s.relay+'</b> | AP <b>'+s.ssid+'</b> | Clients <b>'+s.clients+'</b> | Time <b>'+(s.time_synced?(new Date(s.epoch*1000).toLocaleString()):'unknown')+'</b>';"
-    "document.getElementById('warningBox').textContent=s.queue_full?'Message queue is full; active items must complete before new ones can be queued.':(s.duplicate_warning?'Possible duplicate node ID on the mesh':'');"
-    "let m=await fetch('/api/messages').then(r=>r.json());cachedThreads={};m.forEach(x=>{let key=x.thread_key||'UNKNOWN';if(!cachedThreads[key])cachedThreads[key]={thread_key:key,label:key==='ANNOUNCEMENTS'?'Announcements':key,messages:[]};cachedThreads[key].messages.push(x);if(key==='ANNOUNCEMENTS')cachedThreads[key].label='Announcements';else if(!cachedThreads[key].label||cachedThreads[key].label===key)cachedThreads[key].label=key;});if(!cachedThreads[activeThread]&&Object.keys(cachedThreads).length){activeThread=Object.keys(cachedThreads)[0];}renderThreads();renderThreadView();let roster=await fetch('/discover').then(r=>r.json());let health=document.getElementById('health');health.innerHTML=roster.length?roster.map(p=>'<div class=msg><b>'+escapeHtml(p.node_id)+'</b><br><span class=muted>'+(p.online?'Online':'Offline')+'</span><br><span class=muted>Last seen epoch '+escapeHtml(p.last_seen_epoch||0)+'</span><br>'+escapeHtml([p.location?.sitio||'',p.location?.barangay||'',p.location?.municipality||''].filter(Boolean).join(' \xE2\x86\x92 ')||'Unknown')+'</div>').join(''):'No peers yet.';}"
-    "document.getElementById('discoverBtn').addEventListener('click',load);load();setInterval(load,15000);</script></body></html>";
+    "async function load(){try{let s=await fetch('/api/status').then(r=>r.json());document.getElementById('status').innerHTML='Node <b>'+s.node+'</b> | '+s.name+' | '+s.location+' | Role <b>'+((s.node_role)||'unknown')+'</b> | Relay <b>'+s.relay+'</b> | AP <b>'+s.ssid+'</b> | Clients <b>'+s.clients+'</b> | Mailbox <b>'+((s.mailbox)||0)+'</b> | Time <b>'+(s.time_synced?(new Date(s.epoch*1000).toLocaleString()):'unknown')+'</b>';document.getElementById('warningBox').textContent=s.queue_full?'Message queue is full; active items must complete before new ones can be queued.':(s.duplicate_warning?'Possible duplicate node ID on the mesh':'');let m=await fetch('/api/messages').then(r=>r.json());cachedThreads={};m.forEach(x=>{let key=x.thread_key||'UNKNOWN';if(!cachedThreads[key])cachedThreads[key]={thread_key:key,label:key==='ANNOUNCEMENTS'?'Announcements':key,messages:[],highestPriority:'low'};cachedThreads[key].messages.push(x);if((x.priority||'LOW').toUpperCase()==='HIGH')cachedThreads[key].highestPriority='high';else if((x.priority||'LOW').toUpperCase()==='NORMAL'&&cachedThreads[key].highestPriority!=='high')cachedThreads[key].highestPriority='normal';if(key==='ANNOUNCEMENTS')cachedThreads[key].label='Announcements';else if(!cachedThreads[key].label||cachedThreads[key].label===key)cachedThreads[key].label=key;});if(!cachedThreads[activeThread]&&Object.keys(cachedThreads).length){activeThread=Object.keys(cachedThreads)[0];}renderThreads();renderThreadView();let roster=await fetch('/api/roster').then(r=>r.json());let health=document.getElementById('health');health.innerHTML=roster.length?roster.map(p=>'<div class=msg><b>'+escapeHtml(p.node_id)+'</b><br><span class=muted>Score '+escapeHtml(p.health_score||0)+'</span><br><span class=muted>'+(p.online?'Online':'Offline')+'</span><br><span class=muted>Last seen epoch '+escapeHtml(p.last_seen_epoch||0)+'</span><br><span class=muted>RSSI '+escapeHtml(p.last_rssi||0)+' dBm | SNR '+escapeHtml(p.last_snr||0)+' dB</span><br>'+escapeHtml([p.location?.sitio||'',p.location?.barangay||'',p.location?.municipality||''].filter(Boolean).join(' \xE2\x86\x92 ')||'Unknown')+'</div>').join(''):'No peers yet.';let routes=await fetch('/api/routes').then(r=>r.json());document.getElementById('routes').innerHTML=routes.length?routes.map(r=>'<div class=msg><b>'+escapeHtml(r.node_id)+'</b><br><span class=muted>Hops '+escapeHtml(r.best_hop_distance)+'</span>'+((r.stale)?'<br><span class=muted>stale</span>':'')+((r.best_rssi!==undefined)?'<br><span class=muted>RSSI '+escapeHtml(r.best_rssi)+' dBm</span>':'')+'</div>').join(''):'No routes yet.';}catch(e){document.getElementById('health').textContent='Connection issue - retrying...';document.getElementById('routes').textContent='Connection issue - retrying...';}}"
+    "function refreshDiscovery(){fetch('/discover').then(r=>r.json()).then(roster=>{let health=document.getElementById('health');health.innerHTML=roster.length?roster.map(p=>'<div class=msg><b>'+escapeHtml(p.node_id)+'</b><br><span class=muted>'+(p.online?'Online':'Offline')+'</span><br><span class=muted>Last seen epoch '+escapeHtml(p.last_seen_epoch||0)+'</span><br><span class=muted>RSSI '+escapeHtml(p.last_rssi||0)+' dBm | SNR '+escapeHtml(p.last_snr||0)+' dB</span><br>'+escapeHtml([p.location?.sitio||'',p.location?.barangay||'',p.location?.municipality||''].filter(Boolean).join(' \xE2\x86\x92 ')||'Unknown')+'</div>').join(''):'No peers yet.';}).catch(()=>{document.getElementById('health').textContent='Discovery failed - retrying...';});}sendForm.addEventListener('submit',async ev=>{ev.preventDefault();try{let res=await fetch('/send',{method:'POST',body:new FormData(sendForm)});if(!res.ok)throw new Error();toast.textContent='Message queued';toast.classList.add('show');setTimeout(()=>toast.classList.remove('show'),1800);load();}catch(e){toast.textContent='Message send failed';toast.classList.add('show');setTimeout(()=>toast.classList.remove('show'),2200);}});document.getElementById('otaBtn').addEventListener('click',async()=>{let f=document.getElementById('otaFile').files[0];if(!f)return;try{let res=await fetch('/ota',{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:f});if(!res.ok)throw new Error();toast.textContent='OTA accepted';toast.classList.add('show');}catch(e){toast.textContent='OTA failed';toast.classList.add('show');}});document.getElementById('discoverBtn').addEventListener('click',refreshDiscovery);load();setInterval(load,15000);</script></body></html>";
 
 static const char SETUP_HTML[] =
     "<!doctype html><html><head><meta name=viewport content='width=device-width,initial-scale=1'>"
@@ -426,12 +447,11 @@ static const char SETUP_HTML[] =
     "<p>Progressive wizard mode: keep the node usable, but set the security fields before deploying.</p></div></div>"
     "<main class=wrap><section class=card><div class=warn id=setupWarn>Fill the security fields below before you hand this node to an operator.</div>"
     "<form method=post action=/setup><div class=section>1. Network membership</div>"
-    "<div class=row><label><input type=radio name=join_mode value=create checked> Create new network</label><label><input type=radio name=join_mode value=join> Join existing network</label></div>"
-    "<div class=grid><label>Network Key<input name=network_key maxlength=31 placeholder='Generated on first boot or enter pairing key' required></label><label>Web PIN<input name=web_pin maxlength=31 placeholder='Generated on first boot' required></label><label>Wi-Fi AP Password<input name=ap_password maxlength=31 placeholder='Generated on first boot' required></label></div>"
-    "<div class=section>2. Identity</div><div class=grid><label>Node ID<input name=node_id maxlength=31 placeholder='BRGY-SANISIDRO-01' required></label><label>Node Name<input name=node_name maxlength=31 placeholder='Barangay Hall or House 23' required></label><label>Node Role<select name=node_role><option>relay-only</option><option>relay+message-origin</option><option>gateway</option></select></label><label class=muted>Join mode is selected above and does not need a separate save field.</label></div>"
+    "<div class=grid><label>Network Key<input name=network_key maxlength=31 placeholder='Generated on first boot or enter pairing key' required></label><label>Web PIN<input name=web_pin maxlength=31 placeholder='Generated on first boot' required></label><label>Duress PIN<input name=duress_pin maxlength=31 placeholder='Optional silent PIN'></label><label>Wi-Fi AP Password<input name=ap_password maxlength=31 placeholder='Generated on first boot' required></label></div>"
+    "<div class=section>2. Identity</div><div class=grid><label>Node ID<input name=node_id maxlength=31 placeholder='BRGY-SANISIDRO-01' required></label><label>Node Name<input name=node_name maxlength=31 placeholder='Barangay Hall or House 23' required></label><label>Node Role<select name=node_role><option>relay-only</option><option>relay+message-origin</option><option>gateway</option></select></label></div>"
     "<div class=section>3. Location</div><div class=grid><label>Sitio / Landmark<input name=sitio maxlength=23 placeholder='Purok 3, Chapel Roof'></label><label>Barangay<input name=barangay maxlength=23 placeholder='San Isidro' required></label><label>Municipality<input name=municipality maxlength=23 placeholder='Cabuyao'></label></div>"
     "<div class=section>4. Messaging defaults</div><div class=grid><label>Default Destination<input name=default_destination maxlength=31 value='BRGY001' placeholder='ALL or BRGY001'></label><label>Default Priority<select name=default_priority><option>HIGH</option><option selected>NORMAL</option><option>LOW</option></select></label></div>"
-    "<div class=section>5. Advanced</div><div class=grid><label>TX Power Ceiling<input name=tx_power_ceiling maxlength=5 placeholder='Optional'></label><label>Low Battery Threshold<input name=low_battery_threshold maxlength=5 placeholder='Optional'></label></div>"
+    "<div class=section>5. Advanced</div><div class='muted small'>Advanced radio tuning fields were removed from this setup flow for now.</div>"
     "<p class='muted small'>This wizard keeps the radio profile fixed. Use the fields above for identity and deployment defaults only.</p>"
     "<button type=submit>Save Setup and Reboot</button></form>"
     "<form method=post action=/reset onsubmit='return confirm(\"Factory reset this node and run setup again?\")'><button type=submit style='background:#991b1b'>Factory Reset Node</button></form>"
@@ -447,13 +467,155 @@ static const char LOGIN_HTML[] =
     "label{display:block;font-weight:700;margin-top:12px}input,button{box-sizing:border-box;width:100%;font:inherit;padding:12px;margin-top:6px;border-radius:6px;border:1px solid #b8c0cc}"
     "button{background:#b91c1c;color:white;border:0;font-weight:700;margin-top:16px}.muted{color:#5f6b7a;font-size:14px}"
     "</style></head><body><div class=top><div class=wrap><h2>Barangay Emergency Mesh</h2></div></div>"
-    "<main class=wrap><section class=card><form method=post action=/login>"
+    "<main class=wrap><section class=card><div id=loginWarn class=muted></div><form method=post action=/login>"
     "<label>Portal PIN<input name=pin maxlength=31 type=password required></label>"
     "<button type=submit>Unlock Portal</button></form><p class=muted>Use the shared PIN configured for this node.</p></section></main></body></html>";
 
 static bool message_is_completed(const emergency_message_t *message)
 {
-    return strcmp(message->direction, "RX") == 0 || strcmp(message->status, "ACKED") == 0 || strcmp(message->status, "FAILED") == 0;
+    return strcmp(message->direction, "RX") == 0 || strcmp(message->status, "ACKED") == 0 || strcmp(message->status, "FAILED") == 0 || message_is_low_and_expired(message);
+}
+
+static bool message_is_low_and_expired(const emergency_message_t *message)
+{
+    return strcmp(message->priority, "LOW") == 0 && message->stored_epoch != 0 &&
+           (current_epoch_seconds() - message->stored_epoch) * 1000ULL >= LOW_MESSAGE_TTL_MS;
+}
+
+static void prune_expired_low_messages(void)
+{
+    data_lock();
+    for (size_t i = 0; i < message_count; i++) {
+        if (message_is_low_and_expired(&messages[i])) {
+            copy_field(messages[i].status, sizeof(messages[i].status), "EXPIRED");
+        }
+    }
+    data_unlock();
+}
+
+static bool request_is_duress(httpd_req_t *request)
+{
+    char cookie[128] = {0};
+    const char *token;
+    session_record_t *session;
+
+    if (httpd_req_get_hdr_value_str(request, "Cookie", cookie, sizeof(cookie)) != ESP_OK) {
+        return false;
+    }
+    token = strstr(cookie, SESSION_COOKIE_NAME "=");
+    if (token == NULL) {
+        return false;
+    }
+    token += strlen(SESSION_COOKIE_NAME) + 1;
+    session = session_find_by_token(token);
+    return session != NULL && session->duress;
+}
+
+static int message_ack_ratio_for_node(const char *node)
+{
+    int acked = 0;
+    int total = 0;
+
+    data_lock();
+    for (size_t i = 0; i < message_count; i++) {
+        if (strcmp(messages[i].source, node) != 0) {
+            continue;
+        }
+        if (strcmp(messages[i].status, "ACKED") == 0) {
+            acked++;
+        }
+        if (strcmp(messages[i].direction, "TX") == 0) {
+            total++;
+        }
+    }
+    data_unlock();
+
+    return total == 0 ? 0 : (acked * 100) / total;
+}
+
+static int compute_health_score_for_node(const char *node_id_value, const roster_entry_t *entry)
+{
+    int score = roster_health_score(entry);
+    int ratio = message_ack_ratio_for_node(node_id_value);
+    score += (ratio / 10) - 5;
+    return MAX(0, MIN(100, score));
+}
+
+static void mailbox_flush_destination(const char *destination);
+static size_t mailbox_active_count(void)
+{
+    size_t count = 0;
+    for (size_t i = 0; i < MAX_MAILBOX_ENTRIES; i++) {
+        if (mailbox[i].active) {
+            count++;
+        }
+    }
+    return count;
+}
+
+static mailbox_entry_t *mailbox_find_slot(const char *destination)
+{
+    mailbox_entry_t *oldest = NULL;
+    for (size_t i = 0; i < MAX_MAILBOX_ENTRIES; i++) {
+        if (mailbox[i].active && strcmp(mailbox[i].destination, destination) == 0) {
+            return &mailbox[i];
+        }
+        if (!mailbox[i].active) {
+            return &mailbox[i];
+        }
+        if (oldest == NULL || mailbox[i].created_tick < oldest->created_tick) {
+            oldest = &mailbox[i];
+        }
+    }
+    return oldest;
+}
+
+static void mailbox_store_message(const emergency_message_t *message)
+{
+    mailbox_entry_t *slot = mailbox_find_slot(message->destination);
+    if (slot == NULL) {
+        return;
+    }
+    slot->active = true;
+    copy_field(slot->destination, sizeof(slot->destination), message->destination);
+    slot->message = *message;
+    slot->created_tick = xTaskGetTickCount();
+}
+
+static void mailbox_flush_destination(const char *destination)
+{
+    for (size_t i = 0; i < MAX_MAILBOX_ENTRIES; i++) {
+        if (mailbox[i].active && strcmp(mailbox[i].destination, destination) == 0) {
+            queue_message(mailbox[i].message.destination, mailbox[i].message.type, mailbox[i].message.priority, mailbox[i].message.payload);
+            mailbox[i].active = false;
+        }
+    }
+}
+
+static void mailbox_prune(void)
+{
+    for (size_t i = 0; i < MAX_MESSAGES; i++) {
+        if (message_is_low_and_expired(&messages[i])) {
+            copy_field(messages[i].status, sizeof(messages[i].status), "EXPIRED");
+        }
+    }
+}
+
+static int roster_health_score(const roster_entry_t *entry)
+{
+    int score = 50;
+
+    if (entry->online) {
+        score += 20;
+    } else {
+        score -= 20;
+    }
+    if (entry->last_rssi > -90) score += 15;
+    else if (entry->last_rssi > -110) score += 5;
+    else score -= 10;
+    if (entry->last_snr > 5) score += 10;
+    else if (entry->last_snr < 0) score -= 10;
+    return MAX(0, MIN(100, score));
 }
 
 static emergency_message_t *next_message_slot(void)
@@ -613,6 +775,20 @@ static void write_message_json_chunk(httpd_req_t *request, const emergency_messa
     char escaped_sitio[SITIO_LEN * 2];
     char escaped_barangay[BARANGAY_LEN * 2];
     char escaped_municipality[MUNICIPALITY_LEN * 2];
+    char attempts_chunk[24];
+    char max_attempts_chunk[24];
+    uint8_t attempts = 0;
+    uint8_t max_attempts = 0;
+
+    data_lock();
+    for (size_t i = 0; i < MAX_MESSAGES; i++) {
+        if (retry_entries[i].active && retry_entries[i].id == message->id && strcmp(retry_entries[i].source, message->source) == 0) {
+            attempts = retry_entries[i].attempts;
+            max_attempts = retry_entries[i].max_attempts;
+            break;
+        }
+    }
+    data_unlock();
 
     json_escape_string(escaped_direction, sizeof(escaped_direction), message->direction);
     json_escape_string(escaped_source, sizeof(escaped_source), message->source);
@@ -650,7 +826,13 @@ static void write_message_json_chunk(httpd_req_t *request, const emergency_messa
     httpd_resp_send_chunk(request, escaped_thread_key, HTTPD_RESP_USE_STRLEN);
     httpd_resp_send_chunk(request, "\",\"status\":\"", HTTPD_RESP_USE_STRLEN);
     httpd_resp_send_chunk(request, escaped_status, HTTPD_RESP_USE_STRLEN);
-    httpd_resp_send_chunk(request, "\",\"stored_epoch\":", HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(request, "\",\"attempts\":", HTTPD_RESP_USE_STRLEN);
+    snprintf(attempts_chunk, sizeof(attempts_chunk), "%u", attempts);
+    httpd_resp_send_chunk(request, attempts_chunk, HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(request, ",\"max_attempts\":", HTTPD_RESP_USE_STRLEN);
+    snprintf(max_attempts_chunk, sizeof(max_attempts_chunk), "%u", max_attempts);
+    httpd_resp_send_chunk(request, max_attempts_chunk, HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(request, ",\"stored_epoch\":", HTTPD_RESP_USE_STRLEN);
     char epoch_chunk[24];
     snprintf(epoch_chunk, sizeof(epoch_chunk), "%lu", (unsigned long)message->stored_epoch);
     httpd_resp_send_chunk(request, epoch_chunk, HTTPD_RESP_USE_STRLEN);
@@ -1042,9 +1224,45 @@ static void lora_tx_worker_task(void *parameter)
 static void time_sync_task(void *parameter)
 {
     while (true) {
+        prune_expired_low_messages();
         broadcast_time_sync_if_synced();
+        adjust_radio_policy();
         vTaskDelay(pdMS_TO_TICKS(30000));
     }
+}
+
+static void adjust_radio_policy(void)
+{
+    roster_entry_t snapshot[MAX_ROSTER_ENTRIES];
+    size_t count = roster_get_snapshot(snapshot, MAX_ROSTER_ENTRIES);
+    int rssi_sum = 0;
+    int seen = 0;
+
+    for (size_t i = 0; i < count; i++) {
+        if (!snapshot[i].online || snapshot[i].last_rssi == 0) {
+            continue;
+        }
+        rssi_sum += snapshot[i].last_rssi;
+        seen++;
+    }
+
+    if (seen == 0) {
+        return;
+    }
+
+    int avg_rssi = rssi_sum / seen;
+    if (avg_rssi < -110) {
+        adaptive_spreading_factor = 9;
+        adaptive_tx_power = 0x8F;
+    } else if (avg_rssi < -100) {
+        adaptive_spreading_factor = 8;
+        adaptive_tx_power = 0x8C;
+    } else {
+        adaptive_spreading_factor = 7;
+        adaptive_tx_power = 0x88;
+    }
+    lora_set_spreading_factor(adaptive_spreading_factor);
+    lora_set_tx_power(adaptive_tx_power);
 }
 
 static void copy_node_id(char *destination, size_t destination_size, const char *source)
@@ -1182,10 +1400,18 @@ static void factory_reset_button_task(void *parameter)
 {
     bool warning_blinked = false;
     int held_ms = 0;
+    int press_count = 0;
+    int release_window_ms = 0;
+    bool press_active = false;
 
     while (true) {
         if (gpio_get_level(BOOT_BUTTON_GPIO) == 0) {
+            if (!press_active) {
+                press_active = true;
+                press_count++;
+            }
             held_ms += 100;
+            release_window_ms = 0;
 
             if (!warning_blinked && held_ms >= RESET_WARNING_MS) {
                 ESP_LOGW(TAG, "BOOT held for 5 seconds. Keep holding for factory reset.");
@@ -1201,11 +1427,26 @@ static void factory_reset_button_task(void *parameter)
                 esp_restart();
             }
         } else {
+            if (press_active && held_ms < 700) {
+                if (press_count >= 3 && release_window_ms < 2000) {
+                    queue_message("ALL", "SOS", "HIGH", "Emergency SOS triggered by BOOT button");
+                    press_count = 0;
+                    release_window_ms = 0;
+                }
+            }
+            if (press_active) {
+                release_window_ms += 100;
+            }
             if (held_ms > 0 && held_ms < FACTORY_RESET_HOLD_MS) {
                 ESP_LOGI(TAG, "Factory reset hold cancelled");
             }
+            if (release_window_ms > 2000) {
+                press_count = 0;
+                release_window_ms = 0;
+            }
             held_ms = 0;
             warning_blinked = false;
+            press_active = false;
         }
 
         vTaskDelay(pdMS_TO_TICKS(100));
@@ -1361,8 +1602,8 @@ static void mesh_control_rx_task(void *parameter)
         }
 
         if (parsed.valid && strcmp(parsed.source, node_id) != 0) {
-            roster_touch(parsed.source, &parsed.location, time_synced ? current_epoch_seconds() : 0);
-            route_table_learn(parsed.source, MAX(hops_for_priority(parsed.priority) - parsed.hops, 0));
+            roster_touch(parsed.source, &parsed.location, time_synced ? current_epoch_seconds() : 0, rssi, snr);
+            route_table_learn(parsed.source, MAX(hops_for_priority(parsed.priority) - parsed.hops, 0), rssi);
         }
 
         is_self_packet = strcmp(parsed.source, node_id) == 0;
@@ -1428,6 +1669,7 @@ static void mesh_control_rx_task(void *parameter)
         } else if (strcmp(parsed.type, "WHO_ONLINE_REPLY") == 0) {
             if (parsed.valid && strcmp(parsed.source, node_id) != 0) {
                 roster_mark_active(parsed.source);
+                mailbox_flush_destination(parsed.source);
             }
         }
 
@@ -1554,8 +1796,33 @@ static void queue_message(const char *destination, const char *type, const char 
     copy_field(queued_destination, sizeof(queued_destination), message->destination);
     copy_field(queued_priority, sizeof(queued_priority), message->priority);
     copy_field(packet, sizeof(packet), message->packet);
+    if (strcmp(queued_destination, "ALL") != 0) {
+        route_entry_t route;
+        if (route_table_lookup(queued_destination, &route) && route.best_rssi > -95) {
+            lora_set_tx_power(0x88);
+        } else {
+            lora_set_tx_power(adaptive_tx_power);
+        }
+    } else {
+        lora_set_tx_power(0x8F);
+    }
+    if (current_request_duress) {
+        size_t packet_len = strlen(packet);
+        if (packet_len + 10 < sizeof(packet)) {
+            snprintf(packet + packet_len, sizeof(packet) - packet_len, "|DURESS=1");
+        }
+        copy_field(message->packet, sizeof(message->packet), packet);
+    }
     save_packet_counter();
     data_unlock();
+
+    if (strcmp(queued_destination, "ALL") != 0 && roster_is_stale(queued_destination) && strcmp(queued_priority, "LOW") != 0) {
+        data_lock();
+        mailbox_store_message(message);
+        copy_field(message->status, sizeof(message->status), "STORED");
+        data_unlock();
+        return;
+    }
 
     ESP_LOGI(TAG, "LoRa TX pending: %s", packet);
     if (lora_transmit(packet)) {
@@ -1743,12 +2010,13 @@ static void login_record_success(const char *client_id)
     lockout->lock_until = 0;
 }
 
-static void issue_session_for_client(const char *client_id, char *token_out, size_t token_size)
+static void issue_session_for_client(const char *client_id, bool duress, char *token_out, size_t token_size)
 {
     session_record_t *session = session_alloc();
     random_session_token(session->token, sizeof(session->token));
     session->active = true;
     copy_field(session->ip, sizeof(session->ip), client_id);
+    session->duress = duress;
     session_touch(session);
     copy_field(token_out, token_size, session->token);
 }
@@ -1775,6 +2043,34 @@ static esp_err_t require_session(httpd_req_t *request)
     }
 
     return send_redirect(request, "/");
+}
+
+static esp_err_t send_login_page(httpd_req_t *request, const char *warning)
+{
+    char page[2048];
+    char warning_block[256] = {0};
+    const char *warning_text = warning != NULL ? warning : "";
+
+    if (warning_text[0] != '\0') {
+        snprintf(warning_block, sizeof(warning_block), "<div class=warn>%s</div>", warning_text);
+    }
+
+    snprintf(page, sizeof(page),
+             "<!doctype html><html><head><meta name=viewport content='width=device-width,initial-scale=1'>"
+             "<title>Barangay Mesh Login</title><style>"
+             ":root{font-family:Arial,sans-serif;color:#17202a;background:#f5f7f9}"
+             "body{margin:0}.top{background:#b91c1c;color:white;padding:16px}.wrap{max-width:420px;margin:auto;padding:16px}"
+             ".card{background:white;border:1px solid #d8dee4;border-radius:8px;padding:16px;margin:12px 0}"
+             "label{display:block;font-weight:700;margin-top:12px}input,button{box-sizing:border-box;width:100%%;font:inherit;padding:12px;margin-top:6px;border-radius:6px;border:1px solid #b8c0cc}"
+             "button{background:#b91c1c;color:white;border:0;font-weight:700;margin-top:16px}.muted{color:#5f6b7a;font-size:14px}.warn{background:#fff7d6;border:1px solid #e9cf85;color:#6b4e00;padding:10px 12px;border-radius:8px;margin-bottom:12px}"
+             "</style></head><body><div class=top><div class=wrap><h2>Barangay Emergency Mesh</h2></div></div>"
+             "<main class=wrap><section class=card>%s<form method=post action=/login>"
+             "<label>Portal PIN<input name=pin maxlength=31 type=password required></label>"
+             "<button type=submit>Unlock Portal</button></form><p class=muted>Use the shared PIN configured for this node.</p></section></main></body></html>",
+             warning_block);
+
+    httpd_resp_set_type(request, "text/html");
+    return httpd_resp_send(request, page, HTTPD_RESP_USE_STRLEN);
 }
 
 static esp_err_t index_handler(httpd_req_t *request)
@@ -1807,9 +2103,8 @@ static esp_err_t login_handler(httpd_req_t *request)
         unsigned int wait_seconds = (unsigned int)pdTICKS_TO_MS(remaining) / 1000U;
         char message[96];
         httpd_resp_set_status(request, "429 Too Many Requests");
-        httpd_resp_set_type(request, "text/plain");
         snprintf(message, sizeof(message), "Too many failed attempts. Please wait %u seconds.", wait_seconds);
-        return httpd_resp_send(request, message, HTTPD_RESP_USE_STRLEN);
+        return send_login_page(request, message);
     }
 
     while (received < request->content_len && received < (int)sizeof(body) - 1) {
@@ -1821,15 +2116,26 @@ static esp_err_t login_handler(httpd_req_t *request)
     }
 
     form_value(body, "pin", pin, sizeof(pin));
-    if (strcmp(pin, node_config.web_pin) != 0) {
+    if (strcmp(pin, node_config.web_pin) != 0 && strcmp(pin, node_config_get_duress_pin()) != 0) {
+        TickType_t remaining_after_failure = 0;
+        unsigned int attempts_left;
+        char message[96];
+
         login_record_failure(client_id);
         httpd_resp_set_status(request, "403 Forbidden");
-        httpd_resp_set_type(request, "text/html");
-        return httpd_resp_send(request, LOGIN_HTML, HTTPD_RESP_USE_STRLEN);
+        if (!login_is_locked(client_id, &remaining_after_failure)) {
+            login_lockout_t *lockout = lockout_find_or_alloc(client_id);
+            attempts_left = lockout->failures < 3 ? (unsigned int)(3 - lockout->failures) : 0U;
+            snprintf(message, sizeof(message), "%u attempt%s remaining before lockout.", attempts_left, attempts_left == 1 ? "" : "s");
+        } else {
+            unsigned int wait_seconds = (unsigned int)pdTICKS_TO_MS(remaining_after_failure) / 1000U;
+            snprintf(message, sizeof(message), "Locked, try again in %u seconds.", wait_seconds);
+        }
+        return send_login_page(request, message);
     }
 
     login_record_success(client_id);
-    issue_session_for_client(client_id, token, sizeof(token));
+    issue_session_for_client(client_id, strcmp(pin, node_config_get_duress_pin()) == 0, token, sizeof(token));
     snprintf(cookie, sizeof(cookie), "%s=%s; Path=/; HttpOnly; SameSite=Lax", SESSION_COOKIE_NAME, token);
     httpd_resp_set_hdr(request, "Set-Cookie", cookie);
     return send_redirect(request, "/");
@@ -1860,6 +2166,7 @@ static esp_err_t setup_handler(httpd_req_t *request)
     form_value(body, "default_destination", new_config.default_destination, sizeof(new_config.default_destination));
     form_value(body, "default_priority", new_config.default_priority, sizeof(new_config.default_priority));
     form_value(body, "web_pin", new_config.web_pin, sizeof(new_config.web_pin));
+    form_value(body, "duress_pin", new_config.duress_pin, sizeof(new_config.duress_pin));
     form_value(body, "network_key", new_config.network_key, sizeof(new_config.network_key));
     form_value(body, "ap_password", new_config.ap_password, sizeof(new_config.ap_password));
     new_config.configured = true;
@@ -1889,6 +2196,9 @@ static esp_err_t setup_handler(httpd_req_t *request)
     }
     if (new_config.web_pin[0] == '\0') {
         copy_field(new_config.web_pin, sizeof(new_config.web_pin), node_config_get_web_pin());
+    }
+    if (new_config.duress_pin[0] == '\0') {
+        copy_field(new_config.duress_pin, sizeof(new_config.duress_pin), node_config_get_duress_pin());
     }
     if (new_config.network_key[0] == '\0') {
         copy_field(new_config.network_key, sizeof(new_config.network_key), node_config_get_network_key());
@@ -2005,7 +2315,9 @@ static esp_err_t send_handler(httpd_req_t *request)
         copy_field(payload, sizeof(payload), named_payload);
     }
 
+    current_request_duress = request_is_duress(request);
     queue_message(destination, type, priority, payload);
+    current_request_duress = false;
     return send_redirect(request, "/");
 }
 
@@ -2024,11 +2336,12 @@ static esp_err_t sync_handler(httpd_req_t *request)
 static esp_err_t status_handler(httpd_req_t *request)
 {
     wifi_sta_list_t clients = {0};
-    char response[512];
+    char response[640];
     char escaped_node[FIELD_LEN * 2];
     char escaped_name[FIELD_LEN * 2];
     char escaped_location[FIELD_LEN * 2];
     char escaped_ssid[FIELD_LEN * 2];
+    char escaped_role[FIELD_LEN * 2];
     char escaped_relay[8];
     bool duplicate_warning;
     size_t current_message_count;
@@ -2047,17 +2360,20 @@ static esp_err_t status_handler(httpd_req_t *request)
     json_escape_string(escaped_name, sizeof(escaped_name), node_config.node_name);
     json_escape_string(escaped_location, sizeof(escaped_location), node_config.location.barangay);
     json_escape_string(escaped_ssid, sizeof(escaped_ssid), ap_ssid);
+    json_escape_string(escaped_role, sizeof(escaped_role), node_config.node_role);
     json_escape_string(escaped_relay, sizeof(escaped_relay), "true");
     duplicate_warning = duplicate_node_id_warning_active();
 
     snprintf(response, sizeof(response),
-             "{\"node\":\"%s\",\"name\":\"%s\",\"location\":\"%s\",\"ssid\":\"%s\",\"clients\":%u,\"messages\":%u,\"configured\":%s,\"relay\":\"%s\",\"duplicate_warning\":%s,\"queue_full\":%s,\"time_synced\":%s,\"epoch\":%lu}",
+             "{\"node\":\"%s\",\"name\":\"%s\",\"location\":\"%s\",\"ssid\":\"%s\",\"node_role\":\"%s\",\"clients\":%u,\"messages\":%u,\"mailbox\":%u,\"configured\":%s,\"relay\":\"%s\",\"duplicate_warning\":%s,\"queue_full\":%s,\"time_synced\":%s,\"epoch\":%lu}",
              escaped_node,
              escaped_name,
              escaped_location,
              escaped_ssid,
+             escaped_role,
              clients.num,
              (unsigned int)current_message_count,
+             (unsigned int)mailbox_active_count(),
              node_config.configured ? "true" : "false",
              escaped_relay,
              duplicate_warning ? "true" : "false",
@@ -2122,7 +2438,7 @@ static esp_err_t roster_handler(httpd_req_t *request)
         char escaped_sitio[SITIO_LEN * 2];
         char escaped_barangay[BARANGAY_LEN * 2];
         char escaped_municipality[MUNICIPALITY_LEN * 2];
-        char json[320];
+        char json[512];
 
         json_escape_string(escaped_node, sizeof(escaped_node), snapshot[i].node_id);
         json_escape_string(escaped_sitio, sizeof(escaped_sitio), snapshot[i].location.sitio);
@@ -2130,13 +2446,16 @@ static esp_err_t roster_handler(httpd_req_t *request)
         json_escape_string(escaped_municipality, sizeof(escaped_municipality), snapshot[i].location.municipality);
 
         snprintf(json, sizeof(json),
-                 "%s{\"node_id\":\"%s\",\"sitio\":\"%s\",\"barangay\":\"%s\",\"municipality\":\"%s\",\"last_seen_epoch\":%lu,\"online\":%s}",
+                 "%s{\"node_id\":\"%s\",\"sitio\":\"%s\",\"barangay\":\"%s\",\"municipality\":\"%s\",\"last_seen_epoch\":%lu,\"last_rssi\":%d,\"last_snr\":%d,\"health_score\":%d,\"online\":%s}",
                  first ? "" : ",",
                  escaped_node,
                  escaped_sitio,
                  escaped_barangay,
                  escaped_municipality,
                  (unsigned long)snapshot[i].last_seen_epoch,
+                 snapshot[i].last_rssi,
+                 snapshot[i].last_snr,
+                 compute_health_score_for_node(snapshot[i].node_id, &snapshot[i]),
                  snapshot[i].online ? "true" : "false");
         first = false;
         httpd_resp_send_chunk(request, json, HTTPD_RESP_USE_STRLEN);
@@ -2165,10 +2484,11 @@ static esp_err_t routes_handler(httpd_req_t *request)
 
         json_escape_string(escaped_node, sizeof(escaped_node), snapshot[i].node_id);
         snprintf(json, sizeof(json),
-                 "%s{\"node_id\":\"%s\",\"best_hop_distance\":%d,\"stale\":%s}",
+                 "%s{\"node_id\":\"%s\",\"best_hop_distance\":%d,\"best_rssi\":%d,\"stale\":%s}",
                  first ? "" : ",",
                  escaped_node,
                  snapshot[i].best_hop_distance,
+                 snapshot[i].best_rssi,
                  snapshot[i].stale ? "true" : "false");
         first = false;
         httpd_resp_send_chunk(request, json, HTTPD_RESP_USE_STRLEN);
@@ -2202,7 +2522,7 @@ static esp_err_t discover_handler(httpd_req_t *request)
         char escaped_sitio[SITIO_LEN * 2];
         char escaped_barangay[BARANGAY_LEN * 2];
         char escaped_municipality[MUNICIPALITY_LEN * 2];
-        char json[320];
+        char json[512];
 
         json_escape_string(escaped_node, sizeof(escaped_node), snapshot[i].node_id);
         json_escape_string(escaped_sitio, sizeof(escaped_sitio), snapshot[i].location.sitio);
@@ -2210,18 +2530,109 @@ static esp_err_t discover_handler(httpd_req_t *request)
         json_escape_string(escaped_municipality, sizeof(escaped_municipality), snapshot[i].location.municipality);
 
         snprintf(json, sizeof(json),
-                 "%s{\"node_id\":\"%s\",\"sitio\":\"%s\",\"barangay\":\"%s\",\"municipality\":\"%s\",\"last_seen_epoch\":%lu,\"online\":%s}",
+                 "%s{\"node_id\":\"%s\",\"sitio\":\"%s\",\"barangay\":\"%s\",\"municipality\":\"%s\",\"last_seen_epoch\":%lu,\"last_rssi\":%d,\"last_snr\":%d,\"health_score\":%d,\"online\":%s}",
                  i == 0 ? "" : ",",
                  escaped_node,
                  escaped_sitio,
                  escaped_barangay,
                  escaped_municipality,
                  (unsigned long)snapshot[i].last_seen_epoch,
+                 snapshot[i].last_rssi,
+                 snapshot[i].last_snr,
+                 compute_health_score_for_node(snapshot[i].node_id, &snapshot[i]),
                  snapshot[i].online ? "true" : "false");
         httpd_resp_send_chunk(request, json, HTTPD_RESP_USE_STRLEN);
     }
     httpd_resp_send_chunk(request, "]", 1);
     return httpd_resp_send_chunk(request, NULL, 0);
+}
+
+static esp_err_t export_handler(httpd_req_t *request)
+{
+    esp_err_t session_result = require_session(request);
+    bool json = false;
+
+    if (session_result != ESP_OK) {
+        return session_result;
+    }
+
+    if (strstr(request->uri, "format=json") != NULL) {
+        json = true;
+    }
+
+    httpd_resp_set_hdr(request, "Content-Disposition", "attachment; filename=incident-log.csv");
+    if (!json) {
+        httpd_resp_set_type(request, "text/csv");
+        httpd_resp_send_chunk(request, "id,direction,source,destination,type,priority,status,stored_epoch,payload\n", HTTPD_RESP_USE_STRLEN);
+        data_lock();
+        for (size_t i = 0; i < message_count; i++) {
+            char line[512];
+            emergency_message_t *m = &messages[i];
+            snprintf(line, sizeof(line), "%lu,%s,%s,%s,%s,%s,%s,%lu,%s\n",
+                     (unsigned long)m->id, m->direction, m->source, m->destination, m->type, m->priority, m->status,
+                     (unsigned long)m->stored_epoch, m->payload);
+            httpd_resp_send_chunk(request, line, HTTPD_RESP_USE_STRLEN);
+        }
+        data_unlock();
+        return httpd_resp_send_chunk(request, NULL, 0);
+    }
+
+    httpd_resp_set_type(request, "application/json");
+    httpd_resp_send_chunk(request, "[", 1);
+    data_lock();
+    for (size_t i = 0; i < message_count; i++) {
+        write_message_json_chunk(request, &messages[i], i == 0);
+    }
+    data_unlock();
+    httpd_resp_send_chunk(request, "]", 1);
+    return httpd_resp_send_chunk(request, NULL, 0);
+}
+
+static esp_err_t ota_handler(httpd_req_t *request)
+{
+    esp_ota_handle_t ota_handle = 0;
+    const esp_partition_t *partition = esp_ota_get_next_update_partition(NULL);
+    char buffer[1024];
+    int received = 0;
+    esp_err_t session_result = require_session(request);
+
+    if (session_result != ESP_OK) {
+        return session_result;
+    }
+    if (partition == NULL) {
+        httpd_resp_set_status(request, "500 Internal Server Error");
+        return httpd_resp_send(request, "No OTA partition available", HTTPD_RESP_USE_STRLEN);
+    }
+
+    if (esp_ota_begin(partition, OTA_SIZE_UNKNOWN, &ota_handle) != ESP_OK) {
+        httpd_resp_set_status(request, "500 Internal Server Error");
+        return httpd_resp_send(request, "OTA begin failed", HTTPD_RESP_USE_STRLEN);
+    }
+
+    while (received < request->content_len) {
+        int chunk = httpd_req_recv(request, buffer, MIN((int)sizeof(buffer), request->content_len - received));
+        if (chunk <= 0) {
+            esp_ota_end(ota_handle);
+            httpd_resp_set_status(request, "400 Bad Request");
+            return httpd_resp_send(request, "OTA upload failed", HTTPD_RESP_USE_STRLEN);
+        }
+        if (esp_ota_write(ota_handle, buffer, chunk) != ESP_OK) {
+            esp_ota_end(ota_handle);
+            httpd_resp_set_status(request, "500 Internal Server Error");
+            return httpd_resp_send(request, "OTA write failed", HTTPD_RESP_USE_STRLEN);
+        }
+        received += chunk;
+    }
+
+    if (esp_ota_end(ota_handle) != ESP_OK || esp_ota_set_boot_partition(partition) != ESP_OK) {
+        httpd_resp_set_status(request, "500 Internal Server Error");
+        return httpd_resp_send(request, "OTA finalize failed", HTTPD_RESP_USE_STRLEN);
+    }
+
+    httpd_resp_send(request, "OTA update accepted. Rebooting.", HTTPD_RESP_USE_STRLEN);
+    vTaskDelay(pdMS_TO_TICKS(500));
+    esp_restart();
+    return ESP_OK;
 }
 
 static esp_err_t captive_handler(httpd_req_t *request)
@@ -2233,7 +2644,7 @@ static void start_http_server(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = HTTP_PORT;
-    config.max_uri_handlers = 18;
+    config.max_uri_handlers = 22;
     config.uri_match_fn = httpd_uri_match_wildcard;
     config.stack_size = 16384;
 
@@ -2249,7 +2660,9 @@ static void start_http_server(void)
         {.uri = "/api/messages", .method = HTTP_GET, .handler = messages_handler},
         {.uri = "/api/roster", .method = HTTP_GET, .handler = roster_handler},
         {.uri = "/api/routes", .method = HTTP_GET, .handler = routes_handler},
+        {.uri = "/api/export", .method = HTTP_GET, .handler = export_handler},
         {.uri = "/discover", .method = HTTP_GET, .handler = discover_handler},
+        {.uri = "/ota", .method = HTTP_POST, .handler = ota_handler},
         {.uri = "/generate_204", .method = HTTP_GET, .handler = captive_handler},
         {.uri = "/gen_204", .method = HTTP_GET, .handler = captive_handler},
         {.uri = "/hotspot-detect.html", .method = HTTP_GET, .handler = captive_handler},

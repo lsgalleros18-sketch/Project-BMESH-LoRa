@@ -19,6 +19,8 @@ void lora_set_mode(uint8_t mode);
 
 // Sets frequency
 void lora_set_frequency(uint32_t frequency_hz);
+void lora_set_spreading_factor(uint8_t sf);
+void lora_set_tx_power(uint8_t tx_power);
 
 // Puts radio into receive mode
 void lora_receive_mode(void);

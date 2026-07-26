@@ -78,7 +78,7 @@ void route_table_init(void)
     }
 }
 
-void route_table_learn(const char *node_id, int hop_distance_from_origin)
+void route_table_learn(const char *node_id, int hop_distance_from_origin, int rssi)
 {
     uint32_t now = now_ms();
     size_t index;
@@ -105,10 +105,13 @@ void route_table_learn(const char *node_id, int hop_distance_from_origin)
         }
         copy_field(route_table[index].node_id, sizeof(route_table[index].node_id), node_id);
         route_table[index].best_hop_distance = hop_distance_from_origin;
+        route_table[index].best_rssi = rssi;
     } else {
         refresh_stale_state(&route_table[index], now);
-        if (route_table[index].stale || hop_distance_from_origin <= route_table[index].best_hop_distance) {
+        if (route_table[index].stale || hop_distance_from_origin < route_table[index].best_hop_distance ||
+            (hop_distance_from_origin == route_table[index].best_hop_distance && rssi > route_table[index].best_rssi)) {
             route_table[index].best_hop_distance = hop_distance_from_origin;
+            route_table[index].best_rssi = rssi;
         }
     }
 

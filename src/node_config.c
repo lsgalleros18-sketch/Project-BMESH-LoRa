@@ -100,6 +100,11 @@ const char *node_config_get_ap_password(void)
     return node_config.ap_password;
 }
 
+const char *node_config_get_duress_pin(void)
+{
+    return node_config.duress_pin;
+}
+
 const char *node_config_get_node_role(void)
 {
     return node_config.node_role;
@@ -138,6 +143,7 @@ void node_config_set_defaults(void)
     copy_field(node_config.default_priority, sizeof(node_config.default_priority), "NORMAL");
     node_config.ap_password[0] = '\0';
     node_config.web_pin[0] = '\0';
+    node_config.duress_pin[0] = '\0';
     node_config.network_key[0] = '\0';
     config_unlock();
 }
@@ -164,6 +170,7 @@ void node_config_load(void)
     nvs_get_str(handle, "default_priority", node_config.default_priority, &(size_t){sizeof(node_config.default_priority)});
     nvs_get_str(handle, "ap_password", node_config.ap_password, &(size_t){sizeof(node_config.ap_password)});
     nvs_get_str(handle, "web_pin", node_config.web_pin, &(size_t){sizeof(node_config.web_pin)});
+    nvs_get_str(handle, "duress_pin", node_config.duress_pin, &(size_t){sizeof(node_config.duress_pin)});
     nvs_get_str(handle, "network_key", node_config.network_key, &(size_t){sizeof(node_config.network_key)});
     if (nvs_get_str(handle, "sitio", node_config.location.sitio, &(size_t){sizeof(node_config.location.sitio)}) != ESP_OK) {
         copy_field(node_config.location.sitio, sizeof(node_config.location.sitio), "");
@@ -191,6 +198,9 @@ void node_config_load(void)
     }
     if (node_config.network_key[0] == '\0') {
         random_hex_string(node_config.network_key, sizeof(node_config.network_key), 16);
+    }
+    if (node_config.duress_pin[0] == '\0') {
+        random_hex_string(node_config.duress_pin, sizeof(node_config.duress_pin), 4);
     }
     if (node_config.node_role[0] == '\0') {
         copy_field(node_config.node_role, sizeof(node_config.node_role), "relay-only");
@@ -229,6 +239,7 @@ int node_config_save(const node_config_t *config)
     if (result == ESP_OK) result = nvs_set_str(handle, "default_priority", config->default_priority);
     if (result == ESP_OK) result = nvs_set_str(handle, "ap_password", config->ap_password);
     if (result == ESP_OK) result = nvs_set_str(handle, "web_pin", config->web_pin);
+    if (result == ESP_OK) result = nvs_set_str(handle, "duress_pin", config->duress_pin);
     if (result == ESP_OK) result = nvs_set_str(handle, "network_key", config->network_key);
     if (result == ESP_OK) result = nvs_erase_key(handle, "location");
     if (result == ESP_OK) result = nvs_commit(handle);

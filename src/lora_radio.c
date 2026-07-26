@@ -149,6 +149,28 @@ void lora_set_frequency(uint32_t frequency_hz)
     lora_write_reg(REG_FRF_LSB, (uint8_t)(frf >> 0));
 }
 
+void lora_set_spreading_factor(uint8_t sf)
+{
+    uint8_t config2;
+
+    if (sf < 6 || sf > 12) {
+        return;
+    }
+
+    config2 = lora_read_reg(REG_MODEM_CONFIG_2);
+    config2 &= 0x0F;
+    config2 |= (uint8_t)(sf << 4);
+    lora_write_reg(REG_MODEM_CONFIG_2, config2);
+}
+
+void lora_set_tx_power(uint8_t tx_power)
+{
+    if (tx_power < 0x80) {
+        tx_power = 0x80;
+    }
+    lora_write_reg(REG_PA_CONFIG, tx_power);
+}
+
 void lora_receive_mode(void)
 {
     lora_write_reg(REG_DIO_MAPPING_1, 0x00);

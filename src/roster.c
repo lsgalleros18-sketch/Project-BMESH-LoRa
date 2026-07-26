@@ -84,7 +84,7 @@ void roster_init(void)
     }
 }
 
-void roster_touch(const char *node_id, const location_info_t *location, uint32_t epoch_seconds)
+void roster_touch(const char *node_id, const location_info_t *location, uint32_t epoch_seconds, int rssi, int snr)
 {
     uint32_t now = now_ms();
     size_t index;
@@ -119,6 +119,8 @@ void roster_touch(const char *node_id, const location_info_t *location, uint32_t
     }
     roster[index].last_seen_epoch = epoch_seconds;
     roster[index].last_seen_tick_ms = now;
+    roster[index].last_rssi = rssi;
+    roster[index].last_snr = snr;
     roster[index].learned_passively = true;
     refresh_online_state(&roster[index], now);
 

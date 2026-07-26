@@ -14,6 +14,7 @@ typedef struct {
     char default_priority[FIELD_LEN];
     char ap_password[FIELD_LEN];
     char web_pin[FIELD_LEN];
+    char duress_pin[FIELD_LEN];
     char network_key[FIELD_LEN];
 } node_config_t;
 
@@ -22,6 +23,7 @@ const char *node_config_get_node_id(void);
 const char *node_config_get_web_pin(void);
 const char *node_config_get_network_key(void);
 const char *node_config_get_ap_password(void);
+const char *node_config_get_duress_pin(void);
 const char *node_config_get_node_role(void);
 const char *node_config_get_default_priority(void);
 bool node_config_is_provisioned(void);
