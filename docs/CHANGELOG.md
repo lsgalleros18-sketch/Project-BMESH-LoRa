@@ -2,6 +2,15 @@
 
 This file is updated by the release helper in `scripts/release.ps1`.
 
+## v1.0.23 - 2026-08-04
+
+- Moved the portal HTML from firmware string literals into LittleFS under `data/`.
+- Added LittleFS mounting and file streaming in `src/main.c` so the web portal is served from `/littlefs`.
+- Reworked the 16MB partition table to keep a single factory app and dedicate the remaining flash to LittleFS storage and coredump space.
+- Updated PlatformIO to use the custom partition table and LittleFS filesystem image.
+- Documented the LittleFS workflow so portal asset changes require `pio run -e esp32-s3-devkitm-1 -t buildfs -t uploadfs`.
+- Kept OTA deferred and explicitly not implemented.
+
 ## v1.0.22 - 2026-07-26
 
 - Removed dead LoRa macro definitions from `src/main.c`.

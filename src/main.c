@@ -12,6 +12,7 @@
 #include "driver/spi_master.h"
 #include "esp_event.h"
 #include "esp_http_server.h"
+#include "esp_littlefs.h"
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_netif.h"
@@ -55,6 +56,8 @@
 #define DEFAULT_NETWORK_KEY "CHANGEME1234567"
 #define SESSION_COOKIE_NAME "BMESH_SESSION"
 #define SESSION_TOKEN_LEN 17
+#define LITTLEFS_BASE_PATH "/littlefs"
+#define PORTAL_FILE_BUFFER_SIZE 1536
 
 #define LORA_MISO_GPIO 5
 #define LORA_DIO0_GPIO 16
@@ -130,6 +133,9 @@ typedef struct {
     char thread_key[FIELD_LEN];        // NEW — "ANNOUNCEMENTS" or the peer node_id
     char status[FIELD_LEN];
     uint32_t stored_epoch;
+    int rssi;
+    int snr;
+    int hops;
 } emergency_message_t;
 
 typedef struct {
@@ -222,9 +228,13 @@ static bool rgb_led_ready;
 static bool lora_ready;
 static volatile bool radio_in_tx;
 static bool duplicate_node_id_warning;
+static bool littlefs_mounted;
 static SemaphoreHandle_t lora_dio0_semaphore;
 static SemaphoreHandle_t lora_tx_done_semaphore;
 static SemaphoreHandle_t data_mutex;
+static roster_entry_t roster_snapshot_buffer[MAX_ROSTER_ENTRIES];
+static route_entry_t route_snapshot_buffer[MAX_ROUTE_ENTRIES];
+static emergency_message_t message_snapshot_buffer[MAX_MESSAGES];
 
 static void copy_field(char *destination, size_t destination_size, const char *source);
 static void save_packet_counter(void);
@@ -314,105 +324,10 @@ static void rgb_led_blink_green(int count)
     }
 }
 
-static const char INDEX_HTML[] =
-    "<!doctype html><html><head><meta name=viewport content='width=device-width,initial-scale=1'>"
-    "<title>Barangay Mesh</title><style>"
-    ":root{font-family:Arial,sans-serif;color:#17202a;background:#f5f7f9}"
-    "body{margin:0}.top{background:#b91c1c;color:white;padding:16px}.wrap{max-width:760px;margin:auto;padding:16px}"
-    ".card{background:white;border:1px solid #d8dee4;border-radius:8px;padding:16px;margin:12px 0}"
-    "label{display:block;font-weight:700;margin-top:12px}input,select,textarea,button{box-sizing:border-box;width:100%;font:inherit;padding:12px;margin-top:6px;border-radius:6px;border:1px solid #b8c0cc}"
-    "textarea{min-height:94px}button{background:#b91c1c;color:white;border:0;font-weight:700;margin-top:16px}"
-    ".row{display:grid;grid-template-columns:1fr 1fr;gap:10px}.muted{color:#5f6b7a;font-size:14px}.msg{border-top:1px solid #e5e7eb;padding:10px 0;word-break:break-word}"
-    ".spinner{width:16px;height:16px;border:2px solid #ddd;border-top-color:#b91c1c;border-radius:50%;animation:spin .6s linear infinite;display:inline-block;vertical-align:middle;margin-right:8px}"
-    "@keyframes spin{to{transform:rotate(360deg)}}"
-    ".messenger{display:grid;grid-template-columns:280px 1fr;gap:12px}.thread-list{border-right:1px solid #eef2f7;padding-right:8px}.thread-item{padding:10px 12px;border-radius:8px;cursor:pointer;border:1px solid transparent;margin-bottom:8px;background:#f8fafc;position:relative}.thread-item.active{border-color:#b91c1c;background:#fff1f2}.thread-item.active b{font-weight:800}.thread-item small{display:block;color:#5f6b7a;margin-top:4px}.thread-item .unread{position:absolute;top:10px;right:10px;background:#b91c1c;color:#fff;border-radius:999px;padding:2px 6px;font-size:11px;font-weight:700}.thread-view{min-height:220px}.thread-back{display:none;margin-bottom:12px}.thread-header{display:flex;align-items:center;justify-content:space-between;gap:8px}.bubble{background:#fff;border:1px solid #dbe2ea;border-radius:12px;padding:10px 12px;margin:10px 0;max-width:78%;position:relative}.bubble.mine{margin-left:auto;background:#fee2e2;border-color:#fca5a5}.bubble.theirs{margin-right:auto}.bubble .meta{font-size:12px;color:#5f6b7a;margin-bottom:6px}.bubble .stamp{font-size:12px;color:#475569;display:flex;justify-content:flex-end;gap:6px;margin-top:8px;align-items:center}.bubble .sig{font-size:11px;color:#7c2d12;font-weight:700}.avatar{width:28px;height:28px;border-radius:50%;background:#b91c1c;color:#fff;display:inline-flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;flex:none;margin-right:8px}.bubble-row{display:flex;align-items:flex-start;gap:8px}.bubble-row.mine{justify-content:flex-end}.location{font-size:12px;color:#475569;margin-top:6px}"
-    "@media(max-width:620px){.row{grid-template-columns:1fr}}"
-    "@media(max-width:860px){.messenger{grid-template-columns:1fr}.thread-list{border-right:0;padding-right:0}.mobile-thread-open .thread-list{display:none}.mobile-thread-open .thread-view{display:block}.thread-back{display:inline-block}}"
-    "</style></head><body><div class=top><div class=wrap><h2>Barangay Emergency Mesh</h2>"
-    "<div id=status><span class=spinner></span>Loading status...</div></div></div><main class=wrap>"
-    "<section class=card><h3>Send Message</h3><button id=langBtn type=button>Tagalog</button><form method=post action=/send>"
-    "<div class=row><label>Your name<input name=sender_name maxlength=31 placeholder='Optional name for accountability'></label><label>Quick templates<select id=template><option value=''>Choose a template</option><option value='Need medical evacuation|MEDICAL|HIGH'>Need medical evacuation</option><option value='Road impassable|EVACUATION|HIGH'>Road impassable</option><option value='All clear|TEST|LOW'>All clear</option></select></label></div>"
-    "<fieldset style='border:0;padding:0;margin:0 0 8px 0'><legend style='font-weight:700'>Message scope</legend>"
-    "<label><input type=radio name=scope value=announcement checked> Announcement (all nodes)</label>"
-    "<label><input type=radio name=scope value=direct> Direct message (specific node)</label></fieldset>"
-    "<div id=destWrap style='display:none'><label>Destination Node ID<input id=destination name=destination maxlength=31 placeholder='Example: BRGY001'></label></div>"
-    "<input type=hidden id=announcementDest name=destination value=ALL>"
-    "<div class=row><label>Emergency Type<select name=type><option>FLOOD</option><option>FIRE</option><option>MEDICAL</option><option>SECURITY</option><option>EVACUATION</option><option>TEST</option></select></label>"
-    "<label>Priority<select name=priority><option>HIGH</option><option>NORMAL</option><option>LOW</option></select></label></div>"
-    "<label>Message<textarea id=payload name=payload maxlength=159 placeholder='Short emergency message'></textarea></label>"
-    "<button type=submit>Queue / Transmit Message</button></form><p class=muted>The portal sends through the SX1278 using GPIO 5/7/6/8/4/16 at 433 MHz.</p></section>"
-    "<section class=card><h3>Messages</h3><div class=messenger><div class=thread-list><div class=muted><span class=spinner></span>Loading threads...</div></div><div class=thread-view><div class=muted><span class=spinner></span>Loading messages...</div></div></div></section>"
-    "<section class=card><h3>Mesh Health</h3><div id=health class=muted><span class=spinner></span>Loading node roster...</div></section>"
-    "<section class=card><h3>Portal</h3><p class=muted id=warningBox></p><p class=muted>Connect to this Wi-Fi when offline, then open http://192.168.4.1. Android/iOS captive checks are redirected here automatically.</p>"
-    "<form method=post action=/settime><label>Set time<input name=epoch id=epochInput readonly></label><button type=submit>Sync Clock</button></form>"
-    "<form method=post action=/sync><button type=submit>Sync Messages from Mesh</button></form>"
-    "<form method=post action=/reset onsubmit='return confirm(\"Factory reset this node and run setup again?\")'><button type=submit>Factory Reset Node</button></form></section>"
-    "</main><script>"
-    "const scopeRadios=[...document.querySelectorAll('input[name=scope]')];const destWrap=document.getElementById('destWrap');const dest=document.getElementById('destination');const announcementDest=document.getElementById('announcementDest');const template=document.getElementById('template');const payload=document.getElementById('payload');const langBtn=document.getElementById('langBtn');"
-    "function syncScope(){let direct=scopeRadios.some(r=>r.checked&&r.value==='direct');destWrap.style.display=direct?'block':'none';dest.required=direct;dest.disabled=!direct;announcementDest.disabled=direct;if(!direct){announcementDest.value='ALL';}}"
-    "template.addEventListener('change',()=>{if(!template.value)return;let parts=template.value.split('|');payload.value=parts[0];document.querySelector('select[name=type]').value=parts[1]||'TEST';document.querySelector('select[name=priority]').value=parts[2]||'NORMAL';template.value='';});"
-    "scopeRadios.forEach(r=>r.addEventListener('change',syncScope));syncScope();"
-    "let activeThread='ANNOUNCEMENTS';let cachedThreads={};let mobileOpen=false;let rosterState=[];let routeState=[];"
-    "function escapeHtml(v){return String(v).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('\"','&quot;');}"
-    "function locText(x){return [x.location?.sitio||'',x.location?.barangay||'',x.location?.municipality||''].filter(Boolean).join(' \xE2\x86\x92 ');}"
-    "function renderThreads(){let list=document.querySelector('.thread-list');let entries=Object.values(cachedThreads).sort((a,b)=>{if(a.thread_key==='ANNOUNCEMENTS')return -1;if(b.thread_key==='ANNOUNCEMENTS')return 1;return (b.lastSeen||0)-(a.lastSeen||0);});if(!entries.length){list.innerHTML='<div class=muted>No messages yet.</div>';return;}list.innerHTML=entries.map(t=>{let unread=(Number(localStorage.getItem('lastSeen:'+t.thread_key)||0)<(t.lastSeen||0))?'<span class=unread>new</span>':'';return '<div class=thread-item'+(t.thread_key===activeThread?' active':'')+' data-thread=\"'+escapeHtml(t.thread_key)+'\"><b>'+escapeHtml(t.label)+'</b>'+unread+'<small>'+t.messages.length+' message(s)</small></div>';}).join('');list.querySelectorAll('.thread-item').forEach(el=>el.addEventListener('click',()=>{activeThread=el.dataset.thread;mobileOpen=true;document.body.classList.add('mobile-thread-open');renderThreads();renderThreadView();}));}"
-    "function fmtEpoch(e){return e?new Date(e*1000).toLocaleString():'time unknown';}"
-    "function renderThreadView(){let view=document.querySelector('.thread-view');let thread=cachedThreads[activeThread]||Object.values(cachedThreads)[0];if(!thread){view.innerHTML='<div class=muted>No messages yet.</div>';return;}localStorage.setItem('lastSeen:'+thread.thread_key,String(thread.lastSeen||0));let back=mobileOpen?'<button type=button class=thread-back id=threadBack>‹ Back</button>':'';view.innerHTML=back+'<div class=thread-header><h4>'+escapeHtml(thread.label)+'</h4><span class=muted>'+thread.messages.length+' message(s)</span></div>'+thread.messages.map(x=>{let mine=(x.direction==='TX');let meta=x.direction+' #'+x.id+' · '+x.type+' · '+x.priority+' · '+x.thread_key;let stamp=fmtEpoch(x.stored_epoch);let sig='';if(typeof x.rssi==='number'&&typeof x.snr==='number'){sig='RSSI '+x.rssi+' dBm · SNR '+x.snr+' dB';}if(typeof x.hops==='number'){sig=sig?(sig+' · '+x.hops+' hop(s)'):(x.hops+' hop(s)');}let initials=(x.source||'??').slice(0,2).toUpperCase();return '<div class=bubble-row'+(mine?' mine':'')+'>'+(mine?'':'<div class=avatar>'+escapeHtml(initials)+'</div>')+'<div class=\"bubble '+(mine?'mine theirs')+'\" title=\"'+escapeHtml(meta)+'\"><div class=meta>'+escapeHtml(meta)+'</div><div><b>From:</b> '+escapeHtml(x.source)+'<br><b>To:</b> '+escapeHtml(x.destination)+'<br><b>Payload:</b> '+escapeHtml(x.payload)+'</div><div class=location><b>Location:</b> '+escapeHtml(locText(x))+'</div>'+((x.thread_key==='ANNOUNCEMENTS')?'<div class=location><b>Sender:</b> '+escapeHtml(x.source)+'</div>':'')+'<div class=stamp><span>'+escapeHtml(stamp)+'</span><span class=sig>'+escapeHtml((x.status||'UNKNOWN')+(sig?' · '+sig:''))+'</span></div></div></div>';}).join('');let backBtn=document.getElementById('threadBack');if(backBtn)backBtn.addEventListener('click',()=>{mobileOpen=false;document.body.classList.remove('mobile-thread-open');renderThreads();renderThreadView();});}"
-    "const strings={en:{scope:'Message scope',announcement:'Announcement (all nodes)',direct:'Direct message (specific node)',messages:'Messages',health:'Mesh Health',portal:'Portal',send:'Queue / Transmit Message',toggle:'Tagalog'},tl:{scope:'Layunin ng mensahe',announcement:'Anunsyo (lahat ng node)',direct:'Direktang mensahe (tiyak na node)',messages:'Mga Mensahe',health:'Kalagayan ng Mesh',portal:'Portal',send:'Ipadala ang Mensahe',toggle:'English'}};let lang='en';function applyLang(){let s=strings[lang];document.querySelector('legend').textContent=s.scope;document.querySelectorAll('label')[2].childNodes[1].textContent=' '+s.announcement;document.querySelectorAll('label')[3].childNodes[1].textContent=' '+s.direct;document.querySelectorAll('section.card h3')[1].textContent=s.messages;document.querySelectorAll('section.card h3')[2].textContent=s.health;document.querySelectorAll('section.card h3')[3].textContent=s.portal;document.querySelector('button[type=submit]').textContent=s.send;langBtn.textContent=s.toggle;}langBtn.addEventListener('click',()=>{lang=lang==='en'?'tl':'en';applyLang();});applyLang();"
-    "document.getElementById('epochInput').value=Math.floor(Date.now()/1000);"
-    "function loadingFallback(target,label){target.innerHTML='<span class=spinner></span>'+label;}"
-    "async function load(){try{let s=await fetch('/api/status').then(r=>r.json());document.getElementById('status').innerHTML='Node <b>'+s.node+'</b> | '+s.name+' | '+s.location+' | Role <b>'+(s.node_role||'relay-only')+'</b> | AP <b>'+s.ssid+'</b> | Clients <b>'+s.clients+'</b> | Time <b>'+(s.time_synced?(new Date(s.epoch*1000).toLocaleString()):'unknown')+'</b>';document.getElementById('warningBox').textContent=s.duplicate_warning?'Possible duplicate node ID on the mesh':'';}catch(e){loadingFallback(document.getElementById('status'),'Reconnecting...');return;}try{let m=await fetch('/api/messages').then(r=>r.json());cachedThreads={};m.forEach(x=>{let key=x.thread_key||'UNKNOWN';if(!cachedThreads[key])cachedThreads[key]={thread_key:key,label:key==='ANNOUNCEMENTS'?'Announcements':key,messages:[],lastSeen:0};cachedThreads[key].messages.push(x);cachedThreads[key].lastSeen=Math.max(cachedThreads[key].lastSeen,x.id||0);if(key==='ANNOUNCEMENTS')cachedThreads[key].label='Announcements';else if(!cachedThreads[key].label||cachedThreads[key].label===key)cachedThreads[key].label=key;});if(!cachedThreads[activeThread]&&Object.keys(cachedThreads).length){activeThread=Object.keys(cachedThreads)[0];}renderThreads();renderThreadView();}catch(e){loadingFallback(document.querySelector('.thread-list'),'Reconnecting...');loadingFallback(document.querySelector('.thread-view'),'Reconnecting...');}try{let r=await fetch('/api/status').then(r=>r.json());rosterState=r.roster||[];routeState=r.routes||[];let health=document.getElementById('health');health.innerHTML=rosterState.length?rosterState.map(p=>'<div class=msg><b>'+escapeHtml(p.node_id)+'</b><br><span class=muted>Seen '+escapeHtml(fmtEpoch(p.last_seen_epoch))+' | RSSI '+escapeHtml(p.last_rssi)+' dBm | SNR '+escapeHtml(p.last_snr)+' dB</span><br>'+escapeHtml((p.location?.sitio||'')+' '+(p.location?.barangay||'')+' '+(p.location?.municipality||'')).trim()+'<br><span class=muted>'+(p.online?'Online':'Stale')+'</span></div>').join(''):'No peers yet.';}catch(e){loadingFallback(document.getElementById('health'),'Reconnecting...');}}"
-    "function renderThreadView(){let view=document.querySelector('.thread-view');let thread=cachedThreads[activeThread]||Object.values(cachedThreads)[0];if(!thread){view.innerHTML='<div class=muted>No messages yet.</div>';return;}localStorage.setItem('lastSeen:'+thread.thread_key,String(thread.lastSeen||0));let back=mobileOpen?'<button type=button class=thread-back id=threadBack>Back</button>':'';view.innerHTML=back+'<div class=thread-header><h4>'+escapeHtml(thread.label)+'</h4><span class=muted>'+thread.messages.length+' message(s)</span></div>'+thread.messages.map(x=>{let mine=(x.direction==='TX');let meta=x.direction+' #'+x.id+' · '+x.type+' · '+x.priority+' · '+x.thread_key;let stamp=fmtEpoch(x.stored_epoch);let sig='';if(typeof x.rssi==='number'&&typeof x.snr==='number'){sig='RSSI '+x.rssi+' dBm · SNR '+x.snr+' dB';}if(typeof x.hops==='number'){sig=sig?(sig+' · '+x.hops+' hop(s)'):(x.hops+' hop(s)');}let initials=(x.source||'??').slice(0,2).toUpperCase();return '<div class=bubble-row'+(mine?' mine':'')+'>'+(mine?'':'<div class=avatar>'+escapeHtml(initials)+'</div>')+'<div class=\"bubble '+(mine?'mine':'theirs')+'\" title=\"'+escapeHtml(meta)+'\"><div class=meta>'+escapeHtml(meta)+'</div><div><b>From:</b> '+escapeHtml(x.source)+'<br><b>To:</b> '+escapeHtml(x.destination)+'<br><b>Payload:</b> '+escapeHtml(x.payload)+'</div><div class=location><b>Location:</b> '+escapeHtml(locText(x))+'</div>'+((x.thread_key==='ANNOUNCEMENTS')?'<div class=location><b>Sender:</b> '+escapeHtml(x.source)+'</div>':'')+'<div class=stamp><span>'+escapeHtml(stamp)+'</span><span class=sig>'+escapeHtml((x.status||'UNKNOWN')+(sig?' · '+sig:''))+'</span></div></div></div>';}).join('');let backBtn=document.getElementById('threadBack');if(backBtn)backBtn.addEventListener('click',()=>{mobileOpen=false;document.body.classList.remove('mobile-thread-open');renderThreads();renderThreadView();});}"
-    "load();setInterval(load,4000);</script></body></html>";
 
-static const char SETUP_HTML[] =
-    "<!doctype html><html><head><meta name=viewport content='width=device-width,initial-scale=1'>"
-    "<title>Setup Barangay Mesh</title><style>"
-    ":root{font-family:Arial,sans-serif;color:#17202a;background:#f5f7f9}"
-    "body{margin:0}.top{background:#1f6f5b;color:white;padding:16px}.wrap{max-width:720px;margin:auto;padding:16px}"
-    ".card{background:white;border:1px solid #d8dee4;border-radius:8px;padding:16px;margin:12px 0}"
-    "label{display:block;font-weight:700;margin-top:12px}input,button,select{box-sizing:border-box;width:100%;font:inherit;padding:12px;margin-top:6px;border-radius:6px;border:1px solid #b8c0cc}"
-    "button{background:#1f6f5b;color:white;border:0;font-weight:700;margin-top:16px}.muted{color:#5f6b7a;font-size:14px}"
-    "</style></head><body><div class=top><div class=wrap><h2>First-Time Node Setup</h2>"
-    "<p>Configure this universal mesh node once. All nodes still send, receive, and relay.</p></div></div>"
-    "<main class=wrap><section class=card><form method=post action=/setup>"
-    "<label>Node ID<input name=node_id maxlength=31 placeholder='Example: BRGY001, HH023, RELAY04' required></label>"
-    "<label>Node Name<input name=node_name maxlength=31 placeholder='Example: Barangay Hall or House 23' required></label>"
-    "<label>Node Role<select name=node_role><option value='relay-only'>Relay / Listener</option><option value='household'>Household</option><option value='command-post'>Command Post</option></select></label>"
-    "<label>Default Priority<select name=default_priority><option>HIGH</option><option selected>NORMAL</option><option>LOW</option></select></label>"
-    "<label>Sitio / Landmark<input name=sitio maxlength=23 placeholder='Example: Purok 3, Chapel Roof'></label>"
-    "<label>Barangay<input name=barangay maxlength=23 placeholder='Example: San Isidro' required></label>"
-    "<label>Municipality<input name=municipality maxlength=23 placeholder='Example: Cabuyao'></label>"
-    "<label>Default Destination<input name=default_destination maxlength=31 value='BRGY001' placeholder='Example: ALL or BRGY001'></label>"
-    "<label>AP Password<input name=ap_password maxlength=31 value='123456789' placeholder='Wi-Fi hotspot password (8+ chars)'></label>"
-    "<label>Web PIN<input name=web_pin maxlength=31 value='123456789' placeholder='Shared portal PIN' required></label>"
-    "<label>Duress PIN<input name=duress_pin maxlength=31 placeholder='Visible emergency-only PIN used to signal distress'></label>"
-    "<label>Network Key<input name=network_key maxlength=31 value='CHANGEME1234567' placeholder='Shared mesh encryption key' required></label>"
-    "<button type=submit>Save Setup and Reboot</button></form>"
-    "<p class=muted>Factory reset later by holding BOOT for 10 seconds during startup.</p></section></main></body></html>";
 
-static const char REBOOT_HTML[] =
-    "<!doctype html><html><head><meta name=viewport content='width=device-width,initial-scale=1'>"
-    "<title>Restarting...</title><style>"
-    ":root{font-family:Arial,sans-serif;color:#17202a;background:#f5f7f9}body{margin:0}.wrap{max-width:520px;margin:auto;padding:24px}"
-    ".card{background:white;border:1px solid #d8dee4;border-radius:12px;padding:20px}.spinner{width:36px;height:36px;border:4px solid #e5e7eb;border-top-color:#1f6f5b;border-radius:50%;animation:spin .8s linear infinite;margin:10px 0}"
-    "@keyframes spin{to{transform:rotate(360deg)}}.muted{color:#5f6b7a;font-size:14px}.count{font-size:34px;font-weight:800;color:#1f6f5b}"
-    "</style></head><body><main class=wrap><section class=card><div class=spinner></div><h2>Setup saved. Node is restarting.</h2><div class=count id=count>15</div><p class=muted id=msg>Please reconnect to the Wi-Fi AP for this node, then the page will retry automatically.</p><p class=muted id=ssid></p></section></main><script>"
-    "let s=15;const ap='192.168.4.1';function tick(){document.getElementById('count').textContent=s;if(s<=0)return;setTimeout(tick,1000);s--;}tick();let tries=0;async function probe(){tries++;try{let r=await fetch('http://192.168.4.1/api/status',{cache:'no-store'});if(r.ok){window.location.href='/';return;}}catch(e){}setTimeout(probe,2000);}setTimeout(probe,16000);"
-    "</script></body></html>";
 
-static const char LOGIN_HTML[] =
-    "<!doctype html><html><head><meta name=viewport content='width=device-width,initial-scale=1'>"
-    "<title>Barangay Mesh Login</title><style>"
-    ":root{font-family:Arial,sans-serif;color:#17202a;background:#f5f7f9}"
-    "body{margin:0}.top{background:#b91c1c;color:white;padding:16px}.wrap{max-width:420px;margin:auto;padding:16px}"
-    ".card{background:white;border:1px solid #d8dee4;border-radius:8px;padding:16px;margin:12px 0}"
-    "label{display:block;font-weight:700;margin-top:12px}input,button{box-sizing:border-box;width:100%;font:inherit;padding:12px;margin-top:6px;border-radius:6px;border:1px solid #b8c0cc}"
-    "button{background:#b91c1c;color:white;border:0;font-weight:700;margin-top:16px}.muted{color:#5f6b7a;font-size:14px}"
-    "</style></head><body><div class=top><div class=wrap><h2>Barangay Emergency Mesh</h2></div></div>"
-    "<main class=wrap><section class=card><form method=post action=/login>"
-    "<label>Portal PIN<input name=pin maxlength=31 type=password required></label>"
-    "<button type=submit>Unlock Portal</button></form><p class=muted>Use the shared PIN configured for this node.</p></section></main></body></html>";
+
 
 static esp_err_t lora_transfer(uint8_t address, const uint8_t *tx_data, uint8_t *rx_data, size_t length)
 {
@@ -660,7 +575,7 @@ static void build_forward_packet(const mesh_packet_t *parsed, char *packet, size
              31,
              parsed->relay,
              encoded_location,
-             120,
+             48,
              parsed->payload);
 }
 
@@ -2038,18 +1953,78 @@ static esp_err_t require_session(httpd_req_t *request)
     return send_redirect(request, "/");
 }
 
+static esp_err_t send_portal_file(httpd_req_t *request, const char *filename)
+{
+    static const char unavailable_html[] =
+        "<!doctype html><html><body><h2>Portal unavailable</h2><p>The portal files could not be mounted. Restart the node or reflash its filesystem image.</p></body></html>";
+    char path[64];
+    char buffer[PORTAL_FILE_BUFFER_SIZE];
+    FILE *file;
+    esp_err_t result = ESP_OK;
+    size_t bytes_read;
+
+    httpd_resp_set_type(request, "text/html");
+    if (!littlefs_mounted) {
+        httpd_resp_set_status(request, "503 Service Unavailable");
+        return httpd_resp_send(request, unavailable_html, HTTPD_RESP_USE_STRLEN);
+    }
+    if (snprintf(path, sizeof(path), "%s/%s", LITTLEFS_BASE_PATH, filename) >= (int)sizeof(path)) {
+        return ESP_FAIL;
+    }
+    file = fopen(path, "r");
+    if (file == NULL) {
+        ESP_LOGE(TAG, "Portal file not found: %s", path);
+        httpd_resp_set_status(request, "500 Internal Server Error");
+        return httpd_resp_send(request, unavailable_html, HTTPD_RESP_USE_STRLEN);
+    }
+    while ((bytes_read = fread(buffer, 1, sizeof(buffer), file)) > 0) {
+        result = httpd_resp_send_chunk(request, buffer, bytes_read);
+        if (result != ESP_OK) {
+            break;
+        }
+    }
+    if (ferror(file)) {
+        result = ESP_FAIL;
+    }
+    fclose(file);
+    return result == ESP_OK ? httpd_resp_send_chunk(request, NULL, 0) : result;
+}
+
+static void init_littlefs(void)
+{
+    esp_vfs_littlefs_conf_t config = {
+        .base_path = LITTLEFS_BASE_PATH,
+        .partition_label = "storage",
+        .format_if_mount_failed = true,
+        .dont_mount = false,
+    };
+    size_t total_bytes = 0;
+    size_t used_bytes = 0;
+    esp_err_t result = esp_vfs_littlefs_register(&config);
+
+    if (result != ESP_OK) {
+        ESP_LOGE(TAG, "LittleFS mount failed for partition '%s': %s", config.partition_label, esp_err_to_name(result));
+        return;
+    }
+    littlefs_mounted = true;
+    result = esp_littlefs_info(config.partition_label, &total_bytes, &used_bytes);
+    if (result == ESP_OK) {
+        ESP_LOGI(TAG, "LittleFS mounted at %s: %u/%u bytes used", config.base_path, (unsigned int)used_bytes, (unsigned int)total_bytes);
+    } else {
+        ESP_LOGW(TAG, "LittleFS mounted, but space query failed: %s", esp_err_to_name(result));
+    }
+}
+
 static esp_err_t index_handler(httpd_req_t *request)
 {
-    httpd_resp_set_type(request, "text/html");
-
     if (!node_config.configured) {
-        return httpd_resp_send(request, SETUP_HTML, HTTPD_RESP_USE_STRLEN);
+        return send_portal_file(request, "setup.html");
     }
     if (!request_has_session(request)) {
-        return httpd_resp_send(request, LOGIN_HTML, HTTPD_RESP_USE_STRLEN);
+        return send_portal_file(request, "login.html");
     }
 
-    return httpd_resp_send(request, INDEX_HTML, HTTPD_RESP_USE_STRLEN);
+    return send_portal_file(request, "index.html");
 }
 
 static esp_err_t login_handler(httpd_req_t *request)
@@ -2084,8 +2059,7 @@ static esp_err_t login_handler(httpd_req_t *request)
     if (!constant_time_equal((const uint8_t *)pin, (const uint8_t *)node_config.web_pin, sizeof(pin))) {
         failed_login_count++;
         httpd_resp_set_status(request, "403 Forbidden");
-        httpd_resp_set_type(request, "text/html");
-        return httpd_resp_send(request, LOGIN_HTML, HTTPD_RESP_USE_STRLEN);
+        return send_portal_file(request, "login.html");
     }
 
     failed_login_count = 0;
@@ -2158,8 +2132,7 @@ static esp_err_t setup_handler(httpd_req_t *request)
     }
 
     ESP_ERROR_CHECK(save_node_config(&new_config));
-    httpd_resp_set_type(request, "text/html");
-    httpd_resp_send(request, REBOOT_HTML, HTTPD_RESP_USE_STRLEN);
+    send_portal_file(request, "reboot.html");
     vTaskDelay(pdMS_TO_TICKS(500));
     esp_restart();
     return ESP_OK;
@@ -2205,8 +2178,7 @@ static esp_err_t reset_handler(httpd_req_t *request)
     }
 
     erase_node_config();
-    httpd_resp_set_type(request, "text/html");
-    httpd_resp_send(request, REBOOT_HTML, HTTPD_RESP_USE_STRLEN);
+    send_portal_file(request, "reboot.html");
     vTaskDelay(pdMS_TO_TICKS(500));
     esp_restart();
     return ESP_OK;
@@ -2333,8 +2305,6 @@ static void send_route_json_chunk(httpd_req_t *request, const route_entry_t *ent
 static esp_err_t status_handler(httpd_req_t *request)
 {
     wifi_sta_list_t clients = {0};
-    roster_entry_t roster_snapshot[MAX_ROSTER_ENTRIES];
-    route_entry_t route_snapshot[MAX_ROUTE_ENTRIES];
     char escaped_node[FIELD_LEN * 2];
     char escaped_name[FIELD_LEN * 2];
     char escaped_role[FIELD_LEN * 2];
@@ -2354,8 +2324,8 @@ static esp_err_t status_handler(httpd_req_t *request)
     data_lock();
     current_message_count = message_count;
     data_unlock();
-    roster_count = roster_get_snapshot(roster_snapshot, MAX_ROSTER_ENTRIES);
-    route_count = route_table_get_snapshot(route_snapshot, MAX_ROUTE_ENTRIES);
+    roster_count = roster_get_snapshot(roster_snapshot_buffer, MAX_ROSTER_ENTRIES);
+    route_count = route_table_get_snapshot(route_snapshot_buffer, MAX_ROUTE_ENTRIES);
 
     json_escape_string(escaped_node, sizeof(escaped_node), node_id);
     json_escape_string(escaped_name, sizeof(escaped_name), node_config.node_name);
@@ -2366,30 +2336,43 @@ static esp_err_t status_handler(httpd_req_t *request)
 
     httpd_resp_set_type(request, "application/json");
     httpd_resp_send_chunk(request, "{", 1);
-    {
-        char chunk[256];
-        snprintf(chunk, sizeof(chunk),
-                 "\"node\":\"%s\",\"name\":\"%s\",\"node_role\":\"%s\",\"location\":\"%s\",\"ssid\":\"%s\",\"clients\":%u,\"messages\":%u,\"configured\":%s,\"relay\":\"%s\",\"duplicate_warning\":%s,\"time_synced\":%s,\"epoch\":%lu,\"roster\":[",
-                 escaped_node,
-                 escaped_name,
-                 escaped_role,
-                 escaped_location,
-                 escaped_ssid,
-                 clients.num,
-                 (unsigned int)current_message_count,
-                 node_config.configured ? "true" : "false",
-                 escaped_relay,
-                 duplicate_node_id_warning ? "true" : "false",
-                 time_synced ? "true" : "false",
-                 (unsigned long)current_epoch_seconds());
-        httpd_resp_send_chunk(request, chunk, HTTPD_RESP_USE_STRLEN);
-    }
+    httpd_resp_send_chunk(request, "\"node\":\"", HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(request, escaped_node, HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(request, "\",\"name\":\"", HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(request, escaped_name, HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(request, "\",\"node_role\":\"", HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(request, escaped_role, HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(request, "\",\"location\":\"", HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(request, escaped_location, HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(request, "\",\"ssid\":\"", HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(request, escaped_ssid, HTTPD_RESP_USE_STRLEN);
+    char clients_chunk[24];
+    snprintf(clients_chunk, sizeof(clients_chunk), "%u", clients.num);
+    httpd_resp_send_chunk(request, "\",\"clients\":", HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(request, clients_chunk, HTTPD_RESP_USE_STRLEN);
+    char messages_chunk[24];
+    snprintf(messages_chunk, sizeof(messages_chunk), "%u", (unsigned int)current_message_count);
+    httpd_resp_send_chunk(request, ",\"messages\":", HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(request, messages_chunk, HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(request, ",\"configured\":", HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(request, node_config.configured ? "true" : "false", HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(request, ",\"relay\":\"", HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(request, escaped_relay, HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(request, "\",\"duplicate_warning\":", HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(request, duplicate_node_id_warning ? "true" : "false", HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(request, ",\"time_synced\":", HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(request, time_synced ? "true" : "false", HTTPD_RESP_USE_STRLEN);
+    char epoch_chunk[24];
+    snprintf(epoch_chunk, sizeof(epoch_chunk), "%lu", (unsigned long)current_epoch_seconds());
+    httpd_resp_send_chunk(request, ",\"epoch\":", HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(request, epoch_chunk, HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(request, ",\"roster\":[", HTTPD_RESP_USE_STRLEN);
     for (size_t i = 0; i < roster_count; i++) {
-        send_roster_json_chunk(request, &roster_snapshot[i], i == 0);
+        send_roster_json_chunk(request, &roster_snapshot_buffer[i], i == 0);
     }
     httpd_resp_send_chunk(request, "],\"routes\":[", HTTPD_RESP_USE_STRLEN);
     for (size_t i = 0; i < route_count; i++) {
-        send_route_json_chunk(request, &route_snapshot[i], i == 0);
+        send_route_json_chunk(request, &route_snapshot_buffer[i], i == 0);
     }
     httpd_resp_send_chunk(request, "]}", 2);
     return httpd_resp_send_chunk(request, NULL, 0);
@@ -2397,7 +2380,6 @@ static esp_err_t status_handler(httpd_req_t *request)
 
 static esp_err_t messages_handler(httpd_req_t *request)
 {
-    emergency_message_t snapshot[MAX_MESSAGES];
     size_t snapshot_count = 0;
     esp_err_t session_result = require_session(request);
 
@@ -2409,11 +2391,11 @@ static esp_err_t messages_handler(httpd_req_t *request)
     httpd_resp_send_chunk(request, "[", 1);
     data_lock();
     for (size_t i = 0; i < message_count && snapshot_count < MAX_MESSAGES; i++) {
-        snapshot[snapshot_count++] = messages[message_count - 1 - i];
+        message_snapshot_buffer[snapshot_count++] = messages[message_count - 1 - i];
     }
     data_unlock();
     for (size_t i = 0; i < snapshot_count; i++) {
-        write_message_json_chunk(request, &snapshot[i], i == 0);
+        write_message_json_chunk(request, &message_snapshot_buffer[i], i == 0);
     }
     httpd_resp_send_chunk(request, "]", 1);
     httpd_resp_set_type(request, "application/json");
@@ -2431,7 +2413,7 @@ static void start_http_server(void)
     config.server_port = HTTP_PORT;
     config.max_uri_handlers = 16;
     config.uri_match_fn = httpd_uri_match_wildcard;
-    config.stack_size = 12288;
+    config.stack_size = 20480;
 
     const httpd_uri_t routes[] = {
         {.uri = "/", .method = HTTP_GET, .handler = index_handler},
@@ -2587,6 +2569,7 @@ void app_main(void)
     load_node_config();
     load_messages_from_nvs();
     lora_init();
+    init_littlefs();
     xTaskCreate(boot_sync_task, "boot_sync_task", 4096, NULL, 4, NULL);
     xTaskCreate(retry_tracker_task, "retry_tracker_task", 4096, NULL, 3, NULL);
     xTaskCreate(time_sync_task, "time_sync_task", 3072, NULL, 2, NULL);
