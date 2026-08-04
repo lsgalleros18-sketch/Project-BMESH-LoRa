@@ -604,6 +604,36 @@ static void build_forward_packet(const mesh_packet_t *parsed, char *packet, size
              parsed->payload);
 }
 
+typedef struct {
+    mesh_packet_t packet;
+    int rssi;
+    int snr;
+} forward_packet_task_args_t;
+
+static void delayed_forward_task(void *parameter)
+{
+    forward_packet_task_args_t *args = (forward_packet_task_args_t *)parameter;
+    char forward_packet[PACKET_LEN];
+    uint32_t delay_ms = 100 + (esp_random() % 500);
+
+    vTaskDelay(pdMS_TO_TICKS(delay_ms));
+
+    if (packet_seen(args->packet.source, args->packet.id)) {
+        ESP_LOGI(TAG, "Suppressed duplicate forward for %s/%lu after %u ms", args->packet.source, (unsigned long)args->packet.id, (unsigned int)delay_ms);
+        vPortFree(args);
+        vTaskDelete(NULL);
+    }
+
+    if (args->packet.hops > 0) {
+        build_forward_packet(&args->packet, forward_packet, sizeof(forward_packet));
+        ESP_LOGI(TAG, "Forwarding packet %s/%lu after %u ms delay", args->packet.source, (unsigned long)args->packet.id, (unsigned int)delay_ms);
+        lora_transmit(forward_packet);
+    }
+
+    vPortFree(args);
+    vTaskDelete(NULL);
+}
+
 static void send_ack_packet(const mesh_packet_t *parsed)
 {
     char ack_packet[PACKET_LEN];
@@ -1226,11 +1256,17 @@ static void lora_rx_task(void *parameter)
                             }
                         }
 
-                        if (parsed.hops > 0 && !is_for_me) {
-                            char forward_packet[PACKET_LEN];
-                            build_forward_packet(&parsed, forward_packet, sizeof(forward_packet));
-                            ESP_LOGI(TAG, "Relaying packet toward %s with %d hops left", parsed.destination, parsed.hops - 1);
-                            lora_transmit(forward_packet);
+                        if (parsed.hops > 0 && !is_for_me && !is_ack && !is_sync_req && !is_sync_resp && strcmp(parsed.type, "TIME_SYNC") != 0) {
+                            forward_packet_task_args_t *forward_args = (forward_packet_task_args_t *)pvPortMalloc(sizeof(*forward_args));
+
+                            if (forward_args != NULL) {
+                                forward_args->packet = parsed;
+                                forward_args->rssi = rssi;
+                                forward_args->snr = snr;
+                                xTaskCreate(delayed_forward_task, "fwd_pkt", 4096, forward_args, 5, NULL);
+                            } else {
+                                ESP_LOGW(TAG, "Failed to allocate delayed forward args for %s/%lu", parsed.source, (unsigned long)parsed.id);
+                            }
                         }
                     }
                 } else {
