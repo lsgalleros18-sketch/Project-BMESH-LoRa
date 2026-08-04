@@ -442,13 +442,35 @@ static void IRAM_ATTR lora_dio0_isr_handler(void *arg)
 
 static emergency_message_t *next_message_slot(void)
 {
-    emergency_message_t *message;
+    emergency_message_t *message = NULL;
 
     if (message_count < MAX_MESSAGES) {
         message = &messages[message_count++];
     } else {
-        memmove(&messages[0], &messages[1], sizeof(messages[0]) * (MAX_MESSAGES - 1));
-        message = &messages[MAX_MESSAGES - 1];
+        size_t oldest_completed_index = MAX_MESSAGES;
+        TickType_t oldest_completed_tick = 0;
+
+        for (size_t i = 0; i < MAX_MESSAGES; i++) {
+            const emergency_message_t *candidate = &messages[i];
+            bool completed = strcmp(candidate->direction, "RX") == 0 ||
+                             strcmp(candidate->status, "ACKED") == 0 ||
+                             strcmp(candidate->status, "FAILED") == 0;
+
+            if (!completed) {
+                continue;
+            }
+
+            if (oldest_completed_index == MAX_MESSAGES || candidate->stored_epoch <= oldest_completed_tick) {
+                oldest_completed_index = i;
+                oldest_completed_tick = candidate->stored_epoch;
+            }
+        }
+
+        if (oldest_completed_index == MAX_MESSAGES) {
+            return NULL;
+        }
+
+        message = &messages[oldest_completed_index];
     }
 
     memset(message, 0, sizeof(*message));
@@ -1010,6 +1032,12 @@ static void store_received_packet(const char *packet, const mesh_packet_t *parse
     data_lock();
     emergency_message_t *message = next_message_slot();
     bool counter_changed = false;
+
+    if (message == NULL) {
+        ESP_LOGW(TAG, "Dropping received packet because message table is full of active entries");
+        data_unlock();
+        return;
+    }
 
     if (parsed->valid) {
         message->id = parsed->id;
@@ -2006,6 +2034,12 @@ static void queue_message(const char *destination, const char *type, const char 
 
     data_lock();
     emergency_message_t *message = next_message_slot();
+
+    if (message == NULL) {
+        data_unlock();
+        ESP_LOGW(TAG, "Message queue full; unable to enqueue %s -> %s", node_id, destination);
+        return;
+    }
 
     message->id = ++packet_counter;
     copy_field(message->direction, sizeof(message->direction), "TX");
