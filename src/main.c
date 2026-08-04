@@ -14,7 +14,6 @@
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_mac.h"
-#include "esp_timer.h"
 #include "esp_netif.h"
 #include "esp_random.h"
 #include "esp_system.h"
@@ -26,35 +25,95 @@
 #include "lwip/sockets.h"
 #include "nvs.h"
 #include "nvs_flash.h"
-#include "esp_ota_ops.h"
 #include "psa/crypto.h"
-#include "bems_common.h"
+
 #include "bems_crypto.h"
-#include "mesh_protocol.h"
-#include "roster.h"
-#include "route_table.h"
-#include "node_config.h"
-#include "lora_radio.h"
 
 #define AP_CHANNEL 6
 #define AP_MAX_CONNECTIONS 4
 #define DNS_PORT 53
 #define HTTP_PORT 80
 #define MAX_MESSAGES 16
-#define MAX_MAILBOX_ENTRIES 8
+#define MAX_SEEN_PACKETS 64
+#define SEEN_PACKET_TTL_MS 60000
+#define FIELD_LEN 32
+#define SITIO_LEN 24
+#define BARANGAY_LEN 24
+#define MUNICIPALITY_LEN 24
 #define PAYLOAD_LEN 140
 #define PACKET_LEN 320
 #define BOOT_BUTTON_GPIO 0
 #define RGB_LED_GPIO 48
 #define FACTORY_RESET_HOLD_MS 10000
 #define RESET_WARNING_MS 5000
-#define DUPLICATE_NODE_ID_WARNING_MS 60000
 #define CONFIG_NAMESPACE "bems_config"
 #define PACKET_COUNTER_KEY "packet_ctr"
 #define HIGHEST_SEEN_ID_KEY "highest_seen"
+#define DEFAULT_WEB_PIN "123456789"
+#define DEFAULT_NETWORK_KEY "CHANGEME1234567"
 #define SESSION_COOKIE_NAME "BMESH_SESSION"
 #define SESSION_TOKEN_LEN 17
-#define LOW_MESSAGE_TTL_MS (24ULL * 60ULL * 60ULL * 1000ULL)
+
+#define LORA_MISO_GPIO 5
+#define LORA_DIO0_GPIO 16
+#define LORA_SCK_GPIO 7
+#define LORA_MOSI_GPIO 6
+#define LORA_RST_GPIO 4
+#define LORA_NSS_GPIO 8
+#define LORA_SPI_HOST SPI2_HOST
+#define LORA_FREQUENCY_HZ 433000000UL
+#define LORA_MAX_PAYLOAD 255
+
+#define REG_FIFO 0x00
+#define REG_OP_MODE 0x01
+#define REG_FRF_MSB 0x06
+#define REG_FRF_MID 0x07
+#define REG_FRF_LSB 0x08
+#define REG_PA_CONFIG 0x09
+#define REG_LNA 0x0C
+#define REG_FIFO_ADDR_PTR 0x0D
+#define REG_FIFO_TX_BASE_ADDR 0x0E
+#define REG_FIFO_RX_BASE_ADDR 0x0F
+#define REG_FIFO_RX_CURRENT_ADDR 0x10
+#define REG_IRQ_FLAGS 0x12
+#define REG_RX_NB_BYTES 0x13
+#define REG_PKT_SNR_VALUE 0x19
+#define REG_PKT_RSSI_VALUE 0x1A
+#define REG_MODEM_CONFIG_1 0x1D
+#define REG_MODEM_CONFIG_2 0x1E
+#define REG_PREAMBLE_MSB 0x20
+#define REG_PREAMBLE_LSB 0x21
+#define REG_PAYLOAD_LENGTH 0x22
+#define REG_MODEM_CONFIG_3 0x26
+#define REG_SYNC_WORD 0x39
+#define REG_DIO_MAPPING_1 0x40
+#define REG_IRQ_FLAGS_1 0x3E
+#define REG_VERSION 0x42
+
+#define MODE_LONG_RANGE_MODE 0x80
+#define MODE_SLEEP 0x00
+#define MODE_STDBY 0x01
+#define MODE_TX 0x03
+#define MODE_RX_CONTINUOUS 0x05
+
+#define IRQ_TX_DONE_MASK 0x08
+#define IRQ_PAYLOAD_CRC_ERROR_MASK 0x20
+#define IRQ_RX_DONE_MASK 0x40
+
+#define IRQ1_CAD_DONE_MASK 0x04
+#define IRQ1_CAD_DETECTED_MASK 0x01
+
+#define LORA_BW_125_KHZ 0x70
+#define LORA_CR_4_5 0x02
+#define LORA_EXPLICIT_HEADER_MODE 0x00
+#define LORA_SPREADING_FACTOR 7
+#define LORA_TX_CONTINUOUS_MODE 0x00
+#define LORA_RX_PAYLOAD_CRC_ON 0x04
+#define LORA_LOW_DATA_RATE_OPTIMIZE_OFF 0x00
+#define LORA_AGC_AUTO_ON 0x04
+#define LORA_MODEM_CONFIG_1 (LORA_BW_125_KHZ | LORA_CR_4_5 | LORA_EXPLICIT_HEADER_MODE)
+#define LORA_MODEM_CONFIG_2 ((LORA_SPREADING_FACTOR << 4) | LORA_TX_CONTINUOUS_MODE | LORA_RX_PAYLOAD_CRC_ON)
+#define LORA_MODEM_CONFIG_3 (LORA_LOW_DATA_RATE_OPTIMIZE_OFF | LORA_AGC_AUTO_ON)
 
 typedef struct {
     uint32_t id;
@@ -71,28 +130,52 @@ typedef struct {
     uint32_t stored_epoch;
 } emergency_message_t;
 
+typedef struct {
+    bool configured;
+    char node_id[FIELD_LEN];
+    char node_name[FIELD_LEN];
+    location_info_t location;          // was: char location[FIELD_LEN]
+    char default_destination[FIELD_LEN];
+    char web_pin[FIELD_LEN];
+    char network_key[FIELD_LEN];
+} node_config_t;
+
+static void location_encode(const location_info_t *loc, char *out, size_t out_size);
+static void location_decode(const char *encoded, location_info_t *loc);
 static void compute_thread_key(char *out, size_t out_size, const char *source, const char *destination);
+static void copy_field_no_delims(char *destination, size_t destination_size, const char *source);
+static void save_message_to_nvs(const emergency_message_t *message, int slot);
+static void load_messages_from_nvs(void);
 static void json_escape_string(char *destination, size_t destination_size, const char *source);
 static void update_message_status(uint32_t id, const char *source, const char *status);
-static int hops_for_priority(const char *priority);
-static int compute_health_score_for_node(const char *node_id_value, const roster_entry_t *entry);
-static void radio_task(void *parameter);
+static bool lora_channel_clear(void);
 static void retry_tracker_task(void *parameter);
 static void time_sync_task(void *parameter);
-static void adjust_radio_policy(void);
 static uint32_t current_epoch_seconds(void);
 static void apply_time_sync(uint32_t epoch, uint8_t distance);
 static void send_time_sync_packet(uint32_t epoch, uint8_t distance, uint8_t hops);
 static void broadcast_time_sync_if_synced(void);
 static void write_message_json_chunk(httpd_req_t *request, const emergency_message_t *message, bool first);
-static void send_online_discovery(uint8_t hops);
-static esp_err_t discover_handler(httpd_req_t *request);
-static void queue_message(const char *destination, const char *type, const char *priority, const char *payload);
-static esp_err_t export_handler(httpd_req_t *request);
-static esp_err_t ota_handler(httpd_req_t *request);
-static bool message_is_low_and_expired(const emergency_message_t *message);
-static int roster_health_score(const roster_entry_t *entry);
-static bool pin_matches(const char *submitted, const char *stored);
+
+typedef struct {
+    uint32_t id;
+    TickType_t seen_tick;
+    char source[FIELD_LEN];
+} seen_packet_t;
+
+typedef struct {
+    bool valid;
+    uint32_t id;
+    int hops;
+    char source[FIELD_LEN];
+    char destination[FIELD_LEN];
+    char type[FIELD_LEN];
+    char priority[FIELD_LEN];
+    char relay[FIELD_LEN];
+    char location_raw[PACKET_LEN];
+    location_info_t location; // was: char location[FIELD_LEN]
+    char payload[PAYLOAD_LEN];
+} mesh_packet_t;
 
 typedef struct {
     uint32_t id;
@@ -100,88 +183,49 @@ typedef struct {
     char destination[FIELD_LEN];
     char priority[FIELD_LEN];
     uint8_t attempts;
-    uint8_t max_attempts;
-    uint8_t mode;
     TickType_t next_retry_tick;
-    TickType_t retry_interval_ticks;
     bool active;
 } retry_entry_t;
 
-#define RETRY_MODE_ACK 1
-#define RETRY_MODE_BROADCAST 2
-
-typedef struct {
-    char packet[PACKET_LEN];
-} tx_queue_item_t;
-
 static const char *TAG = "barangay_mesh";
+static const char *AP_PASSWORD = "123456789";
 
 static char node_id[FIELD_LEN];
 static char ap_ssid[FIELD_LEN];
+static char session_token[SESSION_TOKEN_LEN];
+static node_config_t node_config;
 static emergency_message_t messages[MAX_MESSAGES];
+static seen_packet_t seen_packets[MAX_SEEN_PACKETS];
 static retry_entry_t retry_entries[MAX_MESSAGES];
 static size_t message_count;
+static size_t seen_packet_count;
 static uint32_t packet_counter;
 static uint32_t highest_seen_id;
 static TickType_t last_send_tick;
+static TickType_t last_login_attempt_tick;
+static uint8_t failed_login_count;
 static int64_t epoch_offset_sec;
 static bool time_synced;
 static uint8_t time_sync_distance;
 static TickType_t last_time_sync_broadcast_tick;
 static httpd_handle_t http_server;
+static spi_device_handle_t lora_spi;
 static rmt_channel_handle_t rgb_led_channel;
 static rmt_encoder_handle_t rgb_led_encoder;
 static bool rgb_led_ready;
+static bool lora_ready;
+static volatile bool radio_in_tx;
 static bool duplicate_node_id_warning;
-static TickType_t duplicate_node_id_warning_tick;
-static bool queue_full_warning;
-static TickType_t queue_full_warning_tick;
-static QueueHandle_t lora_tx_queue;
+static SemaphoreHandle_t lora_dio0_semaphore;
+static SemaphoreHandle_t lora_tx_done_semaphore;
 static SemaphoreHandle_t data_mutex;
-static bool current_request_duress;
-
-typedef struct {
-    bool active;
-    char token[SESSION_TOKEN_LEN];
-    char ip[40];
-    TickType_t last_seen;
-    bool duress;
-} session_record_t;
-static session_record_t *session_find_by_token(const char *token);
-
-typedef struct {
-    bool active;
-    char ip[40];
-    uint8_t failures;
-    TickType_t lock_until;
-} login_lockout_t;
-
-#define MAX_SESSIONS 4
-#define MAX_LOCKOUTS 4
-#ifndef SESSION_IDLE_TIMEOUT_MS
-#define SESSION_IDLE_TIMEOUT_MS 900000
-#endif
-#define LOGIN_BASE_LOCK_MS 30000
-
-static session_record_t sessions[MAX_SESSIONS];
-static login_lockout_t lockouts[MAX_LOCKOUTS];
-typedef struct {
-    bool active;
-    char destination[FIELD_LEN];
-    emergency_message_t message;
-    TickType_t created_tick;
-} mailbox_entry_t;
-static mailbox_entry_t mailbox[MAX_MAILBOX_ENTRIES];
-static bool discovery_active;
-static uint8_t discovery_budget;
-static uint8_t adaptive_spreading_factor = 7;
-static uint8_t adaptive_tx_power = 0x8F;
-
-#define node_config (*node_config_get())
 
 static void copy_field(char *destination, size_t destination_size, const char *source);
 static void save_packet_counter(void);
 static void update_highest_seen_id(uint32_t id);
+static bool lora_transmit(const char *packet);
+static esp_err_t save_node_config(const node_config_t *config);
+
 static void data_lock(void)
 {
     if (data_mutex != NULL) {
@@ -194,63 +238,6 @@ static void data_unlock(void)
     if (data_mutex != NULL) {
         xSemaphoreGive(data_mutex);
     }
-}
-
-static void set_duplicate_node_id_warning(void)
-{
-    duplicate_node_id_warning = true;
-    duplicate_node_id_warning_tick = xTaskGetTickCount();
-}
-
-static bool duplicate_node_id_warning_active(void)
-{
-    if (!duplicate_node_id_warning) {
-        return false;
-    }
-
-    if ((xTaskGetTickCount() - duplicate_node_id_warning_tick) > pdMS_TO_TICKS(DUPLICATE_NODE_ID_WARNING_MS)) {
-        duplicate_node_id_warning = false;
-        return false;
-    }
-
-    return true;
-}
-
-static void set_queue_full_warning(void)
-{
-    queue_full_warning = true;
-    queue_full_warning_tick = xTaskGetTickCount();
-}
-
-static bool queue_full_warning_active(void)
-{
-    if (!queue_full_warning) {
-        return false;
-    }
-
-    if ((xTaskGetTickCount() - queue_full_warning_tick) > pdMS_TO_TICKS(10000)) {
-        queue_full_warning = false;
-        return false;
-    }
-
-    return true;
-}
-
-static bool queue_lora_transmit(const char *packet)
-{
-    tx_queue_item_t item = {0};
-
-    if (lora_tx_queue == NULL) {
-        return lora_transmit(packet);
-    }
-
-    copy_field(item.packet, sizeof(item.packet), packet);
-    if (xQueueSend(lora_tx_queue, &item, 0) != pdTRUE) {
-        ESP_LOGW(TAG, "LoRa TX queue full; dropping packet");
-        return false;
-    }
-
-    return true;
 }
 
 static void rgb_led_init(void)
@@ -330,12 +317,12 @@ static const char INDEX_HTML[] =
     "label{display:block;font-weight:700;margin-top:12px}input,select,textarea,button{box-sizing:border-box;width:100%;font:inherit;padding:12px;margin-top:6px;border-radius:6px;border:1px solid #b8c0cc}"
     "textarea{min-height:94px}button{background:#b91c1c;color:white;border:0;font-weight:700;margin-top:16px}"
     ".row{display:grid;grid-template-columns:1fr 1fr;gap:10px}.muted{color:#5f6b7a;font-size:14px}.msg{border-top:1px solid #e5e7eb;padding:10px 0;word-break:break-word}"
-    ".messenger{display:grid;grid-template-columns:280px 1fr;gap:12px}.thread-list{border-right:1px solid #eef2f7;padding-right:8px}.thread-item{padding:10px 12px;border-radius:8px;cursor:pointer;border:1px solid transparent;margin-bottom:8px;background:#f8fafc}.thread-item.active{border-color:#b91c1c;background:#fff1f2}.thread-item .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:8px;vertical-align:middle}.thread-item.pri-high .dot,.bubble.pri-high{background:#fee2e2}.thread-item.pri-normal .dot,.bubble.pri-normal{background:#fef3c7}.thread-item.pri-low .dot,.bubble.pri-low{background:#d1fae5}.thread-item small{display:block;color:#5f6b7a;margin-top:4px}.thread-view{min-height:220px}.bubble{background:#fff;border:1px solid #dbe2ea;border-radius:12px;padding:10px 12px;margin:10px 0}.bubble .meta{font-size:12px;color:#5f6b7a;margin-bottom:6px}.bubble .debug{font-family:monospace;font-size:12px;white-space:pre-wrap;word-break:break-all;background:#f8fafc;padding:8px;border-radius:8px;margin-top:8px}.location{font-size:12px;color:#475569;margin-top:6px}.toast{position:fixed;right:16px;bottom:16px;background:#17202a;color:#fff;padding:12px 14px;border-radius:10px;box-shadow:0 12px 28px rgba(0,0,0,.18);opacity:0;transform:translateY(12px);transition:.2s;pointer-events:none}.toast.show{opacity:1;transform:translateY(0)}"
+    ".messenger{display:grid;grid-template-columns:280px 1fr;gap:12px}.thread-list{border-right:1px solid #eef2f7;padding-right:8px}.thread-item{padding:10px 12px;border-radius:8px;cursor:pointer;border:1px solid transparent;margin-bottom:8px;background:#f8fafc}.thread-item.active{border-color:#b91c1c;background:#fff1f2}.thread-item small{display:block;color:#5f6b7a;margin-top:4px}.thread-view{min-height:220px}.bubble{background:#fff;border:1px solid #dbe2ea;border-radius:12px;padding:10px 12px;margin:10px 0}.bubble .meta{font-size:12px;color:#5f6b7a;margin-bottom:6px}.location{font-size:12px;color:#475569;margin-top:6px}"
     "@media(max-width:620px){.row{grid-template-columns:1fr}}"
     "@media(max-width:860px){.messenger{grid-template-columns:1fr}.thread-list{border-right:0;padding-right:0}}"
     "</style></head><body><div class=top><div class=wrap><h2>Barangay Emergency Mesh</h2>"
     "<div id=status>Loading status...</div></div></div><main class=wrap>"
-    "<section class=card><h3>Send Message</h3><button id=langBtn type=button>Tagalog</button><form id=sendForm method=post action=/send>"
+    "<section class=card><h3>Send Message</h3><button id=langBtn type=button>Tagalog</button><form method=post action=/send>"
     "<div class=row><label>Your name<input name=sender_name maxlength=31 placeholder='Optional name for accountability'></label><label>Quick templates<select id=template><option value=''>Choose a template</option><option value='Need medical evacuation|MEDICAL|HIGH'>Need medical evacuation</option><option value='Road impassable|EVACUATION|HIGH'>Road impassable</option><option value='All clear|TEST|LOW'>All clear</option></select></label></div>"
     "<fieldset style='border:0;padding:0;margin:0 0 8px 0'><legend style='font-weight:700'>Message scope</legend>"
     "<label><input type=radio name=scope value=announcement checked> Announcement (all nodes)</label>"
@@ -345,57 +332,53 @@ static const char INDEX_HTML[] =
     "<div class=row><label>Emergency Type<select name=type><option>FLOOD</option><option>FIRE</option><option>MEDICAL</option><option>SECURITY</option><option>EVACUATION</option><option>TEST</option></select></label>"
     "<label>Priority<select name=priority><option>HIGH</option><option>NORMAL</option><option>LOW</option></select></label></div>"
     "<label>Message<textarea id=payload name=payload maxlength=159 placeholder='Short emergency message'></textarea></label>"
-    "<button type=submit>Queue / Transmit Message</button></form><p class=muted>The portal sends through the SX1278 using GPIO 5/7/6/8/4/16 at 433 MHz.</p><button id=debugToggle type=button>Show Raw Packet Debug</button></section>"
+    "<button type=submit>Queue / Transmit Message</button></form><p class=muted>The portal sends through the SX1278 using GPIO 5/7/6/8/4/16 at 433 MHz.</p></section>"
     "<section class=card><h3>Messages</h3><div class=messenger><div class=thread-list><div class=muted>Loading threads...</div></div><div class=thread-view><div class=muted>Loading messages...</div></div></div></section>"
-    "<section class=card><h3>Mesh Health</h3><button id=discoverBtn type=button>Refresh Mesh</button><div id=health class=muted>Loading node roster...</div><div id=routes class=muted style='margin-top:12px'>Loading routes...</div></section>"
+    "<section class=card><h3>Mesh Health</h3><div id=health class=muted>Loading node roster...</div></section>"
     "<section class=card><h3>Portal</h3><p class=muted id=warningBox></p><p class=muted>Connect to this Wi-Fi when offline, then open http://192.168.4.1. Android/iOS captive checks are redirected here automatically.</p>"
     "<form method=post action=/settime><label>Set time<input name=epoch id=epochInput readonly></label><button type=submit>Sync Clock</button></form>"
     "<form method=post action=/sync><button type=submit>Sync Messages from Mesh</button></form>"
-    "<p><a href=/api/export>Download incident log</a></p>"
-    "<form method=post action=/ota enctype='application/octet-stream'><label>OTA image<input id=otaFile type=file accept='.bin'></label><button id=otaBtn type=button>Upload OTA</button></form>"
     "<form method=post action=/reset onsubmit='return confirm(\"Factory reset this node and run setup again?\")'><button type=submit>Factory Reset Node</button></form></section>"
     "</main><script>"
-    "const scopeRadios=[...document.querySelectorAll('input[name=scope]')];const destWrap=document.getElementById('destWrap');const dest=document.getElementById('destination');const announcementDest=document.getElementById('announcementDest');const template=document.getElementById('template');const payload=document.getElementById('payload');const langBtn=document.getElementById('langBtn');const debugToggle=document.getElementById('debugToggle');const sendForm=document.getElementById('sendForm');const toast=document.createElement('div');toast.className='toast';document.body.appendChild(toast);let showRawPacket=false;"
+    "const scopeRadios=[...document.querySelectorAll('input[name=scope]')];const destWrap=document.getElementById('destWrap');const dest=document.getElementById('destination');const announcementDest=document.getElementById('announcementDest');const template=document.getElementById('template');const payload=document.getElementById('payload');const langBtn=document.getElementById('langBtn');"
     "function syncScope(){let direct=scopeRadios.some(r=>r.checked&&r.value==='direct');destWrap.style.display=direct?'block':'none';dest.required=direct;dest.disabled=!direct;announcementDest.disabled=direct;if(!direct){announcementDest.value='ALL';}}"
     "template.addEventListener('change',()=>{if(!template.value)return;let parts=template.value.split('|');payload.value=parts[0];document.querySelector('select[name=type]').value=parts[1]||'TEST';document.querySelector('select[name=priority]').value=parts[2]||'NORMAL';template.value='';});"
     "scopeRadios.forEach(r=>r.addEventListener('change',syncScope));syncScope();"
     "let activeThread='ANNOUNCEMENTS';let cachedThreads={};"
     "function escapeHtml(v){return String(v).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('\"','&quot;');}"
     "function locText(x){return [x.location?.sitio||'',x.location?.barangay||'',x.location?.municipality||''].filter(Boolean).join(' \xE2\x86\x92 ');}"
-    "function renderThreads(){let list=document.querySelector('.thread-list');let entries=Object.values(cachedThreads).sort((a,b)=>{if(a.thread_key==='ANNOUNCEMENTS')return -1;if(b.thread_key==='ANNOUNCEMENTS')return 1;return (b.lastSeen||0)-(a.lastSeen||0);});if(!entries.length){list.innerHTML='<div class=muted>No messages yet.</div>';return;}list.innerHTML=entries.map(t=>'<div class=thread-item pri-'+(t.highestPriority||'low')+(t.thread_key===activeThread?' active':'')+' data-thread=\"'+escapeHtml(t.thread_key)+'\"><span class=dot></span><b>'+escapeHtml(t.label)+'</b><small>'+t.messages.length+' message(s)</small></div>').join('');list.querySelectorAll('.thread-item').forEach(el=>el.addEventListener('click',()=>{activeThread=el.dataset.thread;renderThreads();renderThreadView();}));}"
+    "function renderThreads(){let list=document.querySelector('.thread-list');let entries=Object.values(cachedThreads).sort((a,b)=>{if(a.thread_key==='ANNOUNCEMENTS')return -1;if(b.thread_key==='ANNOUNCEMENTS')return 1;return (b.lastSeen||0)-(a.lastSeen||0);});if(!entries.length){list.innerHTML='<div class=muted>No messages yet.</div>';return;}list.innerHTML=entries.map(t=>'<div class=thread-item'+(t.thread_key===activeThread?' active':'')+' data-thread=\"'+escapeHtml(t.thread_key)+'\"><b>'+escapeHtml(t.label)+'</b><small>'+t.messages.length+' message(s)</small></div>').join('');list.querySelectorAll('.thread-item').forEach(el=>el.addEventListener('click',()=>{activeThread=el.dataset.thread;renderThreads();renderThreadView();}));}"
     "function fmtEpoch(e){return e?new Date(e*1000).toLocaleString():'time unknown';}"
-    "function renderThreadView(){let view=document.querySelector('.thread-view');let thread=cachedThreads[activeThread]||Object.values(cachedThreads)[0];if(!thread){view.innerHTML='<div class=muted>No messages yet.</div>';return;}view.innerHTML='<h4>'+escapeHtml(thread.label)+'</h4>'+thread.messages.map(x=>'<div class=bubble pri-'+String(x.priority||'LOW').toLowerCase()+'><div class=meta>'+escapeHtml(x.direction)+' #'+x.id+' | '+escapeHtml(x.type)+' | '+escapeHtml(x.priority)+' | '+escapeHtml(x.thread_key)+' | Status: '+escapeHtml(x.status||'UNKNOWN')+' | '+escapeHtml(fmtEpoch(x.stored_epoch))+(x.status==='SENT'&&x.attempts&&x.max_attempts?' | attempt '+x.attempts+'/'+x.max_attempts:'')+'</div><div><b>From:</b> '+escapeHtml(x.source)+'<br><b>To:</b> '+escapeHtml(x.destination)+'<br><b>Payload:</b> '+escapeHtml(x.payload)+'</div><div class=location><b>Location:</b> '+escapeHtml(locText(x))+'</div>'+((x.thread_key==='ANNOUNCEMENTS')?'<div class=location><b>Sender:</b> '+escapeHtml(x.source)+'</div>':'')+(showRawPacket?'<div class=debug>'+escapeHtml(x.packet)+'</div>':'')+'</div>').join('');}"
-    "const strings={en:{scope:'Message scope',announcement:'Announcement (all nodes)',direct:'Direct message (specific node)',messages:'Messages',health:'Mesh Health',portal:'Portal',send:'Queue / Transmit Message',toggle:'Tagalog',debug:'Show Raw Packet Debug',debugHide:'Hide Raw Packet Debug'},tl:{scope:'Layunin ng mensahe',announcement:'Anunsyo (lahat ng node)',direct:'Direktang mensahe (tiyak na node)',messages:'Mga Mensahe',health:'Kalagayan ng Mesh',portal:'Portal',send:'Ipadala ang Mensahe',toggle:'English',debug:'Ipakita ang Raw Packet Debug',debugHide:'Itago ang Raw Packet Debug'}};let lang='en';function applyLang(){let s=strings[lang];document.querySelector('legend').textContent=s.scope;document.querySelectorAll('label')[2].childNodes[1].textContent=' '+s.announcement;document.querySelectorAll('label')[3].childNodes[1].textContent=' '+s.direct;document.querySelectorAll('section.card h3')[1].textContent=s.messages;document.querySelectorAll('section.card h3')[2].textContent=s.health;document.querySelectorAll('section.card h3')[3].textContent=s.portal;document.querySelector('button[type=submit]').textContent=s.send;langBtn.textContent=s.toggle;debugToggle.textContent=showRawPacket?s.debugHide:s.debug;renderThreads();renderThreadView();}langBtn.addEventListener('click',()=>{lang=lang==='en'?'tl':'en';applyLang();});debugToggle.addEventListener('click',()=>{showRawPacket=!showRawPacket;applyLang();});applyLang();"
+    "function renderThreadView(){let view=document.querySelector('.thread-view');let thread=cachedThreads[activeThread]||Object.values(cachedThreads)[0];if(!thread){view.innerHTML='<div class=muted>No messages yet.</div>';return;}view.innerHTML='<h4>'+escapeHtml(thread.label)+'</h4>'+thread.messages.map(x=>'<div class=bubble><div class=meta>'+escapeHtml(x.direction)+' #'+x.id+' | '+escapeHtml(x.type)+' | '+escapeHtml(x.priority)+' | '+escapeHtml(x.thread_key)+' | Status: '+escapeHtml(x.status||'UNKNOWN')+' | '+escapeHtml(fmtEpoch(x.stored_epoch))+'</div><div><b>From:</b> '+escapeHtml(x.source)+'<br><b>To:</b> '+escapeHtml(x.destination)+'<br><b>Payload:</b> '+escapeHtml(x.payload)+'</div><div class=location><b>Location:</b> '+escapeHtml(locText(x))+'</div>'+((x.thread_key==='ANNOUNCEMENTS')?'<div class=location><b>Sender:</b> '+escapeHtml(x.source)+'</div>':'')+'</div>').join('');}"
+    "const strings={en:{scope:'Message scope',announcement:'Announcement (all nodes)',direct:'Direct message (specific node)',messages:'Messages',health:'Mesh Health',portal:'Portal',send:'Queue / Transmit Message',toggle:'Tagalog'},tl:{scope:'Layunin ng mensahe',announcement:'Anunsyo (lahat ng node)',direct:'Direktang mensahe (tiyak na node)',messages:'Mga Mensahe',health:'Kalagayan ng Mesh',portal:'Portal',send:'Ipadala ang Mensahe',toggle:'English'}};let lang='en';function applyLang(){let s=strings[lang];document.querySelector('legend').textContent=s.scope;document.querySelectorAll('label')[2].childNodes[1].textContent=' '+s.announcement;document.querySelectorAll('label')[3].childNodes[1].textContent=' '+s.direct;document.querySelectorAll('section.card h3')[1].textContent=s.messages;document.querySelectorAll('section.card h3')[2].textContent=s.health;document.querySelectorAll('section.card h3')[3].textContent=s.portal;document.querySelector('button[type=submit]').textContent=s.send;langBtn.textContent=s.toggle;}langBtn.addEventListener('click',()=>{lang=lang==='en'?'tl':'en';applyLang();});applyLang();"
     "document.getElementById('epochInput').value=Math.floor(Date.now()/1000);"
-    "async function load(){try{let s=await fetch('/api/status').then(r=>r.json());document.getElementById('status').innerHTML='Node <b>'+s.node+'</b> | '+s.name+' | '+s.location+' | Role <b>'+((s.node_role)||'unknown')+'</b> | Relay <b>'+s.relay+'</b> | AP <b>'+s.ssid+'</b> | Clients <b>'+s.clients+'</b> | Mailbox <b>'+((s.mailbox)||0)+'</b> | Time <b>'+(s.time_synced?(new Date(s.epoch*1000).toLocaleString()):'unknown')+'</b>';document.getElementById('warningBox').textContent=s.queue_full?'Message queue is full; active items must complete before new ones can be queued.':(s.duplicate_warning?'Possible duplicate node ID on the mesh':'');let m=await fetch('/api/messages').then(r=>r.json());cachedThreads={};m.forEach(x=>{let key=x.thread_key||'UNKNOWN';if(!cachedThreads[key])cachedThreads[key]={thread_key:key,label:key==='ANNOUNCEMENTS'?'Announcements':key,messages:[],highestPriority:'low'};cachedThreads[key].messages.push(x);if((x.priority||'LOW').toUpperCase()==='HIGH')cachedThreads[key].highestPriority='high';else if((x.priority||'LOW').toUpperCase()==='NORMAL'&&cachedThreads[key].highestPriority!=='high')cachedThreads[key].highestPriority='normal';if(key==='ANNOUNCEMENTS')cachedThreads[key].label='Announcements';else if(!cachedThreads[key].label||cachedThreads[key].label===key)cachedThreads[key].label=key;});if(!cachedThreads[activeThread]&&Object.keys(cachedThreads).length){activeThread=Object.keys(cachedThreads)[0];}renderThreads();renderThreadView();let roster=await fetch('/api/roster').then(r=>r.json());let health=document.getElementById('health');health.innerHTML=roster.length?roster.map(p=>'<div class=msg><b>'+escapeHtml(p.node_id)+'</b><br><span class=muted>Score '+escapeHtml(p.health_score||0)+'</span><br><span class=muted>'+(p.online?'Online':'Offline')+'</span><br><span class=muted>Last seen epoch '+escapeHtml(p.last_seen_epoch||0)+'</span><br><span class=muted>RSSI '+escapeHtml(p.last_rssi||0)+' dBm | SNR '+escapeHtml(p.last_snr||0)+' dB</span><br>'+escapeHtml([p.location?.sitio||'',p.location?.barangay||'',p.location?.municipality||''].filter(Boolean).join(' \xE2\x86\x92 ')||'Unknown')+'</div>').join(''):'No peers yet.';let routes=await fetch('/api/routes').then(r=>r.json());document.getElementById('routes').innerHTML=routes.length?routes.map(r=>'<div class=msg><b>'+escapeHtml(r.node_id)+'</b><br><span class=muted>Hops '+escapeHtml(r.best_hop_distance)+'</span>'+((r.stale)?'<br><span class=muted>stale</span>':'')+((r.best_rssi!==undefined)?'<br><span class=muted>RSSI '+escapeHtml(r.best_rssi)+' dBm</span>':'')+'</div>').join(''):'No routes yet.';}catch(e){document.getElementById('health').textContent='Connection issue - retrying...';document.getElementById('routes').textContent='Connection issue - retrying...';}}"
-    "function refreshDiscovery(){fetch('/discover').then(r=>r.json()).then(roster=>{let health=document.getElementById('health');health.innerHTML=roster.length?roster.map(p=>'<div class=msg><b>'+escapeHtml(p.node_id)+'</b><br><span class=muted>'+(p.online?'Online':'Offline')+'</span><br><span class=muted>Last seen epoch '+escapeHtml(p.last_seen_epoch||0)+'</span><br><span class=muted>RSSI '+escapeHtml(p.last_rssi||0)+' dBm | SNR '+escapeHtml(p.last_snr||0)+' dB</span><br>'+escapeHtml([p.location?.sitio||'',p.location?.barangay||'',p.location?.municipality||''].filter(Boolean).join(' \xE2\x86\x92 ')||'Unknown')+'</div>').join(''):'No peers yet.';}).catch(()=>{document.getElementById('health').textContent='Discovery failed - retrying...';});}sendForm.addEventListener('submit',async ev=>{ev.preventDefault();try{let res=await fetch('/send',{method:'POST',body:new FormData(sendForm)});if(!res.ok)throw new Error();toast.textContent='Message queued';toast.classList.add('show');setTimeout(()=>toast.classList.remove('show'),1800);load();}catch(e){toast.textContent='Message send failed';toast.classList.add('show');setTimeout(()=>toast.classList.remove('show'),2200);}});document.getElementById('otaBtn').addEventListener('click',async()=>{let f=document.getElementById('otaFile').files[0];if(!f)return;try{let res=await fetch('/ota',{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:f});if(!res.ok)throw new Error();toast.textContent='OTA accepted';toast.classList.add('show');}catch(e){toast.textContent='OTA failed';toast.classList.add('show');}});document.getElementById('discoverBtn').addEventListener('click',refreshDiscovery);load();setInterval(load,15000);</script></body></html>";
+    "async function load(){let s=await fetch('/api/status').then(r=>r.json());"
+    "document.getElementById('status').innerHTML='Node <b>'+s.node+'</b> | '+s.name+' | '+s.location+' | Relay <b>'+s.relay+'</b> | AP <b>'+s.ssid+'</b> | Clients <b>'+s.clients+'</b> | Time <b>'+(s.time_synced?(new Date(s.epoch*1000).toLocaleString()):'unknown')+'</b>';"
+    "document.getElementById('warningBox').textContent=s.duplicate_warning?'Possible duplicate node ID on the mesh':'';"
+    "let m=await fetch('/api/messages').then(r=>r.json());cachedThreads={};let peers={};m.forEach(x=>{let key=x.thread_key||'UNKNOWN';if(!cachedThreads[key])cachedThreads[key]={thread_key:key,label:key==='ANNOUNCEMENTS'?'Announcements':key,messages:[],lastSeen:0};cachedThreads[key].messages.push(x);cachedThreads[key].lastSeen=Math.max(cachedThreads[key].lastSeen,x.id||0);if(key==='ANNOUNCEMENTS')cachedThreads[key].label='Announcements';else if(!cachedThreads[key].label||cachedThreads[key].label===key)cachedThreads[key].label=key;if(x.source){let p=peers[x.source]||{id:x.source,lastSeen:0,location:''};p.lastSeen=Math.max(p.lastSeen,x.id||0);p.location=locText(x);peers[x.source]=p;}});if(!cachedThreads[activeThread]&&Object.keys(cachedThreads).length){activeThread=Object.keys(cachedThreads)[0];}renderThreads();renderThreadView();let health=document.getElementById('health');let roster=Object.values(peers).sort((a,b)=>b.lastSeen-a.lastSeen);health.innerHTML=roster.length?roster.map(p=>'<div class=msg><b>'+escapeHtml(p.id)+'</b><br><span class=muted>Last seen #'+p.lastSeen+'</span><br>'+escapeHtml(p.location||'Unknown')+'</div>').join(''):'No peers yet.';}"
+    "load();setInterval(load,4000);</script></body></html>";
 
 static const char SETUP_HTML[] =
     "<!doctype html><html><head><meta name=viewport content='width=device-width,initial-scale=1'>"
     "<title>Setup Barangay Mesh</title><style>"
-    ":root{font-family:Arial,sans-serif;color:#17202a;background:linear-gradient(180deg,#eef5f0 0,#f7f9fb 100%)}"
-    "body{margin:0}.top{background:#1f6f5b;color:white;padding:16px}.wrap{max-width:900px;margin:auto;padding:16px}"
-    ".card{background:white;border:1px solid #d8dee4;border-radius:10px;padding:16px;margin:12px 0;box-shadow:0 1px 0 rgba(15,23,42,.03)}"
-    ".grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.full{grid-column:1/-1}"
-    "label{display:block;font-weight:700;margin-top:12px}input,select,button{box-sizing:border-box;width:100%;font:inherit;padding:12px;margin-top:6px;border-radius:8px;border:1px solid #b8c0cc;background:white}"
-    "button{background:#1f6f5b;color:white;border:0;font-weight:700;margin-top:16px;cursor:pointer}"
-    ".muted{color:#5f6b7a;font-size:14px}.warn{background:#fff7d6;border:1px solid #f0d58b;color:#6b4e00;padding:10px 12px;border-radius:8px;margin-top:10px}"
-    ".section{border-left:4px solid #1f6f5b;padding-left:12px;margin:14px 0 6px 0;font-weight:800}.small{font-size:12px}"
-    ".row{display:flex;gap:12px;flex-wrap:wrap}.row label{font-weight:600;margin-top:0}"
+    ":root{font-family:Arial,sans-serif;color:#17202a;background:#f5f7f9}"
+    "body{margin:0}.top{background:#1f6f5b;color:white;padding:16px}.wrap{max-width:720px;margin:auto;padding:16px}"
+    ".card{background:white;border:1px solid #d8dee4;border-radius:8px;padding:16px;margin:12px 0}"
+    "label{display:block;font-weight:700;margin-top:12px}input,button{box-sizing:border-box;width:100%;font:inherit;padding:12px;margin-top:6px;border-radius:6px;border:1px solid #b8c0cc}"
+    "button{background:#1f6f5b;color:white;border:0;font-weight:700;margin-top:16px}.muted{color:#5f6b7a;font-size:14px}"
     "</style></head><body><div class=top><div class=wrap><h2>First-Time Node Setup</h2>"
-    "<p>Progressive wizard mode: keep the node usable, but set the security fields before deploying.</p></div></div>"
-    "<main class=wrap><section class=card><div class=warn id=setupWarn>Fill the security fields below before you hand this node to an operator.</div>"
-    "<form method=post action=/setup><div class=section>1. Network membership</div>"
-    "<div class=grid><label>Network Key<input name=network_key maxlength=31 placeholder='Generated on first boot or enter pairing key' required></label><label>Web PIN<input name=web_pin maxlength=31 placeholder='Generated on first boot' required></label><label>Duress PIN<input name=duress_pin maxlength=31 placeholder='Optional silent PIN'></label><label>Wi-Fi AP Password<input name=ap_password maxlength=31 placeholder='Generated on first boot' required></label></div>"
-    "<div class=section>2. Identity</div><div class=grid><label>Node ID<input name=node_id maxlength=31 placeholder='BRGY-SANISIDRO-01' required></label><label>Node Name<input name=node_name maxlength=31 placeholder='Barangay Hall or House 23' required></label><label>Node Role<select name=node_role><option>relay-only</option><option>relay+message-origin</option><option>gateway</option></select></label></div>"
-    "<div class=section>3. Location</div><div class=grid><label>Sitio / Landmark<input name=sitio maxlength=23 placeholder='Purok 3, Chapel Roof'></label><label>Barangay<input name=barangay maxlength=23 placeholder='San Isidro' required></label><label>Municipality<input name=municipality maxlength=23 placeholder='Cabuyao'></label></div>"
-    "<div class=section>4. Messaging defaults</div><div class=grid><label>Default Destination<input name=default_destination maxlength=31 value='BRGY001' placeholder='ALL or BRGY001'></label><label>Default Priority<select name=default_priority><option>HIGH</option><option selected>NORMAL</option><option>LOW</option></select></label></div>"
-    "<div class=section>5. Advanced</div><div class='muted small'>Advanced radio tuning fields were removed from this setup flow for now.</div>"
-    "<p class='muted small'>This wizard keeps the radio profile fixed. Use the fields above for identity and deployment defaults only.</p>"
+    "<p>Configure this universal mesh node once. All nodes still send, receive, and relay.</p></div></div>"
+    "<main class=wrap><section class=card><form method=post action=/setup>"
+    "<label>Node ID<input name=node_id maxlength=31 placeholder='Example: BRGY001, HH023, RELAY04' required></label>"
+    "<label>Node Name<input name=node_name maxlength=31 placeholder='Example: Barangay Hall or House 23' required></label>"
+    "<label>Sitio / Landmark<input name=sitio maxlength=23 placeholder='Example: Purok 3, Chapel Roof'></label>"
+    "<label>Barangay<input name=barangay maxlength=23 placeholder='Example: San Isidro' required></label>"
+    "<label>Municipality<input name=municipality maxlength=23 placeholder='Example: Cabuyao'></label>"
+    "<label>Default Destination<input name=default_destination maxlength=31 value='BRGY001' placeholder='Example: ALL or BRGY001'></label>"
+    "<label>Web PIN<input name=web_pin maxlength=31 value='123456789' placeholder='Shared portal PIN' required></label>"
+    "<label>Network Key<input name=network_key maxlength=31 value='CHANGEME1234567' placeholder='Shared mesh encryption key' required></label>"
     "<button type=submit>Save Setup and Reboot</button></form>"
-    "<form method=post action=/reset onsubmit='return confirm(\"Factory reset this node and run setup again?\")'><button type=submit style='background:#991b1b'>Factory Reset Node</button></form>"
-    "<p class=muted>Factory reset later by holding BOOT for 10 seconds during startup.</p></section></main>"
-    "<script>const warn=document.getElementById('setupWarn');function updateWarn(){const needed=['network_key','web_pin','ap_password','node_id'];const missing=needed.filter(n=>!document.querySelector('[name='+n+']').value.trim());warn.textContent=missing.length?'Fill: '+missing.join(', '):'Ready to save.';}document.querySelectorAll('input,select').forEach(el=>el.addEventListener('input',updateWarn));updateWarn();</script></body></html>";
+    "<p class=muted>Factory reset later by holding BOOT for 10 seconds during startup.</p></section></main></body></html>";
 
 static const char LOGIN_HTML[] =
     "<!doctype html><html><head><meta name=viewport content='width=device-width,initial-scale=1'>"
@@ -406,187 +389,258 @@ static const char LOGIN_HTML[] =
     "label{display:block;font-weight:700;margin-top:12px}input,button{box-sizing:border-box;width:100%;font:inherit;padding:12px;margin-top:6px;border-radius:6px;border:1px solid #b8c0cc}"
     "button{background:#b91c1c;color:white;border:0;font-weight:700;margin-top:16px}.muted{color:#5f6b7a;font-size:14px}"
     "</style></head><body><div class=top><div class=wrap><h2>Barangay Emergency Mesh</h2></div></div>"
-    "<main class=wrap><section class=card><div id=loginWarn class=muted></div><form method=post action=/login>"
+    "<main class=wrap><section class=card><form method=post action=/login>"
     "<label>Portal PIN<input name=pin maxlength=31 type=password required></label>"
     "<button type=submit>Unlock Portal</button></form><p class=muted>Use the shared PIN configured for this node.</p></section></main></body></html>";
 
-static bool message_is_completed(const emergency_message_t *message)
+static esp_err_t lora_transfer(uint8_t address, const uint8_t *tx_data, uint8_t *rx_data, size_t length)
 {
-    return strcmp(message->direction, "RX") == 0 || strcmp(message->status, "ACKED") == 0 || strcmp(message->status, "FAILED") == 0 || message_is_low_and_expired(message);
-}
+    uint8_t tx_buffer[LORA_MAX_PAYLOAD + 1] = {0};
+    uint8_t rx_buffer[LORA_MAX_PAYLOAD + 1] = {0};
+    spi_transaction_t transaction = {0};
 
-static bool message_is_low_and_expired(const emergency_message_t *message)
-{
-    return strcmp(message->priority, "LOW") == 0 && message->stored_epoch != 0 &&
-           (current_epoch_seconds() - message->stored_epoch) * 1000ULL >= LOW_MESSAGE_TTL_MS;
-}
-
-static void prune_expired_low_messages(void)
-{
-    data_lock();
-    for (size_t i = 0; i < message_count; i++) {
-        if (message_is_low_and_expired(&messages[i])) {
-            copy_field(messages[i].status, sizeof(messages[i].status), "EXPIRED");
-        }
+    if (length > LORA_MAX_PAYLOAD) {
+        return ESP_ERR_INVALID_SIZE;
     }
-    data_unlock();
+
+    tx_buffer[0] = address;
+    if (tx_data != NULL && length > 0) {
+        memcpy(&tx_buffer[1], tx_data, length);
+    }
+
+    transaction.length = (length + 1) * 8;
+    transaction.tx_buffer = tx_buffer;
+    transaction.rx_buffer = rx_buffer;
+
+    esp_err_t result = spi_device_transmit(lora_spi, &transaction);
+    if (result == ESP_OK && rx_data != NULL && length > 0) {
+        memcpy(rx_data, &rx_buffer[1], length);
+    }
+
+    return result;
 }
 
-static bool request_is_duress(httpd_req_t *request)
+static uint8_t lora_read_reg(uint8_t address)
 {
-    char cookie[128] = {0};
-    const char *token;
-    session_record_t *session;
-
-    if (httpd_req_get_hdr_value_str(request, "Cookie", cookie, sizeof(cookie)) != ESP_OK) {
-        return false;
-    }
-    token = strstr(cookie, SESSION_COOKIE_NAME "=");
-    if (token == NULL) {
-        return false;
-    }
-    token += strlen(SESSION_COOKIE_NAME) + 1;
-    session = session_find_by_token(token);
-    return session != NULL && session->duress;
+    uint8_t value = 0;
+    lora_transfer(address & 0x7F, NULL, &value, 1);
+    return value;
 }
 
-static int message_ack_ratio_for_node(const char *node)
+static void lora_write_reg(uint8_t address, uint8_t value)
 {
-    int acked = 0;
-    int total = 0;
-
-    data_lock();
-    for (size_t i = 0; i < message_count; i++) {
-        if (strcmp(messages[i].source, node) != 0) {
-            continue;
-        }
-        if (strcmp(messages[i].status, "ACKED") == 0) {
-            acked++;
-        }
-        if (strcmp(messages[i].direction, "TX") == 0) {
-            total++;
-        }
-    }
-    data_unlock();
-
-    return total == 0 ? 0 : (acked * 100) / total;
+    lora_transfer(address | 0x80, &value, NULL, 1);
 }
 
-static int compute_health_score_for_node(const char *node_id_value, const roster_entry_t *entry)
+static void lora_write_fifo(const uint8_t *data, size_t length)
 {
-    int score = roster_health_score(entry);
-    int ratio = message_ack_ratio_for_node(node_id_value);
-    score += (ratio / 10) - 5;
-    return MAX(0, MIN(100, score));
+    lora_transfer(REG_FIFO | 0x80, data, NULL, length);
 }
 
-static void mailbox_flush_destination(const char *destination);
-static size_t mailbox_active_count(void)
+static void lora_read_fifo(uint8_t *data, size_t length)
 {
-    size_t count = 0;
-    for (size_t i = 0; i < MAX_MAILBOX_ENTRIES; i++) {
-        if (mailbox[i].active) {
-            count++;
-        }
-    }
-    return count;
+    lora_transfer(REG_FIFO & 0x7F, NULL, data, length);
 }
 
-static mailbox_entry_t *mailbox_find_slot(const char *destination)
+static void lora_set_mode(uint8_t mode)
 {
-    mailbox_entry_t *oldest = NULL;
-    for (size_t i = 0; i < MAX_MAILBOX_ENTRIES; i++) {
-        if (mailbox[i].active && strcmp(mailbox[i].destination, destination) == 0) {
-            return &mailbox[i];
-        }
-        if (!mailbox[i].active) {
-            return &mailbox[i];
-        }
-        if (oldest == NULL || mailbox[i].created_tick < oldest->created_tick) {
-            oldest = &mailbox[i];
-        }
-    }
-    return oldest;
+    lora_write_reg(REG_OP_MODE, MODE_LONG_RANGE_MODE | mode);
 }
 
-static void mailbox_store_message(const emergency_message_t *message)
+static bool lora_channel_clear(void)
 {
-    mailbox_entry_t *slot = mailbox_find_slot(message->destination);
-    if (slot == NULL) {
-        return;
-    }
-    slot->active = true;
-    copy_field(slot->destination, sizeof(slot->destination), message->destination);
-    slot->message = *message;
-    slot->created_tick = xTaskGetTickCount();
-}
+    for (int attempt = 0; attempt < 3; attempt++) {
+        lora_set_mode(MODE_STDBY);
+        lora_write_reg(REG_DIO_MAPPING_1, 0x80);
+        lora_write_reg(REG_IRQ_FLAGS, 0xFF);
+        lora_write_reg(REG_IRQ_FLAGS_1, 0xFF);
+        lora_set_mode(0x07); // CAD mode
+        vTaskDelay(pdMS_TO_TICKS(10));
 
-static void mailbox_flush_destination(const char *destination)
-{
-    for (size_t i = 0; i < MAX_MAILBOX_ENTRIES; i++) {
-        if (mailbox[i].active && strcmp(mailbox[i].destination, destination) == 0) {
-            queue_message(mailbox[i].message.destination, mailbox[i].message.type, mailbox[i].message.priority, mailbox[i].message.payload);
-            mailbox[i].active = false;
+        uint8_t irq_flags_1 = lora_read_reg(REG_IRQ_FLAGS_1);
+        lora_write_reg(REG_IRQ_FLAGS, 0xFF);
+        lora_write_reg(REG_IRQ_FLAGS_1, 0xFF);
+        lora_set_mode(MODE_STDBY);
+
+        if ((irq_flags_1 & IRQ1_CAD_DONE_MASK) != 0 && (irq_flags_1 & IRQ1_CAD_DETECTED_MASK) == 0) {
+            return true;
         }
+
+        vTaskDelay(pdMS_TO_TICKS(20 + (attempt * 30)));
     }
+
+    return false;
 }
 
-static void mailbox_prune(void)
+static void lora_set_frequency(uint32_t frequency_hz)
 {
-    for (size_t i = 0; i < MAX_MESSAGES; i++) {
-        if (message_is_low_and_expired(&messages[i])) {
-            copy_field(messages[i].status, sizeof(messages[i].status), "EXPIRED");
-        }
-    }
+    uint64_t frf = ((uint64_t)frequency_hz << 19) / 32000000;
+    lora_write_reg(REG_FRF_MSB, (uint8_t)(frf >> 16));
+    lora_write_reg(REG_FRF_MID, (uint8_t)(frf >> 8));
+    lora_write_reg(REG_FRF_LSB, (uint8_t)(frf >> 0));
 }
 
-static int roster_health_score(const roster_entry_t *entry)
+static void lora_receive_mode(void)
 {
-    int score = 50;
+    lora_write_reg(REG_DIO_MAPPING_1, 0x00);
+    lora_write_reg(REG_IRQ_FLAGS, 0xFF);
+    lora_set_mode(MODE_RX_CONTINUOUS);
+}
 
-    if (entry->online) {
-        score += 20;
-    } else {
-        score -= 20;
+static void IRAM_ATTR lora_dio0_isr_handler(void *arg)
+{
+    BaseType_t high_priority_task_woken = pdFALSE;
+    SemaphoreHandle_t semaphore = radio_in_tx ? lora_tx_done_semaphore : lora_dio0_semaphore;
+
+    if (semaphore != NULL) {
+        xSemaphoreGiveFromISR(semaphore, &high_priority_task_woken);
     }
-    if (entry->last_rssi > -90) score += 15;
-    else if (entry->last_rssi > -110) score += 5;
-    else score -= 10;
-    if (entry->last_snr > 5) score += 10;
-    else if (entry->last_snr < 0) score -= 10;
-    return MAX(0, MIN(100, score));
+
+    if (high_priority_task_woken == pdTRUE) {
+        portYIELD_FROM_ISR();
+    }
 }
 
 static emergency_message_t *next_message_slot(void)
 {
     emergency_message_t *message;
-    size_t evict_index = SIZE_MAX;
 
     if (message_count < MAX_MESSAGES) {
         message = &messages[message_count++];
-        memset(message, 0, sizeof(*message));
-        return message;
+    } else {
+        memmove(&messages[0], &messages[1], sizeof(messages[0]) * (MAX_MESSAGES - 1));
+        message = &messages[MAX_MESSAGES - 1];
     }
 
-    for (size_t i = 0; i < message_count; i++) {
-        if (message_is_completed(&messages[i])) {
-            evict_index = i;
+    memset(message, 0, sizeof(*message));
+    return message;
+}
+
+static bool packet_seen(const char *source, uint32_t id)
+{
+    bool seen = false;
+    TickType_t now = xTaskGetTickCount();
+    TickType_t ttl_ticks = pdMS_TO_TICKS(SEEN_PACKET_TTL_MS);
+
+    data_lock();
+    for (size_t i = 0; i < seen_packet_count;) {
+        if ((now - seen_packets[i].seen_tick) > ttl_ticks) {
+            seen_packets[i] = seen_packets[seen_packet_count - 1];
+            seen_packet_count--;
+            continue;
+        }
+
+        if (seen_packets[i].id == id && strcmp(seen_packets[i].source, source) == 0) {
+            seen = true;
             break;
+        }
+
+        i++;
+    }
+
+    data_unlock();
+    return seen;
+}
+
+static void remember_packet(const char *source, uint32_t id)
+{
+    seen_packet_t *seen_packet;
+    TickType_t now = xTaskGetTickCount();
+    TickType_t ttl_ticks = pdMS_TO_TICKS(SEEN_PACKET_TTL_MS);
+    size_t slot_index = 0;
+
+    data_lock();
+    for (size_t i = 0; i < seen_packet_count;) {
+        if ((now - seen_packets[i].seen_tick) > ttl_ticks) {
+            seen_packets[i] = seen_packets[seen_packet_count - 1];
+            seen_packet_count--;
+            continue;
+        }
+
+        i++;
+    }
+
+    if (seen_packet_count < MAX_SEEN_PACKETS) {
+        seen_packet = &seen_packets[seen_packet_count++];
+    } else {
+        for (size_t i = 1; i < seen_packet_count; i++) {
+            if ((now - seen_packets[i].seen_tick) > (now - seen_packets[slot_index].seen_tick)) {
+                slot_index = i;
+            }
+        }
+        seen_packet = &seen_packets[slot_index];
+    }
+
+    seen_packet->id = id;
+    seen_packet->seen_tick = now;
+    copy_field(seen_packet->source, sizeof(seen_packet->source), source);
+    data_unlock();
+}
+
+static bool parse_mesh_packet(const char *packet, mesh_packet_t *parsed)
+{
+    char packet_copy[PACKET_LEN];
+    char *fields[10] = {0};
+    char *cursor = packet_copy;
+    size_t field_count = 0;
+
+    memset(parsed, 0, sizeof(*parsed));
+    copy_field(packet_copy, sizeof(packet_copy), packet);
+
+    while (field_count < sizeof(fields) / sizeof(fields[0]) && cursor != NULL) {
+        fields[field_count++] = cursor;
+        if (field_count == sizeof(fields) / sizeof(fields[0])) {
+            break;
+        }
+
+        cursor = strchr(cursor, '|');
+        if (cursor != NULL) {
+            *cursor = '\0';
+            cursor++;
         }
     }
 
-    if (evict_index == SIZE_MAX) {
-        return NULL;
+    if (field_count < 10 || strcmp(fields[0], "BEMS") != 0) {
+        return false;
     }
 
-    if (evict_index + 1 < message_count) {
-        memmove(&messages[evict_index], &messages[evict_index + 1], sizeof(messages[0]) * (message_count - evict_index - 1));
-    }
+    parsed->valid = true;
+    parsed->id = (uint32_t)strtoul(fields[1], NULL, 10);
+    parsed->hops = strncmp(fields[6], "HOPS=", 5) == 0 ? atoi(fields[6] + 5) : 0;
+    copy_field(parsed->source, sizeof(parsed->source), fields[2]);
+    copy_field(parsed->destination, sizeof(parsed->destination), fields[3]);
+    copy_field(parsed->type, sizeof(parsed->type), fields[4]);
+    copy_field(parsed->priority, sizeof(parsed->priority), fields[5]);
+    copy_field(parsed->relay, sizeof(parsed->relay), fields[7]);
+    copy_field(parsed->location_raw, sizeof(parsed->location_raw), fields[8]);
+    location_decode(fields[8], &parsed->location);
+    copy_field(parsed->payload, sizeof(parsed->payload), fields[9]);
+    return true;
+}
 
-    message_count--;
-    message = &messages[message_count++];
-    memset(message, 0, sizeof(*message));
-    return message;
+static void build_forward_packet(const mesh_packet_t *parsed, char *packet, size_t packet_size)
+{
+    int next_hops = MAX(parsed->hops - 1, 0);
+    char encoded_location[SITIO_LEN + BARANGAY_LEN + MUNICIPALITY_LEN + 2];
+
+    location_encode(&parsed->location, encoded_location, sizeof(encoded_location));
+
+    snprintf(packet, packet_size, "BEMS|%lu|%.*s|%.*s|%.*s|%.*s|HOPS=%d|%.*s|%s|%.*s",
+             (unsigned long)parsed->id,
+             31,
+             parsed->source,
+             31,
+             parsed->destination,
+             31,
+             parsed->type,
+             31,
+             parsed->priority,
+             next_hops,
+             31,
+             parsed->relay,
+             encoded_location,
+             120,
+             parsed->payload);
 }
 
 static void send_ack_packet(const mesh_packet_t *parsed)
@@ -607,7 +661,7 @@ static void send_ack_packet(const mesh_packet_t *parsed)
              (unsigned long)parsed->id);
 
     ESP_LOGI(TAG, "Sending ACK to %s for packet %lu", parsed->source, (unsigned long)parsed->id);
-    queue_lora_transmit(ack_packet);
+    lora_transmit(ack_packet);
 }
 
 static uint32_t sync_last_id_from_payload(const char *payload)
@@ -630,18 +684,20 @@ static uint32_t ack_id_from_payload(const char *payload)
 
 static bool is_control_packet_type(const char *type)
 {
-    return strcmp(type, "ACK") == 0 || strcmp(type, "SYNC_REQ") == 0 || strcmp(type, "SYNC_RESP") == 0 || strcmp(type, "TIME_SYNC") == 0 ||
-           strcmp(type, "WHO_ONLINE") == 0 || strcmp(type, "WHO_ONLINE_REPLY") == 0 || strcmp(type, "ONLINE_ROSTER") == 0;
+    return strcmp(type, "ACK") == 0 || strcmp(type, "SYNC_REQ") == 0 || strcmp(type, "SYNC_RESP") == 0 || strcmp(type, "TIME_SYNC") == 0;
 }
 
 static uint32_t current_epoch_seconds(void)
 {
-    return (uint32_t)(epoch_offset_sec + (int64_t)(esp_timer_get_time() / 1000000LL));
+    return (uint32_t)(epoch_offset_sec + (int64_t)(xTaskGetTickCount() / configTICK_RATE_HZ));
 }
 
 static void apply_time_sync(uint32_t epoch, uint8_t distance)
 {
-    epoch_offset_sec = (int64_t)epoch - (int64_t)(esp_timer_get_time() / 1000000LL);
+    uint32_t now_ticks = xTaskGetTickCount();
+    uint32_t now_seconds = now_ticks / configTICK_RATE_HZ;
+
+    epoch_offset_sec = (int64_t)epoch - (int64_t)now_seconds;
     time_synced = true;
     time_sync_distance = distance;
     last_time_sync_broadcast_tick = 0;
@@ -685,7 +741,7 @@ static void send_time_sync_packet(uint32_t epoch, uint8_t distance, uint8_t hops
              encoded_location,
              (unsigned long)epoch,
              distance);
-    queue_lora_transmit(packet);
+    lora_transmit(packet);
 }
 
 static void broadcast_time_sync_if_synced(void)
@@ -714,20 +770,6 @@ static void write_message_json_chunk(httpd_req_t *request, const emergency_messa
     char escaped_sitio[SITIO_LEN * 2];
     char escaped_barangay[BARANGAY_LEN * 2];
     char escaped_municipality[MUNICIPALITY_LEN * 2];
-    char attempts_chunk[24];
-    char max_attempts_chunk[24];
-    uint8_t attempts = 0;
-    uint8_t max_attempts = 0;
-
-    data_lock();
-    for (size_t i = 0; i < MAX_MESSAGES; i++) {
-        if (retry_entries[i].active && retry_entries[i].id == message->id && strcmp(retry_entries[i].source, message->source) == 0) {
-            attempts = retry_entries[i].attempts;
-            max_attempts = retry_entries[i].max_attempts;
-            break;
-        }
-    }
-    data_unlock();
 
     json_escape_string(escaped_direction, sizeof(escaped_direction), message->direction);
     json_escape_string(escaped_source, sizeof(escaped_source), message->source);
@@ -765,13 +807,7 @@ static void write_message_json_chunk(httpd_req_t *request, const emergency_messa
     httpd_resp_send_chunk(request, escaped_thread_key, HTTPD_RESP_USE_STRLEN);
     httpd_resp_send_chunk(request, "\",\"status\":\"", HTTPD_RESP_USE_STRLEN);
     httpd_resp_send_chunk(request, escaped_status, HTTPD_RESP_USE_STRLEN);
-    httpd_resp_send_chunk(request, "\",\"attempts\":", HTTPD_RESP_USE_STRLEN);
-    snprintf(attempts_chunk, sizeof(attempts_chunk), "%u", attempts);
-    httpd_resp_send_chunk(request, attempts_chunk, HTTPD_RESP_USE_STRLEN);
-    httpd_resp_send_chunk(request, ",\"max_attempts\":", HTTPD_RESP_USE_STRLEN);
-    snprintf(max_attempts_chunk, sizeof(max_attempts_chunk), "%u", max_attempts);
-    httpd_resp_send_chunk(request, max_attempts_chunk, HTTPD_RESP_USE_STRLEN);
-    httpd_resp_send_chunk(request, ",\"stored_epoch\":", HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(request, "\",\"stored_epoch\":", HTTPD_RESP_USE_STRLEN);
     char epoch_chunk[24];
     snprintf(epoch_chunk, sizeof(epoch_chunk), "%lu", (unsigned long)message->stored_epoch);
     httpd_resp_send_chunk(request, epoch_chunk, HTTPD_RESP_USE_STRLEN);
@@ -791,15 +827,10 @@ static bool is_private_destination_for_other_node(const char *destination, const
 
 static void send_sync_responses(const mesh_packet_t *request)
 {
-    emergency_message_t *snapshot = malloc(sizeof(*snapshot) * MAX_MESSAGES);
+    emergency_message_t snapshot[MAX_MESSAGES];
     size_t snapshot_count = 0;
     uint32_t last_id = sync_last_id_from_payload(request->payload);
     char encoded_location[SITIO_LEN + BARANGAY_LEN + MUNICIPALITY_LEN + 2];
-
-    if (snapshot == NULL) {
-        ESP_LOGW(TAG, "Unable to allocate SYNC_RESP snapshot");
-        return;
-    }
 
     location_encode(&node_config.location, encoded_location, sizeof(encoded_location));
 
@@ -851,10 +882,8 @@ static void send_sync_responses(const mesh_packet_t *request)
         copy_field(sync_response + prefix_len, sizeof(sync_response) - (size_t)prefix_len, original_packet);
 
         ESP_LOGI(TAG, "SYNC_RESP to %s for packet %lu", request->source, (unsigned long)snapshot[i].id);
-        queue_lora_transmit(sync_response);
+        lora_transmit(sync_response);
     }
-
-    free(snapshot);
 }
 
 static void send_sync_request(uint32_t last_id)
@@ -878,7 +907,7 @@ static void send_sync_request(uint32_t last_id)
              (unsigned long)last_id);
 
     ESP_LOGI(TAG, "Broadcasting SYNC_REQ with last_id=%lu", (unsigned long)last_id);
-    queue_lora_transmit(sync_request);
+    lora_transmit(sync_request);
 }
 
 static void send_boot_sync_request(void)
@@ -895,7 +924,7 @@ static void boot_sync_task(void *parameter)
 {
     vTaskDelay(pdMS_TO_TICKS(1500));
 
-    if (node_config.configured) {
+    if (node_config.configured && lora_ready) {
         send_boot_sync_request();
     }
 
@@ -907,12 +936,6 @@ static void store_received_packet(const char *packet, const mesh_packet_t *parse
     data_lock();
     emergency_message_t *message = next_message_slot();
     bool counter_changed = false;
-
-    if (message == NULL) {
-        ESP_LOGW(TAG, "Message table full of active entries; dropping RX packet");
-        data_unlock();
-        return;
-    }
 
     if (parsed->valid) {
         message->id = parsed->id;
@@ -941,7 +964,275 @@ static void store_received_packet(const char *packet, const mesh_packet_t *parse
     if (counter_changed) {
         save_packet_counter();
     }
+    // Only persist messages where this node is source or destination (skip pure relay traffic)
+    if (parsed->valid) {
+        bool is_relevant = (strcmp(parsed->source, node_id) == 0) || 
+                          (strcmp(parsed->destination, node_id) == 0);
+        if (is_relevant) {
+            save_message_to_nvs(message, (int)(message_count - 1));
+        }
+    }
     data_unlock();
+}
+
+static bool lora_transmit(const char *packet)
+{
+    uint8_t frame[LORA_MAX_PAYLOAD];
+    size_t length = 0;
+
+    if (!lora_ready) {
+        ESP_LOGW(TAG, "SX1278 is not ready; packet kept in local log only");
+        return false;
+    }
+
+    if (!bems_encrypt_packet(packet, frame, sizeof(frame), &length)) {
+        ESP_LOGW(TAG, "Failed to encrypt LoRa packet");
+        return false;
+    }
+
+    if (lora_tx_done_semaphore == NULL) {
+        ESP_LOGW(TAG, "LoRa TX done semaphore is not ready");
+        return false;
+    }
+
+    if (!lora_channel_clear()) {
+        ESP_LOGW(TAG, "Channel busy; TX skipped");
+        return false;
+    }
+
+    xSemaphoreTake(lora_tx_done_semaphore, 0);
+    lora_set_mode(MODE_STDBY);
+    lora_write_reg(REG_DIO_MAPPING_1, 0x40);
+    lora_write_reg(REG_IRQ_FLAGS, 0xFF);
+    lora_write_reg(REG_FIFO_ADDR_PTR, 0x00);
+    lora_write_fifo(frame, length);
+    lora_write_reg(REG_PAYLOAD_LENGTH, length);
+    radio_in_tx = true;
+    lora_set_mode(MODE_TX);
+
+    if (xSemaphoreTake(lora_tx_done_semaphore, pdMS_TO_TICKS(5000)) == pdTRUE) {
+        radio_in_tx = false;
+        lora_write_reg(REG_IRQ_FLAGS, 0xFF);
+        lora_receive_mode();
+        ESP_LOGI(TAG, "SX1278 encrypted TX done: %u bytes", (unsigned int)length);
+        return true;
+    }
+
+    radio_in_tx = false;
+    lora_write_reg(REG_IRQ_FLAGS, 0xFF);
+    lora_receive_mode();
+    ESP_LOGW(TAG, "SX1278 TX timeout");
+    return false;
+}
+
+static void lora_rx_task(void *parameter)
+{
+    uint8_t payload[LORA_MAX_PAYLOAD + 1];
+    char decrypted_packet[PACKET_LEN];
+
+    while (true) {
+        if (lora_dio0_semaphore != NULL) {
+            xSemaphoreTake(lora_dio0_semaphore, portMAX_DELAY);
+        }
+
+        if (lora_ready && (lora_read_reg(REG_IRQ_FLAGS) & IRQ_RX_DONE_MASK) != 0) {
+            uint8_t flags = lora_read_reg(REG_IRQ_FLAGS);
+            lora_write_reg(REG_IRQ_FLAGS, 0xFF);
+
+            if ((flags & IRQ_PAYLOAD_CRC_ERROR_MASK) == 0) {
+                uint8_t length = lora_read_reg(REG_RX_NB_BYTES);
+                uint8_t current_addr = lora_read_reg(REG_FIFO_RX_CURRENT_ADDR);
+                int rssi = (int)lora_read_reg(REG_PKT_RSSI_VALUE) - 164;
+                int snr = ((int8_t)lora_read_reg(REG_PKT_SNR_VALUE)) / 4;
+
+                lora_write_reg(REG_FIFO_ADDR_PTR, current_addr);
+                lora_read_fifo(payload, length);
+                payload[length] = '\0';
+
+                if (!bems_decrypt_frame(payload, length, decrypted_packet, sizeof(decrypted_packet))) {
+                    ESP_LOGW(TAG, "Rejected unauthenticated LoRa frame RSSI=%d SNR=%d length=%u", rssi, snr, length);
+                    continue;
+                }
+
+                ESP_LOGI(TAG, "SX1278 RX RSSI=%d SNR=%d: %s", rssi, snr, decrypted_packet);
+                mesh_packet_t parsed;
+                if (parse_mesh_packet(decrypted_packet, &parsed)) {
+                    bool from_self = strcmp(parsed.source, node_id) == 0;
+                    bool is_duplicate = packet_seen(parsed.source, parsed.id);
+                    bool is_broadcast = strcmp(parsed.destination, "ALL") == 0;
+                    bool is_for_me = strcmp(parsed.destination, node_id) == 0;
+                    bool is_ack = strcmp(parsed.type, "ACK") == 0;
+                    bool is_sync_req = strcmp(parsed.type, "SYNC_REQ") == 0;
+                    bool is_sync_resp = strcmp(parsed.type, "SYNC_RESP") == 0;
+
+                    if (!from_self && !is_duplicate) {
+                        remember_packet(parsed.source, parsed.id);
+
+                        if (is_sync_req) {
+                            send_sync_responses(&parsed);
+                            continue;
+                        }
+
+                        if (is_sync_resp) {
+                            mesh_packet_t synced_packet;
+
+                            if (is_for_me && parse_mesh_packet(parsed.payload, &synced_packet) && !packet_seen(synced_packet.source, synced_packet.id)) {
+                                remember_packet(synced_packet.source, synced_packet.id);
+                                store_received_packet(parsed.payload, &synced_packet, rssi, snr);
+                            }
+                            if (is_for_me && strcmp(parsed.source, node_id) != 0) {
+                                duplicate_node_id_warning = true;
+                            }
+                            continue;
+                        }
+
+                        if (strcmp(parsed.type, "TIME_SYNC") == 0) {
+                            uint32_t epoch = time_sync_epoch_from_payload(parsed.payload);
+                            uint8_t dist = time_sync_dist_from_payload(parsed.payload);
+
+                            if ((epoch != 0) && (!time_synced || dist < time_sync_distance)) {
+                                apply_time_sync(epoch, dist);
+                            }
+                            continue;
+                        }
+
+                        if (is_broadcast || is_for_me) {
+                            store_received_packet(decrypted_packet, &parsed, rssi, snr);
+                        }
+
+                        if (is_for_me && !is_ack) {
+                            send_ack_packet(&parsed);
+                        }
+
+                        if (is_ack && is_for_me) {
+                            if (strcmp(parsed.source, node_id) != 0) {
+                                duplicate_node_id_warning = true;
+                            }
+                            uint32_t ack_id = ack_id_from_payload(parsed.payload);
+                            if (ack_id != 0) {
+                                update_message_status(ack_id, node_id, "ACKED");
+                            }
+                        }
+
+                        if (parsed.hops > 0 && !is_for_me) {
+                            char forward_packet[PACKET_LEN];
+                            build_forward_packet(&parsed, forward_packet, sizeof(forward_packet));
+                            ESP_LOGI(TAG, "Relaying packet toward %s with %d hops left", parsed.destination, parsed.hops - 1);
+                            lora_transmit(forward_packet);
+                        }
+                    }
+                } else {
+                    mesh_packet_t raw_packet = {0};
+                    store_received_packet(decrypted_packet, &raw_packet, rssi, snr);
+                }
+            }
+        }
+    }
+}
+
+static void lora_init(void)
+{
+    spi_bus_config_t bus_config = {
+        .mosi_io_num = LORA_MOSI_GPIO,
+        .miso_io_num = LORA_MISO_GPIO,
+        .sclk_io_num = LORA_SCK_GPIO,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = LORA_MAX_PAYLOAD + 1,
+    };
+    spi_device_interface_config_t device_config = {
+        .clock_speed_hz = 1000000,
+        .mode = 0,
+        .spics_io_num = LORA_NSS_GPIO,
+        .queue_size = 1,
+    };
+
+    gpio_config_t reset_config = {
+        .pin_bit_mask = 1ULL << LORA_RST_GPIO,
+        .mode = GPIO_MODE_OUTPUT,
+    };
+    gpio_config_t dio0_config = {
+        .pin_bit_mask = 1ULL << LORA_DIO0_GPIO,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_POSEDGE,
+    };
+
+    ESP_ERROR_CHECK(gpio_config(&reset_config));
+    ESP_ERROR_CHECK(gpio_config(&dio0_config));
+
+    lora_dio0_semaphore = xSemaphoreCreateBinary();
+    if (lora_dio0_semaphore == NULL) {
+        ESP_LOGE(TAG, "Failed to create LoRa DIO0 semaphore");
+        return;
+    }
+
+    lora_tx_done_semaphore = xSemaphoreCreateBinary();
+    if (lora_tx_done_semaphore == NULL) {
+        ESP_LOGE(TAG, "Failed to create LoRa TX done semaphore");
+        return;
+    }
+
+    esp_err_t isr_result = gpio_install_isr_service(0);
+    if (isr_result != ESP_OK && isr_result != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "Failed to install GPIO ISR service: %s", esp_err_to_name(isr_result));
+        return;
+    }
+
+    ESP_ERROR_CHECK(gpio_isr_handler_add(LORA_DIO0_GPIO, lora_dio0_isr_handler, NULL));
+
+    gpio_set_level(LORA_RST_GPIO, 0);
+    vTaskDelay(pdMS_TO_TICKS(10));
+    gpio_set_level(LORA_RST_GPIO, 1);
+    vTaskDelay(pdMS_TO_TICKS(20));
+
+    ESP_ERROR_CHECK(spi_bus_initialize(LORA_SPI_HOST, &bus_config, SPI_DMA_CH_AUTO));
+    ESP_ERROR_CHECK(spi_bus_add_device(LORA_SPI_HOST, &device_config, &lora_spi));
+
+    uint8_t version = lora_read_reg(REG_VERSION);
+    if (version != 0x12) {
+        ESP_LOGE(TAG, "SX1278 not detected. REG_VERSION=0x%02X, check wiring and 3.3V power", version);
+        return;
+    }
+
+    lora_set_mode(MODE_SLEEP);
+    vTaskDelay(pdMS_TO_TICKS(10));
+    lora_set_frequency(LORA_FREQUENCY_HZ);
+    lora_write_reg(REG_FIFO_TX_BASE_ADDR, 0x00);
+    lora_write_reg(REG_FIFO_RX_BASE_ADDR, 0x00);
+    lora_write_reg(REG_LNA, lora_read_reg(REG_LNA) | 0x03);
+    lora_write_reg(REG_MODEM_CONFIG_1, LORA_MODEM_CONFIG_1);
+    lora_write_reg(REG_MODEM_CONFIG_2, LORA_MODEM_CONFIG_2);
+    lora_write_reg(REG_MODEM_CONFIG_3, LORA_MODEM_CONFIG_3);
+    lora_write_reg(REG_PREAMBLE_MSB, 0x00);
+    lora_write_reg(REG_PREAMBLE_LSB, 0x08);
+    lora_write_reg(REG_SYNC_WORD, 0x12);
+    lora_write_reg(REG_PA_CONFIG, 0x8F);
+
+    lora_ready = true;
+    lora_receive_mode();
+    xTaskCreate(lora_rx_task, "lora_rx_task", 4096, NULL, 6, NULL);
+
+    ESP_LOGI(TAG, "SX1278 ready on 433 MHz");
+}
+
+static void copy_field_no_delims(char *destination, size_t destination_size, const char *source)
+{
+    size_t write_index = 0;
+
+    if (destination_size == 0) {
+        return;
+    }
+
+    while (*source != '\0' && write_index < destination_size - 1) {
+        unsigned char c = (unsigned char)*source++;
+        if (c >= 32 && c <= 126 && c != '|' && c != '~') {
+            destination[write_index++] = (char)c;
+        }
+    }
+
+    destination[write_index] = '\0';
 }
 
 static void copy_field(char *destination, size_t destination_size, const char *source)
@@ -960,6 +1251,50 @@ static void copy_field(char *destination, size_t destination_size, const char *s
     }
 
     destination[write_index] = '\0';
+}
+
+static void location_encode(const location_info_t *loc, char *out, size_t out_size)
+{
+    if (out_size == 0) {
+        return;
+    }
+
+    snprintf(out, out_size, "%.*s~%.*s~%.*s",
+             SITIO_LEN - 1, loc->sitio,
+             BARANGAY_LEN - 1, loc->barangay,
+             MUNICIPALITY_LEN - 1, loc->municipality);
+}
+
+static void location_decode(const char *encoded, location_info_t *loc)
+{
+    char buffer[SITIO_LEN + BARANGAY_LEN + MUNICIPALITY_LEN + 2];
+    char *first_sep;
+    char *second_sep;
+
+    memset(loc, 0, sizeof(*loc));
+    if (encoded == NULL) {
+        return;
+    }
+
+    copy_field(buffer, sizeof(buffer), encoded);
+    first_sep = strchr(buffer, '~');
+    if (first_sep == NULL) {
+        copy_field(loc->barangay, sizeof(loc->barangay), buffer);
+        return;
+    }
+
+    *first_sep = '\0';
+    copy_field(loc->sitio, sizeof(loc->sitio), buffer);
+
+    second_sep = strchr(first_sep + 1, '~');
+    if (second_sep == NULL) {
+        copy_field(loc->barangay, sizeof(loc->barangay), first_sep + 1);
+        return;
+    }
+
+    *second_sep = '\0';
+    copy_field(loc->barangay, sizeof(loc->barangay), first_sep + 1);
+    copy_field(loc->municipality, sizeof(loc->municipality), second_sep + 1);
 }
 
 static void compute_thread_key(char *out, size_t out_size, const char *source, const char *destination)
@@ -989,30 +1324,9 @@ static void update_message_status(uint32_t id, const char *source, const char *s
     data_unlock();
 }
 
-static bool message_requires_delivery_ack(const char *destination, const char *priority)
-{
-    return strcmp(destination, "ALL") != 0 && strcmp(priority, "LOW") != 0;
-}
-
 static void retry_tracker_add_by_value(uint32_t id, const char *source, const char *destination, const char *priority)
 {
-    uint8_t max_attempts = 0;
-    TickType_t retry_interval = 0;
-    uint8_t mode = 0;
-
-    if (strcmp(destination, "ALL") == 0) {
-        mode = RETRY_MODE_BROADCAST;
-        max_attempts = 3;
-        retry_interval = pdMS_TO_TICKS(400);
-    } else if (strcmp(priority, "HIGH") == 0) {
-        mode = RETRY_MODE_ACK;
-        max_attempts = 4;
-        retry_interval = pdMS_TO_TICKS(3000);
-    } else if (strcmp(priority, "NORMAL") == 0) {
-        mode = RETRY_MODE_ACK;
-        max_attempts = 2;
-        retry_interval = pdMS_TO_TICKS(8000);
-    } else {
+    if (strcmp(priority, "HIGH") != 0 || strcmp(destination, "ALL") == 0) {
         return;
     }
 
@@ -1025,10 +1339,7 @@ static void retry_tracker_add_by_value(uint32_t id, const char *source, const ch
             copy_field(entry->destination, sizeof(entry->destination), destination);
             copy_field(entry->priority, sizeof(entry->priority), priority);
             entry->attempts = 1;
-            entry->max_attempts = max_attempts;
-            entry->mode = mode;
-            entry->retry_interval_ticks = retry_interval;
-            entry->next_retry_tick = xTaskGetTickCount() + retry_interval;
+            entry->next_retry_tick = xTaskGetTickCount() + pdMS_TO_TICKS(5000);
             entry->active = true;
             break;
         }
@@ -1040,59 +1351,10 @@ static void retry_tracker_task(void *parameter)
 {
     while (true) {
         TickType_t now = xTaskGetTickCount();
+        data_lock();
         for (size_t i = 0; i < MAX_MESSAGES; i++) {
-            retry_entry_t *entry;
-            uint32_t retry_id = 0;
-            char retry_source[FIELD_LEN] = {0};
-            char packet[PACKET_LEN] = {0};
-            bool should_retry = false;
-            bool should_jitter_repeat = false;
-            uint32_t broadcast_retry_id = 0;
-            char broadcast_retry_source[FIELD_LEN] = {0};
-            char broadcast_packet[PACKET_LEN] = {0};
-
-            data_lock();
-            entry = &retry_entries[i];
+            retry_entry_t *entry = &retry_entries[i];
             if (!entry->active || now < entry->next_retry_tick) {
-                data_unlock();
-                continue;
-            }
-
-            if (entry->mode == RETRY_MODE_BROADCAST) {
-                for (size_t j = 0; j < message_count; j++) {
-                    emergency_message_t *message = &messages[j];
-                    if (message->id != entry->id || strcmp(message->source, entry->source) != 0) {
-                        continue;
-                    }
-                    if (entry->attempts >= entry->max_attempts) {
-                        copy_field(message->status, sizeof(message->status), "SENT (no delivery confirmation expected)");
-                        entry->active = false;
-                        break;
-                    }
-                    entry->attempts++;
-                    entry->next_retry_tick = now + entry->retry_interval_ticks + pdMS_TO_TICKS(200 + (esp_random() % 1001));
-                    copy_field(message->status, sizeof(message->status), "SENT (no delivery confirmation expected)");
-                    broadcast_retry_id = entry->id;
-                    copy_field(broadcast_retry_source, sizeof(broadcast_retry_source), entry->source);
-                    copy_field(broadcast_packet, sizeof(broadcast_packet), message->packet);
-                    should_jitter_repeat = true;
-                    break;
-                }
-                data_unlock();
-
-                if (should_jitter_repeat) {
-                    if (!queue_lora_transmit(broadcast_packet)) {
-                        data_lock();
-                        for (size_t j = 0; j < message_count; j++) {
-                            emergency_message_t *message = &messages[j];
-                            if (message->id == broadcast_retry_id && strcmp(message->source, broadcast_retry_source) == 0) {
-                                copy_field(message->status, sizeof(message->status), "FAILED");
-                                break;
-                            }
-                        }
-                        data_unlock();
-                    }
-                }
                 continue;
             }
 
@@ -1105,41 +1367,19 @@ static void retry_tracker_task(void *parameter)
                     entry->active = false;
                     break;
                 }
-                if (roster_is_stale(entry->destination)) {
-                    copy_field(message->status, sizeof(message->status), "FAILED");
-                    entry->active = false;
-                    break;
-                }
-                if (entry->attempts >= entry->max_attempts) {
+                if (entry->attempts >= 3) {
                     copy_field(message->status, sizeof(message->status), "FAILED");
                     entry->active = false;
                     break;
                 }
                 entry->attempts++;
-                entry->next_retry_tick = now + (entry->retry_interval_ticks * entry->attempts);
+                entry->next_retry_tick = now + pdMS_TO_TICKS(5000 * entry->attempts);
+                lora_transmit(message->packet);
                 copy_field(message->status, sizeof(message->status), "SENT");
-                retry_id = entry->id;
-                copy_field(retry_source, sizeof(retry_source), entry->source);
-                copy_field(packet, sizeof(packet), message->packet);
-                should_retry = true;
                 break;
             }
-            data_unlock();
-
-            if (should_retry) {
-                if (!queue_lora_transmit(packet)) {
-                    data_lock();
-                    for (size_t j = 0; j < message_count; j++) {
-                        emergency_message_t *message = &messages[j];
-                        if (message->id == retry_id && strcmp(message->source, retry_source) == 0) {
-                            copy_field(message->status, sizeof(message->status), "FAILED");
-                            break;
-                        }
-                    }
-                    data_unlock();
-                }
-            }
         }
+        data_unlock();
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
@@ -1147,45 +1387,9 @@ static void retry_tracker_task(void *parameter)
 static void time_sync_task(void *parameter)
 {
     while (true) {
-        prune_expired_low_messages();
         broadcast_time_sync_if_synced();
-        adjust_radio_policy();
         vTaskDelay(pdMS_TO_TICKS(30000));
     }
-}
-
-static void adjust_radio_policy(void)
-{
-    roster_entry_t snapshot[MAX_ROSTER_ENTRIES];
-    size_t count = roster_get_snapshot(snapshot, MAX_ROSTER_ENTRIES);
-    int rssi_sum = 0;
-    int seen = 0;
-
-    for (size_t i = 0; i < count; i++) {
-        if (!snapshot[i].online || snapshot[i].last_rssi == 0) {
-            continue;
-        }
-        rssi_sum += snapshot[i].last_rssi;
-        seen++;
-    }
-
-    if (seen == 0) {
-        return;
-    }
-
-    int avg_rssi = rssi_sum / seen;
-    if (avg_rssi < -110) {
-        adaptive_spreading_factor = 9;
-        adaptive_tx_power = 0x8F;
-    } else if (avg_rssi < -100) {
-        adaptive_spreading_factor = 8;
-        adaptive_tx_power = 0x8C;
-    } else {
-        adaptive_spreading_factor = 7;
-        adaptive_tx_power = 0x88;
-    }
-    lora_set_spreading_factor(adaptive_spreading_factor);
-    lora_set_tx_power(adaptive_tx_power);
 }
 
 static void copy_node_id(char *destination, size_t destination_size, const char *source)
@@ -1307,6 +1511,210 @@ static void update_highest_seen_id(uint32_t id)
     }
 }
 
+static void save_message_to_nvs(const emergency_message_t *message, int slot)
+{
+    nvs_handle_t handle;
+    char key[16];
+    esp_err_t result;
+
+    if (slot < 0 || slot >= MAX_MESSAGES) {
+        return;
+    }
+
+    result = nvs_open(CONFIG_NAMESPACE, NVS_READWRITE, &handle);
+    if (result != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to open NVS for message save: %s", esp_err_to_name(result));
+        return;
+    }
+
+    snprintf(key, sizeof(key), "msg_%d", slot);
+    result = nvs_set_blob(handle, key, (const void *)message, sizeof(*message));
+    if (result == ESP_OK) {
+        result = nvs_commit(handle);
+    }
+
+    if (result != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to save message %d to NVS: %s", slot, esp_err_to_name(result));
+    }
+
+    nvs_close(handle);
+}
+
+static void load_messages_from_nvs(void)
+{
+    nvs_handle_t handle;
+    char key[16];
+    esp_err_t result;
+    size_t blob_size;
+    emergency_message_t loaded_message;
+
+    result = nvs_open(CONFIG_NAMESPACE, NVS_READONLY, &handle);
+    if (result != ESP_OK) {
+        ESP_LOGI(TAG, "No saved messages in NVS");
+        return;
+    }
+
+    message_count = 0;
+    for (int i = 0; i < MAX_MESSAGES; i++) {
+        snprintf(key, sizeof(key), "msg_%d", i);
+        blob_size = sizeof(loaded_message);
+        result = nvs_get_blob(handle, key, &loaded_message, &blob_size);
+        
+        if (result == ESP_OK && blob_size == sizeof(loaded_message)) {
+            if (strcmp(loaded_message.direction, "TX") == 0 || strcmp(loaded_message.direction, "RX") == 0) {
+                // Only restore messages where we are source or destination (skip pure relay traffic)
+                bool is_relevant = (strcmp(loaded_message.source, node_id) == 0) ||
+                                   (strcmp(loaded_message.destination, node_id) == 0);
+                if (is_relevant) {
+                    memcpy(&messages[message_count], &loaded_message, sizeof(loaded_message));
+                    message_count++;
+                    if (message_count >= MAX_MESSAGES) {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    ESP_LOGI(TAG, "Loaded %zu messages from NVS", message_count);
+    nvs_close(handle);
+}
+
+static void config_set_defaults(void)
+{
+    node_config.configured = false;
+    copy_field(node_config.node_id, sizeof(node_config.node_id), node_id);
+    copy_field(node_config.node_name, sizeof(node_config.node_name), "Unconfigured Node");
+    copy_field(node_config.location.sitio, sizeof(node_config.location.sitio), "");
+    copy_field(node_config.location.barangay, sizeof(node_config.location.barangay), "Unknown");
+    copy_field(node_config.location.municipality, sizeof(node_config.location.municipality), "");
+    copy_field(node_config.default_destination, sizeof(node_config.default_destination), "BRGY001");
+    copy_field(node_config.web_pin, sizeof(node_config.web_pin), DEFAULT_WEB_PIN);
+    copy_field(node_config.network_key, sizeof(node_config.network_key), DEFAULT_NETWORK_KEY);
+}
+
+static void apply_config_identity(void)
+{
+    if (node_config.configured) {
+        copy_field(node_id, sizeof(node_id), node_config.node_id);
+        snprintf(ap_ssid, sizeof(ap_ssid), "BMesh-%.*s", 24, node_config.node_id);
+    } else {
+        snprintf(ap_ssid, sizeof(ap_ssid), "BMesh-SETUP-%.*s", 18, node_id + 4);
+    }
+}
+
+static void load_node_config(void)
+{
+    nvs_handle_t handle;
+    uint8_t configured = 0;
+    bool migrated_location = false;
+    char legacy_location[FIELD_LEN] = {0};
+
+    config_set_defaults();
+
+    if (nvs_open(CONFIG_NAMESPACE, NVS_READWRITE, &handle) != ESP_OK) {
+        apply_config_identity();
+        return;
+    }
+
+    nvs_get_u8(handle, "configured", &configured);
+    nvs_get_string_or_default(handle, "node_id", node_config.node_id, sizeof(node_config.node_id), node_id);
+    nvs_get_string_or_default(handle, "node_name", node_config.node_name, sizeof(node_config.node_name), "Mesh Node");
+    nvs_get_string_or_default(handle, "default_dest", node_config.default_destination, sizeof(node_config.default_destination), "BRGY001");
+    nvs_get_string_or_default(handle, "web_pin", node_config.web_pin, sizeof(node_config.web_pin), DEFAULT_WEB_PIN);
+    nvs_get_string_or_default(handle, "network_key", node_config.network_key, sizeof(node_config.network_key), DEFAULT_NETWORK_KEY);
+
+    if (nvs_get_str(handle, "sitio", node_config.location.sitio, &(size_t){sizeof(node_config.location.sitio)}) != ESP_OK) {
+        copy_field(node_config.location.sitio, sizeof(node_config.location.sitio), "");
+    }
+    if (nvs_get_str(handle, "barangay", node_config.location.barangay, &(size_t){sizeof(node_config.location.barangay)}) != ESP_OK) {
+        if (nvs_get_str(handle, "location", legacy_location, &(size_t){sizeof(legacy_location)}) == ESP_OK && legacy_location[0] != '\0') {
+            location_decode(legacy_location, &node_config.location);
+            migrated_location = true;
+        } else {
+            copy_field(node_config.location.barangay, sizeof(node_config.location.barangay), "Unknown");
+        }
+    }
+    if (nvs_get_str(handle, "municipality", node_config.location.municipality, &(size_t){sizeof(node_config.location.municipality)}) != ESP_OK) {
+        copy_field(node_config.location.municipality, sizeof(node_config.location.municipality), "");
+    }
+
+    nvs_close(handle);
+
+    node_config.configured = configured == 1;
+    apply_config_identity();
+
+    if (migrated_location) {
+        ESP_LOGI(TAG, "Migrating legacy location key to structured fields");
+        save_node_config(&node_config);
+    }
+
+    char encoded_location[SITIO_LEN + BARANGAY_LEN + MUNICIPALITY_LEN + 2];
+    location_encode(&node_config.location, encoded_location, sizeof(encoded_location));
+
+    ESP_LOGI(TAG, "Config loaded: configured=%d node=%s name=%s location=%s",
+             node_config.configured,
+             node_config.node_id,
+             node_config.node_name,
+             encoded_location);
+}
+
+static esp_err_t save_node_config(const node_config_t *config)
+{
+    nvs_handle_t handle;
+    esp_err_t result = nvs_open(CONFIG_NAMESPACE, NVS_READWRITE, &handle);
+
+    if (result != ESP_OK) {
+        return result;
+    }
+
+    result = nvs_set_u8(handle, "configured", config->configured ? 1 : 0);
+    if (result == ESP_OK) {
+        result = nvs_set_str(handle, "node_id", config->node_id);
+    }
+    if (result == ESP_OK) {
+        result = nvs_set_str(handle, "node_name", config->node_name);
+    }
+    if (result == ESP_OK) {
+        result = nvs_set_str(handle, "sitio", config->location.sitio);
+    }
+    if (result == ESP_OK) {
+        result = nvs_set_str(handle, "barangay", config->location.barangay);
+    }
+    if (result == ESP_OK) {
+        result = nvs_set_str(handle, "municipality", config->location.municipality);
+    }
+    if (result == ESP_OK) {
+        result = nvs_set_str(handle, "default_dest", config->default_destination);
+    }
+    if (result == ESP_OK) {
+        result = nvs_set_str(handle, "web_pin", config->web_pin);
+    }
+    if (result == ESP_OK) {
+        result = nvs_set_str(handle, "network_key", config->network_key);
+    }
+    if (result == ESP_OK) {
+        result = nvs_erase_key(handle, "location");
+    }
+    if (result == ESP_OK) {
+        result = nvs_commit(handle);
+    }
+
+    nvs_close(handle);
+    return result;
+}
+
+static void erase_node_config(void)
+{
+    nvs_handle_t handle;
+
+    if (nvs_open(CONFIG_NAMESPACE, NVS_READWRITE, &handle) == ESP_OK) {
+        nvs_erase_all(handle);
+        nvs_commit(handle);
+        nvs_close(handle);
+    }
+}
+
 static void init_factory_reset_button(void)
 {
     gpio_config_t boot_button_config = {
@@ -1323,18 +1731,10 @@ static void factory_reset_button_task(void *parameter)
 {
     bool warning_blinked = false;
     int held_ms = 0;
-    int press_count = 0;
-    int release_window_ms = 0;
-    bool press_active = false;
 
     while (true) {
         if (gpio_get_level(BOOT_BUTTON_GPIO) == 0) {
-            if (!press_active) {
-                press_active = true;
-                press_count++;
-            }
             held_ms += 100;
-            release_window_ms = 0;
 
             if (!warning_blinked && held_ms >= RESET_WARNING_MS) {
                 ESP_LOGW(TAG, "BOOT held for 5 seconds. Keep holding for factory reset.");
@@ -1345,31 +1745,16 @@ static void factory_reset_button_task(void *parameter)
             if (held_ms >= FACTORY_RESET_HOLD_MS) {
                 ESP_LOGW(TAG, "BOOT held for 10 seconds. Factory reset confirmed.");
                 rgb_led_blink_green(3);
-                node_config_erase();
+                erase_node_config();
                 vTaskDelay(pdMS_TO_TICKS(500));
                 esp_restart();
             }
         } else {
-            if (press_active && held_ms < 700) {
-                if (press_count >= 3 && release_window_ms < 2000) {
-                    queue_message("ALL", "SOS", "HIGH", "Emergency SOS triggered by BOOT button");
-                    press_count = 0;
-                    release_window_ms = 0;
-                }
-            }
-            if (press_active) {
-                release_window_ms += 100;
-            }
             if (held_ms > 0 && held_ms < FACTORY_RESET_HOLD_MS) {
                 ESP_LOGI(TAG, "Factory reset hold cancelled");
             }
-            if (release_window_ms > 2000) {
-                press_count = 0;
-                release_window_ms = 0;
-            }
             held_ms = 0;
             warning_blinked = false;
-            press_active = false;
         }
 
         vTaskDelay(pdMS_TO_TICKS(100));
@@ -1415,10 +1800,6 @@ static bool form_value(const char *body, const char *key, char *output, size_t o
     const size_t key_len = strlen(key);
     const char *cursor = body;
 
-    if (output_size == 0) {
-        return false;
-    }
-
     while (cursor != NULL && *cursor != '\0') {
         if (strncmp(cursor, key, key_len) == 0 && cursor[key_len] == '=') {
             const char *value_start = cursor + key_len + 1;
@@ -1441,198 +1822,6 @@ static bool form_value(const char *body, const char *key, char *output, size_t o
     return false;
 }
 
-static void build_location_string(char *out, size_t out_size)
-{
-    location_encode(&node_config.location, out, out_size);
-}
-
-static void send_control_packet(const char *type, const char *destination, const char *payload)
-{
-    char packet[PACKET_LEN];
-    char encoded_location[SITIO_LEN + BARANGAY_LEN + MUNICIPALITY_LEN + 2];
-    uint32_t message_id;
-
-    data_lock();
-    message_id = ++packet_counter;
-    save_packet_counter();
-    data_unlock();
-
-    build_location_string(encoded_location, sizeof(encoded_location));
-    snprintf(packet, sizeof(packet), "BEMS|%lu|%.*s|%.*s|%s|NORMAL|HOPS=1|RELAY=0|LOC=%s|%s",
-             (unsigned long)message_id,
-             31,
-             node_id,
-             31,
-             destination,
-             type,
-             encoded_location,
-             payload != NULL ? payload : "");
-
-    queue_lora_transmit(packet);
-}
-
-static void send_online_discovery(uint8_t hops)
-{
-    char payload[FIELD_LEN];
-
-    snprintf(payload, sizeof(payload), "budget=%u", hops);
-    discovery_budget = hops;
-    discovery_active = true;
-    send_control_packet("WHO_ONLINE", "ALL", payload);
-}
-
-static bool node_id_collision_detected(const char *proposed_id)
-{
-    char packet[PACKET_LEN];
-    int rssi = 0;
-    int snr = 0;
-    int64_t start_us = esp_timer_get_time();
-
-    {
-        char encoded_location[SITIO_LEN + BARANGAY_LEN + MUNICIPALITY_LEN + 2];
-        uint32_t message_id;
-
-        data_lock();
-        message_id = ++packet_counter;
-        save_packet_counter();
-        data_unlock();
-
-        build_location_string(encoded_location, sizeof(encoded_location));
-        snprintf(packet, sizeof(packet), "BEMS|%lu|%.*s|ALL|ID_CHECK|NORMAL|HOPS=1|RELAY=0|LOC=%s|%s",
-                 (unsigned long)message_id,
-                 31,
-                 node_id,
-                 encoded_location,
-                 proposed_id);
-        queue_lora_transmit(packet);
-    }
-
-    while ((esp_timer_get_time() - start_us) < 2500000LL) {
-        if (!lora_receive_plain_packet(packet, sizeof(packet), &rssi, &snr, 250)) {
-            continue;
-        }
-
-        mesh_packet_t parsed;
-        if (!parse_mesh_packet(packet, &parsed)) {
-            continue;
-        }
-
-        if (strcmp(parsed.type, "ID_TAKEN") == 0 && strcmp(parsed.destination, proposed_id) == 0) {
-            return true;
-        }
-    }
-
-    return false;
-}
-
-static void handle_received_packet(const char *packet, int rssi, int snr)
-{
-    mesh_packet_t parsed;
-    char forward_buf[PACKET_LEN];
-    bool is_self_packet;
-    bool should_relay;
-
-    if (!parse_mesh_packet(packet, &parsed)) {
-        return;
-    }
-
-    if (parsed.valid && strcmp(parsed.source, node_id) != 0) {
-        roster_touch(parsed.source, &parsed.location, time_synced ? current_epoch_seconds() : 0, rssi, snr);
-        route_table_learn(parsed.source, MAX(hops_for_priority(parsed.priority) - parsed.hops, 0), rssi);
-    }
-
-    is_self_packet = strcmp(parsed.source, node_id) == 0;
-    should_relay = parsed.hops > 0;
-    if (!is_self_packet) {
-        if (packet_seen(parsed.source, parsed.id)) {
-            return;
-        }
-        remember_packet(parsed.source, parsed.id);
-    }
-
-    if (strcmp(parsed.type, "ACK") == 0) {
-        update_message_status(ack_id_from_payload(parsed.payload), parsed.source, "ACKED");
-    } else if (strcmp(parsed.type, "SYNC_REQ") == 0) {
-        send_sync_responses(&parsed);
-    } else if (strcmp(parsed.type, "SYNC_RESP") == 0) {
-        // TODO(route-table): not yet consumed
-    } else if (strcmp(parsed.type, "TIME_SYNC") == 0) {
-        apply_time_sync(time_sync_epoch_from_payload(parsed.payload), time_sync_dist_from_payload(parsed.payload));
-    } else if (strcmp(parsed.type, "WHO_ONLINE") == 0) {
-        if (!is_self_packet && parsed.hops > 0) {
-            char reply[PACKET_LEN];
-            char encoded_location[SITIO_LEN + BARANGAY_LEN + MUNICIPALITY_LEN + 2];
-
-            vTaskDelay(pdMS_TO_TICKS(200 + (esp_random() % 1001)));
-            location_encode(&node_config.location, encoded_location, sizeof(encoded_location));
-            snprintf(reply, sizeof(reply), "BEMS|%lu|%.*s|%.*s|WHO_ONLINE_REPLY|NORMAL|HOPS=0|RELAY=0|LOC=%s|%.*s",
-                     (unsigned long)++packet_counter,
-                     31,
-                     node_id,
-                     31,
-                     parsed.source,
-                     encoded_location,
-                     31,
-                     node_id);
-            save_packet_counter();
-            queue_lora_transmit(reply);
-        }
-    } else if (strcmp(parsed.type, "ID_CHECK") == 0 && strcmp(parsed.destination, node_id) == 0 && !is_self_packet) {
-        char reply[PACKET_LEN];
-        char encoded_location[SITIO_LEN + BARANGAY_LEN + MUNICIPALITY_LEN + 2];
-
-        vTaskDelay(pdMS_TO_TICKS(200 + (esp_random() % 1001)));
-        build_location_string(encoded_location, sizeof(encoded_location));
-        snprintf(reply, sizeof(reply), "BEMS|%lu|%.*s|%.*s|ID_TAKEN|NORMAL|HOPS=0|RELAY=0|LOC=%s|%.*s",
-                 (unsigned long)++packet_counter,
-                 31,
-                 node_id,
-                 31,
-                 parsed.source,
-                 encoded_location,
-                 31,
-                 node_id);
-        save_packet_counter();
-        queue_lora_transmit(reply);
-    } else if (strcmp(parsed.type, "ID_TAKEN") == 0) {
-        /* setup-time response only */
-    } else if (!is_control_packet_type(parsed.type)) {
-        store_received_packet(packet, &parsed, rssi, snr);
-        if (message_requires_delivery_ack(parsed.destination, parsed.priority) && strcmp(parsed.destination, node_id) == 0) {
-            send_ack_packet(&parsed);
-        }
-    } else if (strcmp(parsed.type, "WHO_ONLINE_REPLY") == 0) {
-        if (parsed.valid && strcmp(parsed.source, node_id) != 0) {
-            roster_mark_active(parsed.source);
-            mailbox_flush_destination(parsed.source);
-        }
-    }
-
-    if (should_relay) {
-        build_forward_packet(&parsed, forward_buf, sizeof(forward_buf));
-        queue_lora_transmit(forward_buf);
-    }
-}
-
-static void radio_task(void *parameter)
-{
-    tx_queue_item_t item;
-    char packet[PACKET_LEN];
-    int rssi = 0;
-    int snr = 0;
-
-    while (true) {
-        if (lora_tx_queue != NULL && xQueueReceive(lora_tx_queue, &item, 0) == pdTRUE) {
-            lora_transmit(item.packet);
-            continue;
-        }
-
-        if (lora_receive_plain_packet(packet, sizeof(packet), &rssi, &snr, 100)) {
-            handle_received_packet(packet, rssi, snr);
-        }
-    }
-}
-
 static void json_escape_string(char *destination, size_t destination_size, const char *source)
 {
     size_t write_index = 0;
@@ -1642,23 +1831,13 @@ static void json_escape_string(char *destination, size_t destination_size, const
     }
 
     while (*source != '\0' && write_index < destination_size - 1) {
-        unsigned char character = (unsigned char)*source++;
+        char character = *source++;
 
         if ((character == '"' || character == '\\') && write_index < destination_size - 2) {
             destination[write_index++] = '\\';
-            destination[write_index++] = (char)character;
-        } else if (character < 0x20) {
-            if (write_index + 6 >= destination_size) {
-                break;
-            }
-            destination[write_index++] = '\\';
-            destination[write_index++] = 'u';
-            destination[write_index++] = '0';
-            destination[write_index++] = '0';
-            destination[write_index++] = "0123456789ABCDEF"[character >> 4];
-            destination[write_index++] = "0123456789ABCDEF"[character & 0x0F];
+            destination[write_index++] = character;
         } else if (character != '"' && character != '\\') {
-            destination[write_index++] = (char)character;
+            destination[write_index++] = character;
         } else {
             break;
         }
@@ -1724,13 +1903,6 @@ static void queue_message(const char *destination, const char *type, const char 
     data_lock();
     emergency_message_t *message = next_message_slot();
 
-    if (message == NULL) {
-        set_queue_full_warning();
-        data_unlock();
-        ESP_LOGW(TAG, "Message table full of active entries; queueing blocked");
-        return;
-    }
-
     message->id = ++packet_counter;
     copy_field(message->direction, sizeof(message->direction), "TX");
     copy_field(message->source, sizeof(message->source), node_id);
@@ -1748,41 +1920,13 @@ static void queue_message(const char *destination, const char *type, const char 
     copy_field(queued_destination, sizeof(queued_destination), message->destination);
     copy_field(queued_priority, sizeof(queued_priority), message->priority);
     copy_field(packet, sizeof(packet), message->packet);
-    if (strcmp(queued_destination, "ALL") != 0) {
-        route_entry_t route;
-        if (route_table_lookup(queued_destination, &route) && route.best_rssi > -95) {
-            lora_set_tx_power(0x88);
-        } else {
-            lora_set_tx_power(adaptive_tx_power);
-        }
-    } else {
-        lora_set_tx_power(0x8F);
-    }
-    if (current_request_duress) {
-        size_t packet_len = strlen(packet);
-        if (packet_len + 10 < sizeof(packet)) {
-            snprintf(packet + packet_len, sizeof(packet) - packet_len, "|DURESS=1");
-        }
-        copy_field(message->packet, sizeof(message->packet), packet);
-    }
     save_packet_counter();
+    save_message_to_nvs(message, (int)(message_count - 1));
     data_unlock();
-
-    if (strcmp(queued_destination, "ALL") != 0 && roster_is_stale(queued_destination) && strcmp(queued_priority, "LOW") != 0) {
-        data_lock();
-        mailbox_store_message(message);
-        copy_field(message->status, sizeof(message->status), "STORED");
-        data_unlock();
-        return;
-    }
 
     ESP_LOGI(TAG, "LoRa TX pending: %s", packet);
     if (lora_transmit(packet)) {
-        if (strcmp(queued_destination, "ALL") == 0 || !message_requires_delivery_ack(queued_destination, queued_priority)) {
-            update_message_status(queued_id, queued_source, "SENT (no delivery confirmation expected)");
-        } else {
-            update_message_status(queued_id, queued_source, "SENT");
-        }
+        update_message_status(queued_id, queued_source, "SENT");
         retry_tracker_add_by_value(queued_id, queued_source, queued_destination, queued_priority);
     } else {
         update_message_status(queued_id, queued_source, "FAILED");
@@ -1797,185 +1941,18 @@ static esp_err_t send_redirect(httpd_req_t *request, const char *location)
     return ESP_OK;
 }
 
-static void ipv4_to_string(const struct sockaddr_in *addr, char *out, size_t out_size)
-{
-    if (out_size == 0) {
-        return;
-    }
-
-    snprintf(out, out_size, "%u.%u.%u.%u",
-             (unsigned int)((ntohl(addr->sin_addr.s_addr) >> 24) & 0xFF),
-             (unsigned int)((ntohl(addr->sin_addr.s_addr) >> 16) & 0xFF),
-             (unsigned int)((ntohl(addr->sin_addr.s_addr) >> 8) & 0xFF),
-             (unsigned int)(ntohl(addr->sin_addr.s_addr) & 0xFF));
-}
-
-static void request_client_id(httpd_req_t *request, char *out, size_t out_size)
-{
-    int sockfd = httpd_req_to_sockfd(request);
-    struct sockaddr_in addr = {0};
-    socklen_t len = sizeof(addr);
-
-    if (getpeername(sockfd, (struct sockaddr *)&addr, &len) == 0) {
-        ipv4_to_string(&addr, out, out_size);
-        return;
-    }
-
-    snprintf(out, out_size, "sockfd:%d", sockfd);
-}
-
-static void random_session_token(char *out, size_t out_size)
+static void init_session_token(void)
 {
     uint32_t random_a = esp_random();
     uint32_t random_b = esp_random();
-    snprintf(out, out_size, "%08lX%08lX", (unsigned long)random_a, (unsigned long)random_b);
-}
 
-static session_record_t *session_find_by_token(const char *token)
-{
-    for (size_t i = 0; i < MAX_SESSIONS; i++) {
-        if (sessions[i].active && strcmp(sessions[i].token, token) == 0) {
-            return &sessions[i];
-        }
-    }
-    return NULL;
-}
-
-static session_record_t *session_alloc(void)
-{
-    for (size_t i = 0; i < MAX_SESSIONS; i++) {
-        if (!sessions[i].active) {
-            return &sessions[i];
-        }
-    }
-    return &sessions[0];
-}
-
-static void session_touch(session_record_t *session)
-{
-    session->last_seen = xTaskGetTickCount();
-}
-
-static bool cookie_matches_session(const char *cookie_header)
-{
-    const char *cursor = cookie_header;
-    char token[128];
-
-    while (*cursor != '\0') {
-        while (*cursor == ' ' || *cursor == ';') {
-            cursor++;
-        }
-
-        size_t token_len = 0;
-        while (cursor[token_len] != '\0' && cursor[token_len] != ';' && token_len < sizeof(token) - 1) {
-            token[token_len] = cursor[token_len];
-            token_len++;
-        }
-        token[token_len] = '\0';
-
-        if (strncmp(token, SESSION_COOKIE_NAME "=", strlen(SESSION_COOKIE_NAME) + 1) == 0) {
-            const char *value = token + strlen(SESSION_COOKIE_NAME) + 1;
-            session_record_t *session = session_find_by_token(value);
-            if (session != NULL) {
-                session_touch(session);
-                return true;
-            }
-        }
-
-        cursor += token_len;
-        while (*cursor == ';' || *cursor == ' ') {
-            cursor++;
-        }
-    }
-
-    return false;
-}
-
-static void purge_expired_sessions(void)
-{
-    TickType_t now = xTaskGetTickCount();
-    for (size_t i = 0; i < MAX_SESSIONS; i++) {
-        if (sessions[i].active && (now - sessions[i].last_seen) > pdMS_TO_TICKS(SESSION_IDLE_TIMEOUT_MS)) {
-            sessions[i].active = false;
-        }
-    }
-}
-
-static login_lockout_t *lockout_find_or_alloc(const char *client_id)
-{
-    for (size_t i = 0; i < MAX_LOCKOUTS; i++) {
-        if (lockouts[i].active && strcmp(lockouts[i].ip, client_id) == 0) {
-            return &lockouts[i];
-        }
-    }
-    for (size_t i = 0; i < MAX_LOCKOUTS; i++) {
-        if (!lockouts[i].active) {
-            lockouts[i].active = true;
-            copy_field(lockouts[i].ip, sizeof(lockouts[i].ip), client_id);
-            return &lockouts[i];
-        }
-    }
-    return &lockouts[0];
-}
-
-static bool login_is_locked(const char *client_id, TickType_t *remaining)
-{
-    login_lockout_t *lockout = lockout_find_or_alloc(client_id);
-    TickType_t now = xTaskGetTickCount();
-
-    if (lockout->lock_until != 0 && now < lockout->lock_until) {
-        if (remaining != NULL) {
-            *remaining = lockout->lock_until - now;
-        }
-        return true;
-    }
-
-    if (remaining != NULL) {
-        *remaining = 0;
-    }
-    return false;
-}
-
-static void login_record_failure(const char *client_id)
-{
-    login_lockout_t *lockout = lockout_find_or_alloc(client_id);
-    TickType_t lock_ms;
-
-    lockout->failures++;
-    if (lockout->failures < 3) {
-        lockout->lock_until = 0;
-        return;
-    }
-
-    if (lockout->failures == 3) {
-        lock_ms = LOGIN_BASE_LOCK_MS;
-    } else {
-        lock_ms = LOGIN_BASE_LOCK_MS << (lockout->failures - 3);
-    }
-    lockout->lock_until = xTaskGetTickCount() + pdMS_TO_TICKS(lock_ms);
-}
-
-static void login_record_success(const char *client_id)
-{
-    login_lockout_t *lockout = lockout_find_or_alloc(client_id);
-    lockout->failures = 0;
-    lockout->lock_until = 0;
-}
-
-static void issue_session_for_client(const char *client_id, bool duress, char *token_out, size_t token_size)
-{
-    session_record_t *session = session_alloc();
-    random_session_token(session->token, sizeof(session->token));
-    session->active = true;
-    copy_field(session->ip, sizeof(session->ip), client_id);
-    session->duress = duress;
-    session_touch(session);
-    copy_field(token_out, token_size, session->token);
+    snprintf(session_token, sizeof(session_token), "%08lX%08lX", (unsigned long)random_a, (unsigned long)random_b);
 }
 
 static bool request_has_session(httpd_req_t *request)
 {
     char cookie[128] = {0};
+    char expected[64];
 
     if (!node_config.configured) {
         return true;
@@ -1985,7 +1962,8 @@ static bool request_has_session(httpd_req_t *request)
         return false;
     }
 
-    return cookie_matches_session(cookie);
+    snprintf(expected, sizeof(expected), "%s=%s", SESSION_COOKIE_NAME, session_token);
+    return strstr(cookie, expected) != NULL;
 }
 
 static esp_err_t require_session(httpd_req_t *request)
@@ -1997,37 +1975,8 @@ static esp_err_t require_session(httpd_req_t *request)
     return send_redirect(request, "/");
 }
 
-static esp_err_t send_login_page(httpd_req_t *request, const char *warning)
-{
-    char page[2048];
-    char warning_block[256] = {0};
-    const char *warning_text = warning != NULL ? warning : "";
-
-    if (warning_text[0] != '\0') {
-        snprintf(warning_block, sizeof(warning_block), "<div class=warn>%s</div>", warning_text);
-    }
-
-    snprintf(page, sizeof(page),
-             "<!doctype html><html><head><meta name=viewport content='width=device-width,initial-scale=1'>"
-             "<title>Barangay Mesh Login</title><style>"
-             ":root{font-family:Arial,sans-serif;color:#17202a;background:#f5f7f9}"
-             "body{margin:0}.top{background:#b91c1c;color:white;padding:16px}.wrap{max-width:420px;margin:auto;padding:16px}"
-             ".card{background:white;border:1px solid #d8dee4;border-radius:8px;padding:16px;margin:12px 0}"
-             "label{display:block;font-weight:700;margin-top:12px}input,button{box-sizing:border-box;width:100%%;font:inherit;padding:12px;margin-top:6px;border-radius:6px;border:1px solid #b8c0cc}"
-             "button{background:#b91c1c;color:white;border:0;font-weight:700;margin-top:16px}.muted{color:#5f6b7a;font-size:14px}.warn{background:#fff7d6;border:1px solid #e9cf85;color:#6b4e00;padding:10px 12px;border-radius:8px;margin-bottom:12px}"
-             "</style></head><body><div class=top><div class=wrap><h2>Barangay Emergency Mesh</h2></div></div>"
-             "<main class=wrap><section class=card>%s<form method=post action=/login>"
-             "<label>Portal PIN<input name=pin maxlength=31 type=password required></label>"
-             "<button type=submit>Unlock Portal</button></form><p class=muted>Use the shared PIN configured for this node.</p></section></main></body></html>",
-             warning_block);
-
-    httpd_resp_set_type(request, "text/html");
-    return httpd_resp_send(request, page, HTTPD_RESP_USE_STRLEN);
-}
-
 static esp_err_t index_handler(httpd_req_t *request)
 {
-    purge_expired_sessions();
     httpd_resp_set_type(request, "text/html");
 
     if (!node_config.configured) {
@@ -2044,20 +1993,21 @@ static esp_err_t login_handler(httpd_req_t *request)
 {
     char body[96] = {0};
     char pin[FIELD_LEN] = {0};
-    char token[SESSION_TOKEN_LEN];
-    char cookie[128];
-    char client_id[40];
+    char cookie[64];
     int received = 0;
-    TickType_t remaining = 0;
+    TickType_t now = xTaskGetTickCount();
+    uint8_t backoff_seconds;
 
-    request_client_id(request, client_id, sizeof(client_id));
-    if (login_is_locked(client_id, &remaining)) {
-        unsigned int wait_seconds = (unsigned int)pdTICKS_TO_MS(remaining) / 1000U;
-        char message[96];
-        httpd_resp_set_status(request, "429 Too Many Requests");
-        snprintf(message, sizeof(message), "Too many failed attempts. Please wait %u seconds.", wait_seconds);
-        return send_login_page(request, message);
+    // Check brute-force protection
+    if (failed_login_count > 0) {
+        backoff_seconds = MIN(failed_login_count, 6) * (1u << (MIN(failed_login_count, 4) - 1));
+        if ((now - last_login_attempt_tick) < pdMS_TO_TICKS(backoff_seconds * 1000)) {
+            httpd_resp_set_status(request, "429 Too Many Requests");
+            httpd_resp_set_type(request, "text/html");
+            return httpd_resp_send(request, "<!doctype html><html><body><h2>Slow down.</h2><p>Too many login attempts.</p></body></html>", HTTPD_RESP_USE_STRLEN);
+        }
     }
+    last_login_attempt_tick = now;
 
     while (received < request->content_len && received < (int)sizeof(body) - 1) {
         int ret = httpd_req_recv(request, body + received, MIN(request->content_len - received, (int)sizeof(body) - 1 - received));
@@ -2068,42 +2018,17 @@ static esp_err_t login_handler(httpd_req_t *request)
     }
 
     form_value(body, "pin", pin, sizeof(pin));
-    bool matches_web = pin_matches(pin, node_config.web_pin);
-    bool matches_duress = pin_matches(pin, node_config_get_duress_pin());
-
-    if (!matches_web && !matches_duress) {
-        TickType_t remaining_after_failure = 0;
-        unsigned int attempts_left;
-        char message[96];
-
-        login_record_failure(client_id);
+    if (!constant_time_equal((const uint8_t *)pin, (const uint8_t *)node_config.web_pin, sizeof(pin))) {
+        failed_login_count++;
         httpd_resp_set_status(request, "403 Forbidden");
-        if (!login_is_locked(client_id, &remaining_after_failure)) {
-            login_lockout_t *lockout = lockout_find_or_alloc(client_id);
-            attempts_left = lockout->failures < 3 ? (unsigned int)(3 - lockout->failures) : 0U;
-            snprintf(message, sizeof(message), "%u attempt%s remaining before lockout.", attempts_left, attempts_left == 1 ? "" : "s");
-        } else {
-            unsigned int wait_seconds = (unsigned int)pdTICKS_TO_MS(remaining_after_failure) / 1000U;
-            snprintf(message, sizeof(message), "Locked, try again in %u seconds.", wait_seconds);
-        }
-        return send_login_page(request, message);
+        httpd_resp_set_type(request, "text/html");
+        return httpd_resp_send(request, LOGIN_HTML, HTTPD_RESP_USE_STRLEN);
     }
 
-    login_record_success(client_id);
-    issue_session_for_client(client_id, matches_duress, token, sizeof(token));
-    snprintf(cookie, sizeof(cookie), "%s=%s; Path=/; HttpOnly; SameSite=Lax", SESSION_COOKIE_NAME, token);
+    failed_login_count = 0;
+    snprintf(cookie, sizeof(cookie), "%s=%s; Path=/; HttpOnly; SameSite=Lax", SESSION_COOKIE_NAME, session_token);
     httpd_resp_set_hdr(request, "Set-Cookie", cookie);
     return send_redirect(request, "/");
-}
-
-static bool pin_matches(const char *submitted, const char *stored)
-{
-    char padded_submitted[FIELD_LEN] = {0};
-    char padded_stored[FIELD_LEN] = {0};
-
-    copy_field(padded_submitted, sizeof(padded_submitted), submitted);
-    copy_field(padded_stored, sizeof(padded_stored), stored);
-    return constant_time_equal((const uint8_t *)padded_submitted, (const uint8_t *)padded_stored, FIELD_LEN);
 }
 
 static esp_err_t setup_handler(httpd_req_t *request)
@@ -2124,31 +2049,21 @@ static esp_err_t setup_handler(httpd_req_t *request)
     form_value(body, "node_id", raw_node_id, sizeof(raw_node_id));
     copy_node_id(new_config.node_id, sizeof(new_config.node_id), raw_node_id);
     form_value(body, "node_name", new_config.node_name, sizeof(new_config.node_name));
-    form_value(body, "node_role", new_config.node_role, sizeof(new_config.node_role));
     form_value(body, "sitio", new_config.location.sitio, sizeof(new_config.location.sitio));
+    copy_field_no_delims(new_config.location.sitio, sizeof(new_config.location.sitio), new_config.location.sitio);
     form_value(body, "barangay", new_config.location.barangay, sizeof(new_config.location.barangay));
+    copy_field_no_delims(new_config.location.barangay, sizeof(new_config.location.barangay), new_config.location.barangay);
     form_value(body, "municipality", new_config.location.municipality, sizeof(new_config.location.municipality));
+    copy_field_no_delims(new_config.location.municipality, sizeof(new_config.location.municipality), new_config.location.municipality);
     form_value(body, "default_destination", new_config.default_destination, sizeof(new_config.default_destination));
-    form_value(body, "default_priority", new_config.default_priority, sizeof(new_config.default_priority));
     form_value(body, "web_pin", new_config.web_pin, sizeof(new_config.web_pin));
-    form_value(body, "duress_pin", new_config.duress_pin, sizeof(new_config.duress_pin));
     form_value(body, "network_key", new_config.network_key, sizeof(new_config.network_key));
-    form_value(body, "ap_password", new_config.ap_password, sizeof(new_config.ap_password));
     new_config.configured = true;
     if (new_config.node_id[0] == '\0') {
         copy_field(new_config.node_id, sizeof(new_config.node_id), node_id);
     }
-    // Phase 7 will reuse this gate for the Node ID wizard field.
-    if (node_id_collision_detected(new_config.node_id)) {
-        httpd_resp_set_status(request, "409 Conflict");
-        httpd_resp_set_type(request, "text/plain");
-        return httpd_resp_send(request, "Node ID is already in use on the mesh", HTTPD_RESP_USE_STRLEN);
-    }
     if (new_config.node_name[0] == '\0') {
         copy_field(new_config.node_name, sizeof(new_config.node_name), "Mesh Node");
-    }
-    if (new_config.node_role[0] == '\0') {
-        copy_field(new_config.node_role, sizeof(new_config.node_role), "relay-only");
     }
     if (new_config.location.barangay[0] == '\0') {
         copy_field(new_config.location.barangay, sizeof(new_config.location.barangay), "Unknown");
@@ -2156,23 +2071,14 @@ static esp_err_t setup_handler(httpd_req_t *request)
     if (new_config.default_destination[0] == '\0') {
         copy_field(new_config.default_destination, sizeof(new_config.default_destination), "BRGY001");
     }
-    if (new_config.default_priority[0] == '\0') {
-        copy_field(new_config.default_priority, sizeof(new_config.default_priority), "NORMAL");
-    }
     if (new_config.web_pin[0] == '\0') {
-        copy_field(new_config.web_pin, sizeof(new_config.web_pin), node_config_get_web_pin());
-    }
-    if (new_config.duress_pin[0] == '\0') {
-        copy_field(new_config.duress_pin, sizeof(new_config.duress_pin), node_config_get_duress_pin());
+        copy_field(new_config.web_pin, sizeof(new_config.web_pin), DEFAULT_WEB_PIN);
     }
     if (new_config.network_key[0] == '\0') {
-        copy_field(new_config.network_key, sizeof(new_config.network_key), node_config_get_network_key());
-    }
-    if (new_config.ap_password[0] == '\0') {
-        copy_field(new_config.ap_password, sizeof(new_config.ap_password), node_config_get_ap_password());
+        copy_field(new_config.network_key, sizeof(new_config.network_key), DEFAULT_NETWORK_KEY);
     }
 
-    ESP_ERROR_CHECK(node_config_save(&new_config));
+    ESP_ERROR_CHECK(save_node_config(&new_config));
     httpd_resp_set_type(request, "text/html");
     httpd_resp_send(request, "<!doctype html><html><body><h2>Setup saved.</h2><p>Node is restarting.</p></body></html>", HTTPD_RESP_USE_STRLEN);
     vTaskDelay(pdMS_TO_TICKS(500));
@@ -2219,7 +2125,7 @@ static esp_err_t reset_handler(httpd_req_t *request)
         return session_result;
     }
 
-    node_config_erase();
+    erase_node_config();
     httpd_resp_set_type(request, "text/html");
     httpd_resp_send(request, "<!doctype html><html><body><h2>Factory reset complete.</h2><p>Node is restarting into setup mode.</p></body></html>", HTTPD_RESP_USE_STRLEN);
     vTaskDelay(pdMS_TO_TICKS(500));
@@ -2253,8 +2159,11 @@ static esp_err_t send_handler(httpd_req_t *request)
     copy_field(destination, sizeof(destination), node_config.default_destination);
     form_value(body, "sender_name", sender_name, sizeof(sender_name));
     form_value(body, "destination", destination, sizeof(destination));
+    copy_field_no_delims(destination, sizeof(destination), destination);
     form_value(body, "type", type, sizeof(type));
+    copy_field_no_delims(type, sizeof(type), type);
     form_value(body, "priority", priority, sizeof(priority));
+    copy_field_no_delims(priority, sizeof(priority), priority);
     form_value(body, "payload", payload, sizeof(payload));
 
     if ((xTaskGetTickCount() - last_send_tick) < pdMS_TO_TICKS(10000)) {
@@ -2280,9 +2189,7 @@ static esp_err_t send_handler(httpd_req_t *request)
         copy_field(payload, sizeof(payload), named_payload);
     }
 
-    current_request_duress = request_is_duress(request);
     queue_message(destination, type, priority, payload);
-    current_request_duress = false;
     return send_redirect(request, "/");
 }
 
@@ -2301,14 +2208,12 @@ static esp_err_t sync_handler(httpd_req_t *request)
 static esp_err_t status_handler(httpd_req_t *request)
 {
     wifi_sta_list_t clients = {0};
-    char response[640];
+    char response[512];
     char escaped_node[FIELD_LEN * 2];
     char escaped_name[FIELD_LEN * 2];
     char escaped_location[FIELD_LEN * 2];
     char escaped_ssid[FIELD_LEN * 2];
-    char escaped_role[FIELD_LEN * 2];
     char escaped_relay[8];
-    bool duplicate_warning;
     size_t current_message_count;
     esp_err_t session_result = require_session(request);
 
@@ -2325,24 +2230,19 @@ static esp_err_t status_handler(httpd_req_t *request)
     json_escape_string(escaped_name, sizeof(escaped_name), node_config.node_name);
     json_escape_string(escaped_location, sizeof(escaped_location), node_config.location.barangay);
     json_escape_string(escaped_ssid, sizeof(escaped_ssid), ap_ssid);
-    json_escape_string(escaped_role, sizeof(escaped_role), node_config.node_role);
     json_escape_string(escaped_relay, sizeof(escaped_relay), "true");
-    duplicate_warning = duplicate_node_id_warning_active();
 
     snprintf(response, sizeof(response),
-             "{\"node\":\"%s\",\"name\":\"%s\",\"location\":\"%s\",\"ssid\":\"%s\",\"node_role\":\"%s\",\"clients\":%u,\"messages\":%u,\"mailbox\":%u,\"configured\":%s,\"relay\":\"%s\",\"duplicate_warning\":%s,\"queue_full\":%s,\"time_synced\":%s,\"epoch\":%lu}",
+             "{\"node\":\"%s\",\"name\":\"%s\",\"location\":\"%s\",\"ssid\":\"%s\",\"clients\":%u,\"messages\":%u,\"configured\":%s,\"relay\":\"%s\",\"duplicate_warning\":%s,\"time_synced\":%s,\"epoch\":%lu}",
              escaped_node,
              escaped_name,
              escaped_location,
              escaped_ssid,
-             escaped_role,
              clients.num,
              (unsigned int)current_message_count,
-             (unsigned int)mailbox_active_count(),
              node_config.configured ? "true" : "false",
              escaped_relay,
-             duplicate_warning ? "true" : "false",
-             queue_full_warning_active() ? "true" : "false",
+             duplicate_node_id_warning ? "true" : "false",
              time_synced ? "true" : "false",
              (unsigned long)current_epoch_seconds());
 
@@ -2352,7 +2252,7 @@ static esp_err_t status_handler(httpd_req_t *request)
 
 static esp_err_t messages_handler(httpd_req_t *request)
 {
-    emergency_message_t message_copy;
+    emergency_message_t snapshot[MAX_MESSAGES];
     size_t snapshot_count = 0;
     esp_err_t session_result = require_session(request);
 
@@ -2363,241 +2263,16 @@ static esp_err_t messages_handler(httpd_req_t *request)
     httpd_resp_set_type(request, "application/json");
     httpd_resp_send_chunk(request, "[", 1);
     data_lock();
-    snapshot_count = message_count;
-    data_unlock();
-    for (size_t i = 0; i < snapshot_count && i < MAX_MESSAGES; i++) {
-        bool wrote = false;
-
-        data_lock();
-        if (message_count > i) {
-            message_copy = messages[message_count - 1 - i];
-            wrote = true;
-        }
-        data_unlock();
-
-        if (wrote) {
-            write_message_json_chunk(request, &message_copy, i == 0);
-        }
-    }
-    httpd_resp_send_chunk(request, "]", 1);
-    httpd_resp_set_type(request, "application/json");
-    return httpd_resp_send_chunk(request, NULL, 0);
-}
-
-static esp_err_t roster_handler(httpd_req_t *request)
-{
-    roster_entry_t snapshot[MAX_ROSTER_ENTRIES];
-    size_t snapshot_count;
-    bool first = true;
-    esp_err_t session_result = require_session(request);
-
-    if (session_result != ESP_OK) {
-        return session_result;
-    }
-
-    snapshot_count = roster_get_snapshot(snapshot, MAX_ROSTER_ENTRIES);
-    httpd_resp_set_type(request, "application/json");
-    httpd_resp_send_chunk(request, "[", 1);
-    for (size_t i = 0; i < snapshot_count; i++) {
-        char escaped_node[FIELD_LEN * 2];
-        char escaped_sitio[SITIO_LEN * 2];
-        char escaped_barangay[BARANGAY_LEN * 2];
-        char escaped_municipality[MUNICIPALITY_LEN * 2];
-        char json[512];
-
-        json_escape_string(escaped_node, sizeof(escaped_node), snapshot[i].node_id);
-        json_escape_string(escaped_sitio, sizeof(escaped_sitio), snapshot[i].location.sitio);
-        json_escape_string(escaped_barangay, sizeof(escaped_barangay), snapshot[i].location.barangay);
-        json_escape_string(escaped_municipality, sizeof(escaped_municipality), snapshot[i].location.municipality);
-
-        snprintf(json, sizeof(json),
-                 "%s{\"node_id\":\"%s\",\"sitio\":\"%s\",\"barangay\":\"%s\",\"municipality\":\"%s\",\"last_seen_epoch\":%lu,\"last_rssi\":%d,\"last_snr\":%d,\"health_score\":%d,\"online\":%s}",
-                 first ? "" : ",",
-                 escaped_node,
-                 escaped_sitio,
-                 escaped_barangay,
-                 escaped_municipality,
-                 (unsigned long)snapshot[i].last_seen_epoch,
-                 snapshot[i].last_rssi,
-                 snapshot[i].last_snr,
-                 compute_health_score_for_node(snapshot[i].node_id, &snapshot[i]),
-                 snapshot[i].online ? "true" : "false");
-        first = false;
-        httpd_resp_send_chunk(request, json, HTTPD_RESP_USE_STRLEN);
-    }
-    httpd_resp_send_chunk(request, "]", 1);
-    return httpd_resp_send_chunk(request, NULL, 0);
-}
-
-static esp_err_t routes_handler(httpd_req_t *request)
-{
-    route_entry_t snapshot[MAX_ROUTE_ENTRIES];
-    size_t snapshot_count;
-    bool first = true;
-    esp_err_t session_result = require_session(request);
-
-    if (session_result != ESP_OK) {
-        return session_result;
-    }
-
-    snapshot_count = route_table_get_snapshot(snapshot, MAX_ROUTE_ENTRIES);
-    httpd_resp_set_type(request, "application/json");
-    httpd_resp_send_chunk(request, "[", 1);
-    for (size_t i = 0; i < snapshot_count; i++) {
-        char escaped_node[FIELD_LEN * 2];
-        char json[160];
-
-        json_escape_string(escaped_node, sizeof(escaped_node), snapshot[i].node_id);
-        snprintf(json, sizeof(json),
-                 "%s{\"node_id\":\"%s\",\"best_hop_distance\":%d,\"best_rssi\":%d,\"stale\":%s}",
-                 first ? "" : ",",
-                 escaped_node,
-                 snapshot[i].best_hop_distance,
-                 snapshot[i].best_rssi,
-                 snapshot[i].stale ? "true" : "false");
-        first = false;
-        httpd_resp_send_chunk(request, json, HTTPD_RESP_USE_STRLEN);
-    }
-    httpd_resp_send_chunk(request, "]", 1);
-    return httpd_resp_send_chunk(request, NULL, 0);
-}
-
-static esp_err_t discover_handler(httpd_req_t *request)
-{
-    roster_entry_t snapshot[MAX_ROSTER_ENTRIES];
-    size_t snapshot_count;
-    TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(2500);
-    esp_err_t session_result = require_session(request);
-
-    if (session_result != ESP_OK) {
-        return session_result;
-    }
-
-    send_online_discovery(4);
-    while (xTaskGetTickCount() < deadline) {
-        vTaskDelay(pdMS_TO_TICKS(100));
-    }
-    discovery_active = false;
-
-    snapshot_count = roster_get_snapshot(snapshot, MAX_ROSTER_ENTRIES);
-    httpd_resp_set_type(request, "application/json");
-    httpd_resp_send_chunk(request, "[", 1);
-    for (size_t i = 0; i < snapshot_count; i++) {
-        char escaped_node[FIELD_LEN * 2];
-        char escaped_sitio[SITIO_LEN * 2];
-        char escaped_barangay[BARANGAY_LEN * 2];
-        char escaped_municipality[MUNICIPALITY_LEN * 2];
-        char json[512];
-
-        json_escape_string(escaped_node, sizeof(escaped_node), snapshot[i].node_id);
-        json_escape_string(escaped_sitio, sizeof(escaped_sitio), snapshot[i].location.sitio);
-        json_escape_string(escaped_barangay, sizeof(escaped_barangay), snapshot[i].location.barangay);
-        json_escape_string(escaped_municipality, sizeof(escaped_municipality), snapshot[i].location.municipality);
-
-        snprintf(json, sizeof(json),
-                 "%s{\"node_id\":\"%s\",\"sitio\":\"%s\",\"barangay\":\"%s\",\"municipality\":\"%s\",\"last_seen_epoch\":%lu,\"last_rssi\":%d,\"last_snr\":%d,\"health_score\":%d,\"online\":%s}",
-                 i == 0 ? "" : ",",
-                 escaped_node,
-                 escaped_sitio,
-                 escaped_barangay,
-                 escaped_municipality,
-                 (unsigned long)snapshot[i].last_seen_epoch,
-                 snapshot[i].last_rssi,
-                 snapshot[i].last_snr,
-                 compute_health_score_for_node(snapshot[i].node_id, &snapshot[i]),
-                 snapshot[i].online ? "true" : "false");
-        httpd_resp_send_chunk(request, json, HTTPD_RESP_USE_STRLEN);
-    }
-    httpd_resp_send_chunk(request, "]", 1);
-    return httpd_resp_send_chunk(request, NULL, 0);
-}
-
-static esp_err_t export_handler(httpd_req_t *request)
-{
-    esp_err_t session_result = require_session(request);
-    bool json = false;
-
-    if (session_result != ESP_OK) {
-        return session_result;
-    }
-
-    if (strstr(request->uri, "format=json") != NULL) {
-        json = true;
-    }
-
-    httpd_resp_set_hdr(request, "Content-Disposition", "attachment; filename=incident-log.csv");
-    if (!json) {
-        httpd_resp_set_type(request, "text/csv");
-        httpd_resp_send_chunk(request, "id,direction,source,destination,type,priority,status,stored_epoch,payload\n", HTTPD_RESP_USE_STRLEN);
-        data_lock();
-        for (size_t i = 0; i < message_count; i++) {
-            char line[512];
-            emergency_message_t *m = &messages[i];
-            snprintf(line, sizeof(line), "%lu,%s,%s,%s,%s,%s,%s,%lu,%s\n",
-                     (unsigned long)m->id, m->direction, m->source, m->destination, m->type, m->priority, m->status,
-                     (unsigned long)m->stored_epoch, m->payload);
-            httpd_resp_send_chunk(request, line, HTTPD_RESP_USE_STRLEN);
-        }
-        data_unlock();
-        return httpd_resp_send_chunk(request, NULL, 0);
-    }
-
-    httpd_resp_set_type(request, "application/json");
-    httpd_resp_send_chunk(request, "[", 1);
-    data_lock();
-    for (size_t i = 0; i < message_count; i++) {
-        write_message_json_chunk(request, &messages[i], i == 0);
+    for (size_t i = 0; i < message_count && snapshot_count < MAX_MESSAGES; i++) {
+        snapshot[snapshot_count++] = messages[message_count - 1 - i];
     }
     data_unlock();
+    for (size_t i = 0; i < snapshot_count; i++) {
+        write_message_json_chunk(request, &snapshot[i], i == 0);
+    }
     httpd_resp_send_chunk(request, "]", 1);
+    httpd_resp_set_type(request, "application/json");
     return httpd_resp_send_chunk(request, NULL, 0);
-}
-
-static esp_err_t ota_handler(httpd_req_t *request)
-{
-    esp_ota_handle_t ota_handle = 0;
-    const esp_partition_t *partition = esp_ota_get_next_update_partition(NULL);
-    char buffer[1024];
-    int received = 0;
-    esp_err_t session_result = require_session(request);
-
-    if (session_result != ESP_OK) {
-        return session_result;
-    }
-    if (partition == NULL) {
-        httpd_resp_set_status(request, "500 Internal Server Error");
-        return httpd_resp_send(request, "No OTA partition available", HTTPD_RESP_USE_STRLEN);
-    }
-
-    if (esp_ota_begin(partition, OTA_SIZE_UNKNOWN, &ota_handle) != ESP_OK) {
-        httpd_resp_set_status(request, "500 Internal Server Error");
-        return httpd_resp_send(request, "OTA begin failed", HTTPD_RESP_USE_STRLEN);
-    }
-
-    while (received < request->content_len) {
-        int chunk = httpd_req_recv(request, buffer, MIN((int)sizeof(buffer), request->content_len - received));
-        if (chunk <= 0) {
-            esp_ota_end(ota_handle);
-            httpd_resp_set_status(request, "400 Bad Request");
-            return httpd_resp_send(request, "OTA upload failed", HTTPD_RESP_USE_STRLEN);
-        }
-        if (esp_ota_write(ota_handle, buffer, chunk) != ESP_OK) {
-            esp_ota_end(ota_handle);
-            httpd_resp_set_status(request, "500 Internal Server Error");
-            return httpd_resp_send(request, "OTA write failed", HTTPD_RESP_USE_STRLEN);
-        }
-        received += chunk;
-    }
-
-    if (esp_ota_end(ota_handle) != ESP_OK || esp_ota_set_boot_partition(partition) != ESP_OK) {
-        httpd_resp_set_status(request, "500 Internal Server Error");
-        return httpd_resp_send(request, "OTA finalize failed", HTTPD_RESP_USE_STRLEN);
-    }
-
-    httpd_resp_send(request, "OTA update accepted. Rebooting.", HTTPD_RESP_USE_STRLEN);
-    vTaskDelay(pdMS_TO_TICKS(500));
-    esp_restart();
-    return ESP_OK;
 }
 
 static esp_err_t captive_handler(httpd_req_t *request)
@@ -2609,9 +2284,9 @@ static void start_http_server(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = HTTP_PORT;
-    config.max_uri_handlers = 22;
+    config.max_uri_handlers = 16;
     config.uri_match_fn = httpd_uri_match_wildcard;
-    config.stack_size = 16384;
+    config.stack_size = 12288;
 
     const httpd_uri_t routes[] = {
         {.uri = "/", .method = HTTP_GET, .handler = index_handler},
@@ -2623,11 +2298,6 @@ static void start_http_server(void)
         {.uri = "/sync", .method = HTTP_POST, .handler = sync_handler},
         {.uri = "/api/status", .method = HTTP_GET, .handler = status_handler},
         {.uri = "/api/messages", .method = HTTP_GET, .handler = messages_handler},
-        {.uri = "/api/roster", .method = HTTP_GET, .handler = roster_handler},
-        {.uri = "/api/routes", .method = HTTP_GET, .handler = routes_handler},
-        {.uri = "/api/export", .method = HTTP_GET, .handler = export_handler},
-        {.uri = "/discover", .method = HTTP_GET, .handler = discover_handler},
-        {.uri = "/ota", .method = HTTP_POST, .handler = ota_handler},
         {.uri = "/generate_204", .method = HTTP_GET, .handler = captive_handler},
         {.uri = "/gen_204", .method = HTTP_GET, .handler = captive_handler},
         {.uri = "/hotspot-detect.html", .method = HTTP_GET, .handler = captive_handler},
@@ -2735,9 +2405,12 @@ static void start_wifi_ap(void)
     wifi_config.ap.ssid_len = strlen(ap_ssid);
     wifi_config.ap.channel = AP_CHANNEL;
     wifi_config.ap.max_connection = AP_MAX_CONNECTIONS;
-    // This AP passphrase is distinct from the portal PIN and protects Wi-Fi association.
-    copy_field((char *)wifi_config.ap.password, sizeof(wifi_config.ap.password), node_config_get_ap_password());
-    wifi_config.ap.authmode = WIFI_AUTH_WPA2_PSK;
+    wifi_config.ap.authmode = WIFI_AUTH_OPEN;
+
+    if (strlen(AP_PASSWORD) >= 8) {
+        copy_field((char *)wifi_config.ap.password, sizeof(wifi_config.ap.password), AP_PASSWORD);
+        wifi_config.ap.authmode = WIFI_AUTH_WPA2_PSK;
+    }
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
@@ -2759,19 +2432,16 @@ void app_main(void)
 
     data_mutex = xSemaphoreCreateMutex();
     ESP_ERROR_CHECK(data_mutex == NULL ? ESP_ERR_NO_MEM : ESP_OK);
-    lora_tx_queue = xQueueCreate(8, sizeof(tx_queue_item_t));
-    ESP_ERROR_CHECK(lora_tx_queue == NULL ? ESP_ERR_NO_MEM : ESP_OK);
 
     init_identity();
+    init_session_token();
     load_packet_counter();
     load_highest_seen_id();
     rgb_led_init();
     init_factory_reset_button();
-    roster_init();
-    route_table_init();
-    node_config_load();
+    load_node_config();
+    load_messages_from_nvs();
     lora_init();
-    xTaskCreate(radio_task, "radio_task", 4096, NULL, 6, NULL);
     xTaskCreate(boot_sync_task, "boot_sync_task", 4096, NULL, 4, NULL);
     xTaskCreate(retry_tracker_task, "retry_tracker_task", 4096, NULL, 3, NULL);
     xTaskCreate(time_sync_task, "time_sync_task", 3072, NULL, 2, NULL);
