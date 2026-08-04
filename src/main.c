@@ -31,6 +31,8 @@
 #include "bems_crypto.h"
 #include "roster.h"
 #include "route_table.h"
+#include "utils/json_utils.h"
+#include "utils/string_utils.h"
 
 #define AP_CHANNEL 6
 #define AP_MAX_CONNECTIONS 4
@@ -153,15 +155,11 @@ typedef struct {
     char network_key[FIELD_LEN];
 } node_config_t;
 
+void location_encode(const location_info_t *loc, char *out, size_t out_size);
+void location_decode(const char *encoded, location_info_t *loc);
 static void save_message_to_nvs(const emergency_message_t *message, int slot);
 static void load_messages_from_nvs(void);
-static void location_encode(const location_info_t *loc, char *out, size_t out_size);
-static void location_decode(const char *encoded, location_info_t *loc);
-static void compute_thread_key(char *out, size_t out_size, const char *source, const char *destination);
-static void json_escape_string(char *destination, size_t destination_size, const char *source);
-static bool form_value(const char *body, const char *key, char *output, size_t output_size);
 static void update_message_status(uint32_t id, const char *source, const char *status);
-static void copy_field_no_delims(char *destination, size_t destination_size, const char *source);
 static bool lora_channel_clear(void);
 static void retry_tracker_task(void *parameter);
 static void time_sync_task(void *parameter);
@@ -239,7 +237,6 @@ static roster_entry_t roster_snapshot_buffer[MAX_ROSTER_ENTRIES];
 static route_entry_t route_snapshot_buffer[MAX_ROUTE_ENTRIES];
 static emergency_message_t message_snapshot_buffer[MAX_MESSAGES];
 
-static void copy_field(char *destination, size_t destination_size, const char *source);
 static void save_packet_counter(void);
 static void update_highest_seen_id(uint32_t id);
 static bool lora_transmit(const char *packet);
@@ -1365,100 +1362,6 @@ static void lora_init(void)
     ESP_LOGI(TAG, "SX1278 ready on 433 MHz");
 }
 
-static void copy_field_no_delims(char *destination, size_t destination_size, const char *source)
-{
-    size_t write_index = 0;
-
-    if (destination_size == 0) {
-        return;
-    }
-
-    while (*source != '\0' && write_index < destination_size - 1) {
-        unsigned char c = (unsigned char)*source++;
-        if (c >= 32 && c <= 126 && c != '|' && c != '~') {
-            destination[write_index++] = (char)c;
-        }
-    }
-
-    destination[write_index] = '\0';
-}
-
-static void copy_field(char *destination, size_t destination_size, const char *source)
-{
-    size_t write_index = 0;
-
-    if (destination_size == 0) {
-        return;
-    }
-
-    while (*source != '\0' && write_index < destination_size - 1) {
-        unsigned char character = (unsigned char)*source++;
-        if (character >= 32 && character <= 126) {
-            destination[write_index++] = (char)character;
-        }
-    }
-
-    destination[write_index] = '\0';
-}
-
-static void location_encode(const location_info_t *loc, char *out, size_t out_size)
-{
-    if (out_size == 0) {
-        return;
-    }
-
-    snprintf(out, out_size, "%.*s~%.*s~%.*s",
-             SITIO_LEN - 1, loc->sitio,
-             BARANGAY_LEN - 1, loc->barangay,
-             MUNICIPALITY_LEN - 1, loc->municipality);
-}
-
-static void location_decode(const char *encoded, location_info_t *loc)
-{
-    char buffer[SITIO_LEN + BARANGAY_LEN + MUNICIPALITY_LEN + 2];
-    char *first_sep;
-    char *second_sep;
-
-    memset(loc, 0, sizeof(*loc));
-    if (encoded == NULL) {
-        return;
-    }
-
-    copy_field(buffer, sizeof(buffer), encoded);
-    first_sep = strchr(buffer, '~');
-    if (first_sep == NULL) {
-        copy_field(loc->barangay, sizeof(loc->barangay), buffer);
-        return;
-    }
-
-    *first_sep = '\0';
-    copy_field(loc->sitio, sizeof(loc->sitio), buffer);
-
-    second_sep = strchr(first_sep + 1, '~');
-    if (second_sep == NULL) {
-        copy_field(loc->barangay, sizeof(loc->barangay), first_sep + 1);
-        return;
-    }
-
-    *second_sep = '\0';
-    copy_field(loc->barangay, sizeof(loc->barangay), first_sep + 1);
-    copy_field(loc->municipality, sizeof(loc->municipality), second_sep + 1);
-}
-
-static void compute_thread_key(char *out, size_t out_size, const char *source, const char *destination)
-{
-    if (out_size == 0) {
-        return;
-    }
-
-    if (strcmp(destination, "ALL") == 0) {
-        copy_field(out, out_size, "ANNOUNCEMENTS");
-        return;
-    }
-
-    copy_field(out, out_size, source);
-}
-
 static void update_message_status(uint32_t id, const char *source, const char *status)
 {
     data_lock();
@@ -1927,91 +1830,6 @@ static void factory_reset_button_task(void *parameter)
 
         vTaskDelay(pdMS_TO_TICKS(100));
     }
-}
-
-static int hex_value(char character)
-{
-    if (character >= '0' && character <= '9') {
-        return character - '0';
-    }
-    if (character >= 'a' && character <= 'f') {
-        return character - 'a' + 10;
-    }
-    if (character >= 'A' && character <= 'F') {
-        return character - 'A' + 10;
-    }
-    return -1;
-}
-
-static void url_decode(char *value)
-{
-    char *read_ptr = value;
-    char *write_ptr = value;
-
-    while (*read_ptr != '\0') {
-        if (*read_ptr == '+') {
-            *write_ptr++ = ' ';
-            read_ptr++;
-        } else if (*read_ptr == '%' && isxdigit((unsigned char)read_ptr[1]) && isxdigit((unsigned char)read_ptr[2])) {
-            *write_ptr++ = (char)((hex_value(read_ptr[1]) << 4) | hex_value(read_ptr[2]));
-            read_ptr += 3;
-        } else {
-            *write_ptr++ = *read_ptr++;
-        }
-    }
-
-    *write_ptr = '\0';
-}
-
-static bool form_value(const char *body, const char *key, char *output, size_t output_size)
-{
-    const size_t key_len = strlen(key);
-    const char *cursor = body;
-
-    while (cursor != NULL && *cursor != '\0') {
-        if (strncmp(cursor, key, key_len) == 0 && cursor[key_len] == '=') {
-            const char *value_start = cursor + key_len + 1;
-            const char *value_end = strchr(value_start, '&');
-            size_t value_len = value_end == NULL ? strlen(value_start) : (size_t)(value_end - value_start);
-            size_t copy_len = MIN(value_len, output_size - 1);
-
-            memcpy(output, value_start, copy_len);
-            output[copy_len] = '\0';
-            url_decode(output);
-            return true;
-        }
-
-        cursor = strchr(cursor, '&');
-        if (cursor != NULL) {
-            cursor++;
-        }
-    }
-
-    return false;
-}
-
-static void json_escape_string(char *destination, size_t destination_size, const char *source)
-{
-    size_t write_index = 0;
-
-    if (destination_size == 0) {
-        return;
-    }
-
-    while (*source != '\0' && write_index < destination_size - 1) {
-        char character = *source++;
-
-        if ((character == '"' || character == '\\') && write_index < destination_size - 2) {
-            destination[write_index++] = '\\';
-            destination[write_index++] = character;
-        } else if (character != '"' && character != '\\') {
-            destination[write_index++] = character;
-        } else {
-            break;
-        }
-    }
-
-    destination[write_index] = '\0';
 }
 
 static int hops_for_priority(const char *priority)
