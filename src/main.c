@@ -152,14 +152,15 @@ typedef struct {
     char network_key[FIELD_LEN];
 } node_config_t;
 
+static void save_message_to_nvs(const emergency_message_t *message, int slot);
+static void load_messages_from_nvs(void);
 static void location_encode(const location_info_t *loc, char *out, size_t out_size);
 static void location_decode(const char *encoded, location_info_t *loc);
 static void compute_thread_key(char *out, size_t out_size, const char *source, const char *destination);
-static void copy_field_no_delims(char *destination, size_t destination_size, const char *source);
-static void save_message_to_nvs(const emergency_message_t *message, int slot);
-static void load_messages_from_nvs(void);
 static void json_escape_string(char *destination, size_t destination_size, const char *source);
+static bool form_value(const char *body, const char *key, char *output, size_t output_size);
 static void update_message_status(uint32_t id, const char *source, const char *status);
+static void copy_field_no_delims(char *destination, size_t destination_size, const char *source);
 static bool lora_channel_clear(void);
 static void retry_tracker_task(void *parameter);
 static void time_sync_task(void *parameter);
