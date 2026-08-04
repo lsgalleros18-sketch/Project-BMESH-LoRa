@@ -56,6 +56,7 @@
 #define DEFAULT_NETWORK_KEY "CHANGEME1234567"
 #define SESSION_COOKIE_NAME "BMESH_SESSION"
 #define SESSION_TOKEN_LEN 17
+#define SESSION_IDLE_TIMEOUT_MS 900000
 #define LITTLEFS_BASE_PATH "/littlefs"
 #define PORTAL_FILE_BUFFER_SIZE 1536
 
@@ -206,6 +207,7 @@ static const char *AP_PASSWORD = "123456789";
 static char node_id[FIELD_LEN];
 static char ap_ssid[FIELD_LEN];
 static char session_token[SESSION_TOKEN_LEN];
+static TickType_t session_last_activity_tick;
 static node_config_t node_config;
 static emergency_message_t messages[MAX_MESSAGES];
 static seen_packet_t seen_packets[MAX_SEEN_PACKETS];
@@ -2057,12 +2059,14 @@ static void init_session_token(void)
     uint32_t random_b = esp_random();
 
     snprintf(session_token, sizeof(session_token), "%08lX%08lX", (unsigned long)random_a, (unsigned long)random_b);
+    session_last_activity_tick = xTaskGetTickCount();
 }
 
 static bool request_has_session(httpd_req_t *request)
 {
     char cookie[128] = {0};
     char expected[64];
+    TickType_t now;
 
     if (!node_config.configured) {
         return true;
@@ -2073,7 +2077,17 @@ static bool request_has_session(httpd_req_t *request)
     }
 
     snprintf(expected, sizeof(expected), "%s=%s", SESSION_COOKIE_NAME, session_token);
-    return strstr(cookie, expected) != NULL;
+    if (strstr(cookie, expected) == NULL) {
+        return false;
+    }
+
+    now = xTaskGetTickCount();
+    if ((now - session_last_activity_tick) > pdMS_TO_TICKS(SESSION_IDLE_TIMEOUT_MS)) {
+        return false;
+    }
+
+    session_last_activity_tick = now;
+    return true;
 }
 
 static esp_err_t require_session(httpd_req_t *request)
@@ -2202,6 +2216,7 @@ static esp_err_t login_handler(httpd_req_t *request)
     failed_login_count = 0;
     snprintf(cookie, sizeof(cookie), "%s=%s; Path=/; HttpOnly; SameSite=Lax", SESSION_COOKIE_NAME, session_token);
     httpd_resp_set_hdr(request, "Set-Cookie", cookie);
+    session_last_activity_tick = xTaskGetTickCount();
     return send_redirect(request, "/");
 }
 
