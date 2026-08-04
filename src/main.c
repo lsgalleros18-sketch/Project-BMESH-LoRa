@@ -28,6 +28,8 @@
 #include "psa/crypto.h"
 
 #include "bems_crypto.h"
+#include "roster.h"
+#include "route_table.h"
 
 #define AP_CHANNEL 6
 #define AP_MAX_CONNECTIONS 4
@@ -134,9 +136,13 @@ typedef struct {
     bool configured;
     char node_id[FIELD_LEN];
     char node_name[FIELD_LEN];
+    char node_role[FIELD_LEN];
     location_info_t location;          // was: char location[FIELD_LEN]
     char default_destination[FIELD_LEN];
+    char default_priority[FIELD_LEN];
+    char ap_password[FIELD_LEN];
     char web_pin[FIELD_LEN];
+    char duress_pin[FIELD_LEN];
     char network_key[FIELD_LEN];
 } node_config_t;
 
@@ -317,11 +323,13 @@ static const char INDEX_HTML[] =
     "label{display:block;font-weight:700;margin-top:12px}input,select,textarea,button{box-sizing:border-box;width:100%;font:inherit;padding:12px;margin-top:6px;border-radius:6px;border:1px solid #b8c0cc}"
     "textarea{min-height:94px}button{background:#b91c1c;color:white;border:0;font-weight:700;margin-top:16px}"
     ".row{display:grid;grid-template-columns:1fr 1fr;gap:10px}.muted{color:#5f6b7a;font-size:14px}.msg{border-top:1px solid #e5e7eb;padding:10px 0;word-break:break-word}"
-    ".messenger{display:grid;grid-template-columns:280px 1fr;gap:12px}.thread-list{border-right:1px solid #eef2f7;padding-right:8px}.thread-item{padding:10px 12px;border-radius:8px;cursor:pointer;border:1px solid transparent;margin-bottom:8px;background:#f8fafc}.thread-item.active{border-color:#b91c1c;background:#fff1f2}.thread-item small{display:block;color:#5f6b7a;margin-top:4px}.thread-view{min-height:220px}.bubble{background:#fff;border:1px solid #dbe2ea;border-radius:12px;padding:10px 12px;margin:10px 0}.bubble .meta{font-size:12px;color:#5f6b7a;margin-bottom:6px}.location{font-size:12px;color:#475569;margin-top:6px}"
+    ".spinner{width:16px;height:16px;border:2px solid #ddd;border-top-color:#b91c1c;border-radius:50%;animation:spin .6s linear infinite;display:inline-block;vertical-align:middle;margin-right:8px}"
+    "@keyframes spin{to{transform:rotate(360deg)}}"
+    ".messenger{display:grid;grid-template-columns:280px 1fr;gap:12px}.thread-list{border-right:1px solid #eef2f7;padding-right:8px}.thread-item{padding:10px 12px;border-radius:8px;cursor:pointer;border:1px solid transparent;margin-bottom:8px;background:#f8fafc;position:relative}.thread-item.active{border-color:#b91c1c;background:#fff1f2}.thread-item.active b{font-weight:800}.thread-item small{display:block;color:#5f6b7a;margin-top:4px}.thread-item .unread{position:absolute;top:10px;right:10px;background:#b91c1c;color:#fff;border-radius:999px;padding:2px 6px;font-size:11px;font-weight:700}.thread-view{min-height:220px}.thread-back{display:none;margin-bottom:12px}.thread-header{display:flex;align-items:center;justify-content:space-between;gap:8px}.bubble{background:#fff;border:1px solid #dbe2ea;border-radius:12px;padding:10px 12px;margin:10px 0;max-width:78%;position:relative}.bubble.mine{margin-left:auto;background:#fee2e2;border-color:#fca5a5}.bubble.theirs{margin-right:auto}.bubble .meta{font-size:12px;color:#5f6b7a;margin-bottom:6px}.bubble .stamp{font-size:12px;color:#475569;display:flex;justify-content:flex-end;gap:6px;margin-top:8px;align-items:center}.bubble .sig{font-size:11px;color:#7c2d12;font-weight:700}.avatar{width:28px;height:28px;border-radius:50%;background:#b91c1c;color:#fff;display:inline-flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;flex:none;margin-right:8px}.bubble-row{display:flex;align-items:flex-start;gap:8px}.bubble-row.mine{justify-content:flex-end}.location{font-size:12px;color:#475569;margin-top:6px}"
     "@media(max-width:620px){.row{grid-template-columns:1fr}}"
-    "@media(max-width:860px){.messenger{grid-template-columns:1fr}.thread-list{border-right:0;padding-right:0}}"
+    "@media(max-width:860px){.messenger{grid-template-columns:1fr}.thread-list{border-right:0;padding-right:0}.mobile-thread-open .thread-list{display:none}.mobile-thread-open .thread-view{display:block}.thread-back{display:inline-block}}"
     "</style></head><body><div class=top><div class=wrap><h2>Barangay Emergency Mesh</h2>"
-    "<div id=status>Loading status...</div></div></div><main class=wrap>"
+    "<div id=status><span class=spinner></span>Loading status...</div></div></div><main class=wrap>"
     "<section class=card><h3>Send Message</h3><button id=langBtn type=button>Tagalog</button><form method=post action=/send>"
     "<div class=row><label>Your name<input name=sender_name maxlength=31 placeholder='Optional name for accountability'></label><label>Quick templates<select id=template><option value=''>Choose a template</option><option value='Need medical evacuation|MEDICAL|HIGH'>Need medical evacuation</option><option value='Road impassable|EVACUATION|HIGH'>Road impassable</option><option value='All clear|TEST|LOW'>All clear</option></select></label></div>"
     "<fieldset style='border:0;padding:0;margin:0 0 8px 0'><legend style='font-weight:700'>Message scope</legend>"
@@ -333,8 +341,8 @@ static const char INDEX_HTML[] =
     "<label>Priority<select name=priority><option>HIGH</option><option>NORMAL</option><option>LOW</option></select></label></div>"
     "<label>Message<textarea id=payload name=payload maxlength=159 placeholder='Short emergency message'></textarea></label>"
     "<button type=submit>Queue / Transmit Message</button></form><p class=muted>The portal sends through the SX1278 using GPIO 5/7/6/8/4/16 at 433 MHz.</p></section>"
-    "<section class=card><h3>Messages</h3><div class=messenger><div class=thread-list><div class=muted>Loading threads...</div></div><div class=thread-view><div class=muted>Loading messages...</div></div></div></section>"
-    "<section class=card><h3>Mesh Health</h3><div id=health class=muted>Loading node roster...</div></section>"
+    "<section class=card><h3>Messages</h3><div class=messenger><div class=thread-list><div class=muted><span class=spinner></span>Loading threads...</div></div><div class=thread-view><div class=muted><span class=spinner></span>Loading messages...</div></div></div></section>"
+    "<section class=card><h3>Mesh Health</h3><div id=health class=muted><span class=spinner></span>Loading node roster...</div></section>"
     "<section class=card><h3>Portal</h3><p class=muted id=warningBox></p><p class=muted>Connect to this Wi-Fi when offline, then open http://192.168.4.1. Android/iOS captive checks are redirected here automatically.</p>"
     "<form method=post action=/settime><label>Set time<input name=epoch id=epochInput readonly></label><button type=submit>Sync Clock</button></form>"
     "<form method=post action=/sync><button type=submit>Sync Messages from Mesh</button></form>"
@@ -344,18 +352,17 @@ static const char INDEX_HTML[] =
     "function syncScope(){let direct=scopeRadios.some(r=>r.checked&&r.value==='direct');destWrap.style.display=direct?'block':'none';dest.required=direct;dest.disabled=!direct;announcementDest.disabled=direct;if(!direct){announcementDest.value='ALL';}}"
     "template.addEventListener('change',()=>{if(!template.value)return;let parts=template.value.split('|');payload.value=parts[0];document.querySelector('select[name=type]').value=parts[1]||'TEST';document.querySelector('select[name=priority]').value=parts[2]||'NORMAL';template.value='';});"
     "scopeRadios.forEach(r=>r.addEventListener('change',syncScope));syncScope();"
-    "let activeThread='ANNOUNCEMENTS';let cachedThreads={};"
+    "let activeThread='ANNOUNCEMENTS';let cachedThreads={};let mobileOpen=false;let rosterState=[];let routeState=[];"
     "function escapeHtml(v){return String(v).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('\"','&quot;');}"
     "function locText(x){return [x.location?.sitio||'',x.location?.barangay||'',x.location?.municipality||''].filter(Boolean).join(' \xE2\x86\x92 ');}"
-    "function renderThreads(){let list=document.querySelector('.thread-list');let entries=Object.values(cachedThreads).sort((a,b)=>{if(a.thread_key==='ANNOUNCEMENTS')return -1;if(b.thread_key==='ANNOUNCEMENTS')return 1;return (b.lastSeen||0)-(a.lastSeen||0);});if(!entries.length){list.innerHTML='<div class=muted>No messages yet.</div>';return;}list.innerHTML=entries.map(t=>'<div class=thread-item'+(t.thread_key===activeThread?' active':'')+' data-thread=\"'+escapeHtml(t.thread_key)+'\"><b>'+escapeHtml(t.label)+'</b><small>'+t.messages.length+' message(s)</small></div>').join('');list.querySelectorAll('.thread-item').forEach(el=>el.addEventListener('click',()=>{activeThread=el.dataset.thread;renderThreads();renderThreadView();}));}"
+    "function renderThreads(){let list=document.querySelector('.thread-list');let entries=Object.values(cachedThreads).sort((a,b)=>{if(a.thread_key==='ANNOUNCEMENTS')return -1;if(b.thread_key==='ANNOUNCEMENTS')return 1;return (b.lastSeen||0)-(a.lastSeen||0);});if(!entries.length){list.innerHTML='<div class=muted>No messages yet.</div>';return;}list.innerHTML=entries.map(t=>{let unread=(Number(localStorage.getItem('lastSeen:'+t.thread_key)||0)<(t.lastSeen||0))?'<span class=unread>new</span>':'';return '<div class=thread-item'+(t.thread_key===activeThread?' active':'')+' data-thread=\"'+escapeHtml(t.thread_key)+'\"><b>'+escapeHtml(t.label)+'</b>'+unread+'<small>'+t.messages.length+' message(s)</small></div>';}).join('');list.querySelectorAll('.thread-item').forEach(el=>el.addEventListener('click',()=>{activeThread=el.dataset.thread;mobileOpen=true;document.body.classList.add('mobile-thread-open');renderThreads();renderThreadView();}));}"
     "function fmtEpoch(e){return e?new Date(e*1000).toLocaleString():'time unknown';}"
-    "function renderThreadView(){let view=document.querySelector('.thread-view');let thread=cachedThreads[activeThread]||Object.values(cachedThreads)[0];if(!thread){view.innerHTML='<div class=muted>No messages yet.</div>';return;}view.innerHTML='<h4>'+escapeHtml(thread.label)+'</h4>'+thread.messages.map(x=>'<div class=bubble><div class=meta>'+escapeHtml(x.direction)+' #'+x.id+' | '+escapeHtml(x.type)+' | '+escapeHtml(x.priority)+' | '+escapeHtml(x.thread_key)+' | Status: '+escapeHtml(x.status||'UNKNOWN')+' | '+escapeHtml(fmtEpoch(x.stored_epoch))+'</div><div><b>From:</b> '+escapeHtml(x.source)+'<br><b>To:</b> '+escapeHtml(x.destination)+'<br><b>Payload:</b> '+escapeHtml(x.payload)+'</div><div class=location><b>Location:</b> '+escapeHtml(locText(x))+'</div>'+((x.thread_key==='ANNOUNCEMENTS')?'<div class=location><b>Sender:</b> '+escapeHtml(x.source)+'</div>':'')+'</div>').join('');}"
+    "function renderThreadView(){let view=document.querySelector('.thread-view');let thread=cachedThreads[activeThread]||Object.values(cachedThreads)[0];if(!thread){view.innerHTML='<div class=muted>No messages yet.</div>';return;}localStorage.setItem('lastSeen:'+thread.thread_key,String(thread.lastSeen||0));let back=mobileOpen?'<button type=button class=thread-back id=threadBack>‹ Back</button>':'';view.innerHTML=back+'<div class=thread-header><h4>'+escapeHtml(thread.label)+'</h4><span class=muted>'+thread.messages.length+' message(s)</span></div>'+thread.messages.map(x=>{let mine=(x.direction==='TX');let meta=x.direction+' #'+x.id+' · '+x.type+' · '+x.priority+' · '+x.thread_key;let stamp=fmtEpoch(x.stored_epoch);let sig='';if(typeof x.rssi==='number'&&typeof x.snr==='number'){sig='RSSI '+x.rssi+' dBm · SNR '+x.snr+' dB';}if(typeof x.hops==='number'){sig=sig?(sig+' · '+x.hops+' hop(s)'):(x.hops+' hop(s)');}let initials=(x.source||'??').slice(0,2).toUpperCase();return '<div class=bubble-row'+(mine?' mine':'')+'>'+(mine?'':'<div class=avatar>'+escapeHtml(initials)+'</div>')+'<div class=\"bubble '+(mine?'mine theirs')+'\" title=\"'+escapeHtml(meta)+'\"><div class=meta>'+escapeHtml(meta)+'</div><div><b>From:</b> '+escapeHtml(x.source)+'<br><b>To:</b> '+escapeHtml(x.destination)+'<br><b>Payload:</b> '+escapeHtml(x.payload)+'</div><div class=location><b>Location:</b> '+escapeHtml(locText(x))+'</div>'+((x.thread_key==='ANNOUNCEMENTS')?'<div class=location><b>Sender:</b> '+escapeHtml(x.source)+'</div>':'')+'<div class=stamp><span>'+escapeHtml(stamp)+'</span><span class=sig>'+escapeHtml((x.status||'UNKNOWN')+(sig?' · '+sig:''))+'</span></div></div></div>';}).join('');let backBtn=document.getElementById('threadBack');if(backBtn)backBtn.addEventListener('click',()=>{mobileOpen=false;document.body.classList.remove('mobile-thread-open');renderThreads();renderThreadView();});}"
     "const strings={en:{scope:'Message scope',announcement:'Announcement (all nodes)',direct:'Direct message (specific node)',messages:'Messages',health:'Mesh Health',portal:'Portal',send:'Queue / Transmit Message',toggle:'Tagalog'},tl:{scope:'Layunin ng mensahe',announcement:'Anunsyo (lahat ng node)',direct:'Direktang mensahe (tiyak na node)',messages:'Mga Mensahe',health:'Kalagayan ng Mesh',portal:'Portal',send:'Ipadala ang Mensahe',toggle:'English'}};let lang='en';function applyLang(){let s=strings[lang];document.querySelector('legend').textContent=s.scope;document.querySelectorAll('label')[2].childNodes[1].textContent=' '+s.announcement;document.querySelectorAll('label')[3].childNodes[1].textContent=' '+s.direct;document.querySelectorAll('section.card h3')[1].textContent=s.messages;document.querySelectorAll('section.card h3')[2].textContent=s.health;document.querySelectorAll('section.card h3')[3].textContent=s.portal;document.querySelector('button[type=submit]').textContent=s.send;langBtn.textContent=s.toggle;}langBtn.addEventListener('click',()=>{lang=lang==='en'?'tl':'en';applyLang();});applyLang();"
     "document.getElementById('epochInput').value=Math.floor(Date.now()/1000);"
-    "async function load(){let s=await fetch('/api/status').then(r=>r.json());"
-    "document.getElementById('status').innerHTML='Node <b>'+s.node+'</b> | '+s.name+' | '+s.location+' | Relay <b>'+s.relay+'</b> | AP <b>'+s.ssid+'</b> | Clients <b>'+s.clients+'</b> | Time <b>'+(s.time_synced?(new Date(s.epoch*1000).toLocaleString()):'unknown')+'</b>';"
-    "document.getElementById('warningBox').textContent=s.duplicate_warning?'Possible duplicate node ID on the mesh':'';"
-    "let m=await fetch('/api/messages').then(r=>r.json());cachedThreads={};let peers={};m.forEach(x=>{let key=x.thread_key||'UNKNOWN';if(!cachedThreads[key])cachedThreads[key]={thread_key:key,label:key==='ANNOUNCEMENTS'?'Announcements':key,messages:[],lastSeen:0};cachedThreads[key].messages.push(x);cachedThreads[key].lastSeen=Math.max(cachedThreads[key].lastSeen,x.id||0);if(key==='ANNOUNCEMENTS')cachedThreads[key].label='Announcements';else if(!cachedThreads[key].label||cachedThreads[key].label===key)cachedThreads[key].label=key;if(x.source){let p=peers[x.source]||{id:x.source,lastSeen:0,location:''};p.lastSeen=Math.max(p.lastSeen,x.id||0);p.location=locText(x);peers[x.source]=p;}});if(!cachedThreads[activeThread]&&Object.keys(cachedThreads).length){activeThread=Object.keys(cachedThreads)[0];}renderThreads();renderThreadView();let health=document.getElementById('health');let roster=Object.values(peers).sort((a,b)=>b.lastSeen-a.lastSeen);health.innerHTML=roster.length?roster.map(p=>'<div class=msg><b>'+escapeHtml(p.id)+'</b><br><span class=muted>Last seen #'+p.lastSeen+'</span><br>'+escapeHtml(p.location||'Unknown')+'</div>').join(''):'No peers yet.';}"
+    "function loadingFallback(target,label){target.innerHTML='<span class=spinner></span>'+label;}"
+    "async function load(){try{let s=await fetch('/api/status').then(r=>r.json());document.getElementById('status').innerHTML='Node <b>'+s.node+'</b> | '+s.name+' | '+s.location+' | Role <b>'+(s.node_role||'relay-only')+'</b> | AP <b>'+s.ssid+'</b> | Clients <b>'+s.clients+'</b> | Time <b>'+(s.time_synced?(new Date(s.epoch*1000).toLocaleString()):'unknown')+'</b>';document.getElementById('warningBox').textContent=s.duplicate_warning?'Possible duplicate node ID on the mesh':'';}catch(e){loadingFallback(document.getElementById('status'),'Reconnecting...');return;}try{let m=await fetch('/api/messages').then(r=>r.json());cachedThreads={};m.forEach(x=>{let key=x.thread_key||'UNKNOWN';if(!cachedThreads[key])cachedThreads[key]={thread_key:key,label:key==='ANNOUNCEMENTS'?'Announcements':key,messages:[],lastSeen:0};cachedThreads[key].messages.push(x);cachedThreads[key].lastSeen=Math.max(cachedThreads[key].lastSeen,x.id||0);if(key==='ANNOUNCEMENTS')cachedThreads[key].label='Announcements';else if(!cachedThreads[key].label||cachedThreads[key].label===key)cachedThreads[key].label=key;});if(!cachedThreads[activeThread]&&Object.keys(cachedThreads).length){activeThread=Object.keys(cachedThreads)[0];}renderThreads();renderThreadView();}catch(e){loadingFallback(document.querySelector('.thread-list'),'Reconnecting...');loadingFallback(document.querySelector('.thread-view'),'Reconnecting...');}try{let r=await fetch('/api/status').then(r=>r.json());rosterState=r.roster||[];routeState=r.routes||[];let health=document.getElementById('health');health.innerHTML=rosterState.length?rosterState.map(p=>'<div class=msg><b>'+escapeHtml(p.node_id)+'</b><br><span class=muted>Seen '+escapeHtml(fmtEpoch(p.last_seen_epoch))+' | RSSI '+escapeHtml(p.last_rssi)+' dBm | SNR '+escapeHtml(p.last_snr)+' dB</span><br>'+escapeHtml((p.location?.sitio||'')+' '+(p.location?.barangay||'')+' '+(p.location?.municipality||'')).trim()+'<br><span class=muted>'+(p.online?'Online':'Stale')+'</span></div>').join(''):'No peers yet.';}catch(e){loadingFallback(document.getElementById('health'),'Reconnecting...');}}"
+    "function renderThreadView(){let view=document.querySelector('.thread-view');let thread=cachedThreads[activeThread]||Object.values(cachedThreads)[0];if(!thread){view.innerHTML='<div class=muted>No messages yet.</div>';return;}localStorage.setItem('lastSeen:'+thread.thread_key,String(thread.lastSeen||0));let back=mobileOpen?'<button type=button class=thread-back id=threadBack>Back</button>':'';view.innerHTML=back+'<div class=thread-header><h4>'+escapeHtml(thread.label)+'</h4><span class=muted>'+thread.messages.length+' message(s)</span></div>'+thread.messages.map(x=>{let mine=(x.direction==='TX');let meta=x.direction+' #'+x.id+' · '+x.type+' · '+x.priority+' · '+x.thread_key;let stamp=fmtEpoch(x.stored_epoch);let sig='';if(typeof x.rssi==='number'&&typeof x.snr==='number'){sig='RSSI '+x.rssi+' dBm · SNR '+x.snr+' dB';}if(typeof x.hops==='number'){sig=sig?(sig+' · '+x.hops+' hop(s)'):(x.hops+' hop(s)');}let initials=(x.source||'??').slice(0,2).toUpperCase();return '<div class=bubble-row'+(mine?' mine':'')+'>'+(mine?'':'<div class=avatar>'+escapeHtml(initials)+'</div>')+'<div class=\"bubble '+(mine?'mine':'theirs')+'\" title=\"'+escapeHtml(meta)+'\"><div class=meta>'+escapeHtml(meta)+'</div><div><b>From:</b> '+escapeHtml(x.source)+'<br><b>To:</b> '+escapeHtml(x.destination)+'<br><b>Payload:</b> '+escapeHtml(x.payload)+'</div><div class=location><b>Location:</b> '+escapeHtml(locText(x))+'</div>'+((x.thread_key==='ANNOUNCEMENTS')?'<div class=location><b>Sender:</b> '+escapeHtml(x.source)+'</div>':'')+'<div class=stamp><span>'+escapeHtml(stamp)+'</span><span class=sig>'+escapeHtml((x.status||'UNKNOWN')+(sig?' · '+sig:''))+'</span></div></div></div>';}).join('');let backBtn=document.getElementById('threadBack');if(backBtn)backBtn.addEventListener('click',()=>{mobileOpen=false;document.body.classList.remove('mobile-thread-open');renderThreads();renderThreadView();});}"
     "load();setInterval(load,4000);</script></body></html>";
 
 static const char SETUP_HTML[] =
@@ -364,21 +371,35 @@ static const char SETUP_HTML[] =
     ":root{font-family:Arial,sans-serif;color:#17202a;background:#f5f7f9}"
     "body{margin:0}.top{background:#1f6f5b;color:white;padding:16px}.wrap{max-width:720px;margin:auto;padding:16px}"
     ".card{background:white;border:1px solid #d8dee4;border-radius:8px;padding:16px;margin:12px 0}"
-    "label{display:block;font-weight:700;margin-top:12px}input,button{box-sizing:border-box;width:100%;font:inherit;padding:12px;margin-top:6px;border-radius:6px;border:1px solid #b8c0cc}"
+    "label{display:block;font-weight:700;margin-top:12px}input,button,select{box-sizing:border-box;width:100%;font:inherit;padding:12px;margin-top:6px;border-radius:6px;border:1px solid #b8c0cc}"
     "button{background:#1f6f5b;color:white;border:0;font-weight:700;margin-top:16px}.muted{color:#5f6b7a;font-size:14px}"
     "</style></head><body><div class=top><div class=wrap><h2>First-Time Node Setup</h2>"
     "<p>Configure this universal mesh node once. All nodes still send, receive, and relay.</p></div></div>"
     "<main class=wrap><section class=card><form method=post action=/setup>"
     "<label>Node ID<input name=node_id maxlength=31 placeholder='Example: BRGY001, HH023, RELAY04' required></label>"
     "<label>Node Name<input name=node_name maxlength=31 placeholder='Example: Barangay Hall or House 23' required></label>"
+    "<label>Node Role<select name=node_role><option value='relay-only'>Relay / Listener</option><option value='household'>Household</option><option value='command-post'>Command Post</option></select></label>"
+    "<label>Default Priority<select name=default_priority><option>HIGH</option><option selected>NORMAL</option><option>LOW</option></select></label>"
     "<label>Sitio / Landmark<input name=sitio maxlength=23 placeholder='Example: Purok 3, Chapel Roof'></label>"
     "<label>Barangay<input name=barangay maxlength=23 placeholder='Example: San Isidro' required></label>"
     "<label>Municipality<input name=municipality maxlength=23 placeholder='Example: Cabuyao'></label>"
     "<label>Default Destination<input name=default_destination maxlength=31 value='BRGY001' placeholder='Example: ALL or BRGY001'></label>"
+    "<label>AP Password<input name=ap_password maxlength=31 value='123456789' placeholder='Wi-Fi hotspot password (8+ chars)'></label>"
     "<label>Web PIN<input name=web_pin maxlength=31 value='123456789' placeholder='Shared portal PIN' required></label>"
+    "<label>Duress PIN<input name=duress_pin maxlength=31 placeholder='Visible emergency-only PIN used to signal distress'></label>"
     "<label>Network Key<input name=network_key maxlength=31 value='CHANGEME1234567' placeholder='Shared mesh encryption key' required></label>"
     "<button type=submit>Save Setup and Reboot</button></form>"
     "<p class=muted>Factory reset later by holding BOOT for 10 seconds during startup.</p></section></main></body></html>";
+
+static const char REBOOT_HTML[] =
+    "<!doctype html><html><head><meta name=viewport content='width=device-width,initial-scale=1'>"
+    "<title>Restarting...</title><style>"
+    ":root{font-family:Arial,sans-serif;color:#17202a;background:#f5f7f9}body{margin:0}.wrap{max-width:520px;margin:auto;padding:24px}"
+    ".card{background:white;border:1px solid #d8dee4;border-radius:12px;padding:20px}.spinner{width:36px;height:36px;border:4px solid #e5e7eb;border-top-color:#1f6f5b;border-radius:50%;animation:spin .8s linear infinite;margin:10px 0}"
+    "@keyframes spin{to{transform:rotate(360deg)}}.muted{color:#5f6b7a;font-size:14px}.count{font-size:34px;font-weight:800;color:#1f6f5b}"
+    "</style></head><body><main class=wrap><section class=card><div class=spinner></div><h2>Setup saved. Node is restarting.</h2><div class=count id=count>15</div><p class=muted id=msg>Please reconnect to the Wi-Fi AP for this node, then the page will retry automatically.</p><p class=muted id=ssid></p></section></main><script>"
+    "let s=15;const ap='192.168.4.1';function tick(){document.getElementById('count').textContent=s;if(s<=0)return;setTimeout(tick,1000);s--;}tick();let tries=0;async function probe(){tries++;try{let r=await fetch('http://192.168.4.1/api/status',{cache:'no-store'});if(r.ok){window.location.href='/';return;}}catch(e){}setTimeout(probe,2000);}setTimeout(probe,16000);"
+    "</script></body></html>";
 
 static const char LOGIN_HTML[] =
     "<!doctype html><html><head><meta name=viewport content='width=device-width,initial-scale=1'>"
@@ -807,6 +828,18 @@ static void write_message_json_chunk(httpd_req_t *request, const emergency_messa
     httpd_resp_send_chunk(request, escaped_thread_key, HTTPD_RESP_USE_STRLEN);
     httpd_resp_send_chunk(request, "\",\"status\":\"", HTTPD_RESP_USE_STRLEN);
     httpd_resp_send_chunk(request, escaped_status, HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(request, "\",\"rssi\":", HTTPD_RESP_USE_STRLEN);
+    char rssi_chunk[16];
+    snprintf(rssi_chunk, sizeof(rssi_chunk), "%d", message->rssi);
+    httpd_resp_send_chunk(request, rssi_chunk, HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(request, ",\"snr\":", HTTPD_RESP_USE_STRLEN);
+    char snr_chunk[16];
+    snprintf(snr_chunk, sizeof(snr_chunk), "%d", message->snr);
+    httpd_resp_send_chunk(request, snr_chunk, HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(request, ",\"hops\":", HTTPD_RESP_USE_STRLEN);
+    char hops_chunk[16];
+    snprintf(hops_chunk, sizeof(hops_chunk), "%d", message->hops);
+    httpd_resp_send_chunk(request, hops_chunk, HTTPD_RESP_USE_STRLEN);
     httpd_resp_send_chunk(request, "\",\"stored_epoch\":", HTTPD_RESP_USE_STRLEN);
     char epoch_chunk[24];
     snprintf(epoch_chunk, sizeof(epoch_chunk), "%lu", (unsigned long)message->stored_epoch);
@@ -952,14 +985,24 @@ static void store_received_packet(const char *packet, const mesh_packet_t *parse
     if (parsed->valid) {
         message->origin_location = parsed->location;
         compute_thread_key(message->thread_key, sizeof(message->thread_key), parsed->source, parsed->destination);
+        message->rssi = rssi;
+        message->snr = snr;
+        message->hops = parsed->hops;
     } else {
         copy_field(message->thread_key, sizeof(message->thread_key), "UNKNOWN");
+        message->rssi = rssi;
+        message->snr = snr;
+        message->hops = 0;
     }
     copy_field(message->status, sizeof(message->status), parsed->valid ? "RECEIVED" : "RECEIVED");
     message->stored_epoch = time_synced ? current_epoch_seconds() : 0;
     snprintf(message->packet, sizeof(message->packet), "RSSI=%d SNR=%d | %.*s", rssi, snr, 250, packet);
     if (parsed->valid && !is_control_packet_type(parsed->type)) {
         update_highest_seen_id(message->id);
+    }
+    if (parsed->valid) {
+        roster_touch(parsed->source, &parsed->location, message->stored_epoch, rssi, snr);
+        route_table_learn(parsed->source, parsed->hops, rssi);
     }
     if (counter_changed) {
         save_packet_counter();
@@ -1585,11 +1628,15 @@ static void config_set_defaults(void)
     node_config.configured = false;
     copy_field(node_config.node_id, sizeof(node_config.node_id), node_id);
     copy_field(node_config.node_name, sizeof(node_config.node_name), "Unconfigured Node");
+    copy_field(node_config.node_role, sizeof(node_config.node_role), "relay-only");
     copy_field(node_config.location.sitio, sizeof(node_config.location.sitio), "");
     copy_field(node_config.location.barangay, sizeof(node_config.location.barangay), "Unknown");
     copy_field(node_config.location.municipality, sizeof(node_config.location.municipality), "");
     copy_field(node_config.default_destination, sizeof(node_config.default_destination), "BRGY001");
+    copy_field(node_config.default_priority, sizeof(node_config.default_priority), "NORMAL");
+    copy_field(node_config.ap_password, sizeof(node_config.ap_password), AP_PASSWORD);
     copy_field(node_config.web_pin, sizeof(node_config.web_pin), DEFAULT_WEB_PIN);
+    copy_field(node_config.duress_pin, sizeof(node_config.duress_pin), "");
     copy_field(node_config.network_key, sizeof(node_config.network_key), DEFAULT_NETWORK_KEY);
 }
 
@@ -1620,8 +1667,12 @@ static void load_node_config(void)
     nvs_get_u8(handle, "configured", &configured);
     nvs_get_string_or_default(handle, "node_id", node_config.node_id, sizeof(node_config.node_id), node_id);
     nvs_get_string_or_default(handle, "node_name", node_config.node_name, sizeof(node_config.node_name), "Mesh Node");
+    nvs_get_string_or_default(handle, "node_role", node_config.node_role, sizeof(node_config.node_role), "relay-only");
     nvs_get_string_or_default(handle, "default_dest", node_config.default_destination, sizeof(node_config.default_destination), "BRGY001");
+    nvs_get_string_or_default(handle, "default_priority", node_config.default_priority, sizeof(node_config.default_priority), "NORMAL");
+    nvs_get_string_or_default(handle, "ap_password", node_config.ap_password, sizeof(node_config.ap_password), AP_PASSWORD);
     nvs_get_string_or_default(handle, "web_pin", node_config.web_pin, sizeof(node_config.web_pin), DEFAULT_WEB_PIN);
+    nvs_get_string_or_default(handle, "duress_pin", node_config.duress_pin, sizeof(node_config.duress_pin), "");
     nvs_get_string_or_default(handle, "network_key", node_config.network_key, sizeof(node_config.network_key), DEFAULT_NETWORK_KEY);
 
     if (nvs_get_str(handle, "sitio", node_config.location.sitio, &(size_t){sizeof(node_config.location.sitio)}) != ESP_OK) {
@@ -1676,6 +1727,9 @@ static esp_err_t save_node_config(const node_config_t *config)
         result = nvs_set_str(handle, "node_name", config->node_name);
     }
     if (result == ESP_OK) {
+        result = nvs_set_str(handle, "node_role", config->node_role);
+    }
+    if (result == ESP_OK) {
         result = nvs_set_str(handle, "sitio", config->location.sitio);
     }
     if (result == ESP_OK) {
@@ -1688,7 +1742,16 @@ static esp_err_t save_node_config(const node_config_t *config)
         result = nvs_set_str(handle, "default_dest", config->default_destination);
     }
     if (result == ESP_OK) {
+        result = nvs_set_str(handle, "default_priority", config->default_priority);
+    }
+    if (result == ESP_OK) {
+        result = nvs_set_str(handle, "ap_password", config->ap_password);
+    }
+    if (result == ESP_OK) {
         result = nvs_set_str(handle, "web_pin", config->web_pin);
+    }
+    if (result == ESP_OK) {
+        result = nvs_set_str(handle, "duress_pin", config->duress_pin);
     }
     if (result == ESP_OK) {
         result = nvs_set_str(handle, "network_key", config->network_key);
@@ -2049,6 +2112,7 @@ static esp_err_t setup_handler(httpd_req_t *request)
     form_value(body, "node_id", raw_node_id, sizeof(raw_node_id));
     copy_node_id(new_config.node_id, sizeof(new_config.node_id), raw_node_id);
     form_value(body, "node_name", new_config.node_name, sizeof(new_config.node_name));
+    form_value(body, "node_role", new_config.node_role, sizeof(new_config.node_role));
     form_value(body, "sitio", new_config.location.sitio, sizeof(new_config.location.sitio));
     copy_field_no_delims(new_config.location.sitio, sizeof(new_config.location.sitio), new_config.location.sitio);
     form_value(body, "barangay", new_config.location.barangay, sizeof(new_config.location.barangay));
@@ -2056,7 +2120,10 @@ static esp_err_t setup_handler(httpd_req_t *request)
     form_value(body, "municipality", new_config.location.municipality, sizeof(new_config.location.municipality));
     copy_field_no_delims(new_config.location.municipality, sizeof(new_config.location.municipality), new_config.location.municipality);
     form_value(body, "default_destination", new_config.default_destination, sizeof(new_config.default_destination));
+    form_value(body, "default_priority", new_config.default_priority, sizeof(new_config.default_priority));
+    form_value(body, "ap_password", new_config.ap_password, sizeof(new_config.ap_password));
     form_value(body, "web_pin", new_config.web_pin, sizeof(new_config.web_pin));
+    form_value(body, "duress_pin", new_config.duress_pin, sizeof(new_config.duress_pin));
     form_value(body, "network_key", new_config.network_key, sizeof(new_config.network_key));
     new_config.configured = true;
     if (new_config.node_id[0] == '\0') {
@@ -2071,8 +2138,20 @@ static esp_err_t setup_handler(httpd_req_t *request)
     if (new_config.default_destination[0] == '\0') {
         copy_field(new_config.default_destination, sizeof(new_config.default_destination), "BRGY001");
     }
+    if (new_config.node_role[0] == '\0') {
+        copy_field(new_config.node_role, sizeof(new_config.node_role), "relay-only");
+    }
+    if (new_config.default_priority[0] == '\0') {
+        copy_field(new_config.default_priority, sizeof(new_config.default_priority), "NORMAL");
+    }
+    if (new_config.ap_password[0] == '\0') {
+        copy_field(new_config.ap_password, sizeof(new_config.ap_password), AP_PASSWORD);
+    }
     if (new_config.web_pin[0] == '\0') {
         copy_field(new_config.web_pin, sizeof(new_config.web_pin), DEFAULT_WEB_PIN);
+    }
+    if (new_config.duress_pin[0] == '\0') {
+        copy_field(new_config.duress_pin, sizeof(new_config.duress_pin), "");
     }
     if (new_config.network_key[0] == '\0') {
         copy_field(new_config.network_key, sizeof(new_config.network_key), DEFAULT_NETWORK_KEY);
@@ -2080,7 +2159,7 @@ static esp_err_t setup_handler(httpd_req_t *request)
 
     ESP_ERROR_CHECK(save_node_config(&new_config));
     httpd_resp_set_type(request, "text/html");
-    httpd_resp_send(request, "<!doctype html><html><body><h2>Setup saved.</h2><p>Node is restarting.</p></body></html>", HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send(request, REBOOT_HTML, HTTPD_RESP_USE_STRLEN);
     vTaskDelay(pdMS_TO_TICKS(500));
     esp_restart();
     return ESP_OK;
@@ -2127,7 +2206,7 @@ static esp_err_t reset_handler(httpd_req_t *request)
 
     erase_node_config();
     httpd_resp_set_type(request, "text/html");
-    httpd_resp_send(request, "<!doctype html><html><body><h2>Factory reset complete.</h2><p>Node is restarting into setup mode.</p></body></html>", HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send(request, REBOOT_HTML, HTTPD_RESP_USE_STRLEN);
     vTaskDelay(pdMS_TO_TICKS(500));
     esp_restart();
     return ESP_OK;
@@ -2205,16 +2284,66 @@ static esp_err_t sync_handler(httpd_req_t *request)
     return send_redirect(request, "/");
 }
 
+static void send_roster_json_chunk(httpd_req_t *request, const roster_entry_t *entry, bool first)
+{
+    char escaped_id[FIELD_LEN * 2];
+    char escaped_sitio[SITIO_LEN * 2];
+    char escaped_barangay[BARANGAY_LEN * 2];
+    char escaped_municipality[MUNICIPALITY_LEN * 2];
+    char chunk[512];
+
+    json_escape_string(escaped_id, sizeof(escaped_id), entry->node_id);
+    json_escape_string(escaped_sitio, sizeof(escaped_sitio), entry->location.sitio);
+    json_escape_string(escaped_barangay, sizeof(escaped_barangay), entry->location.barangay);
+    json_escape_string(escaped_municipality, sizeof(escaped_municipality), entry->location.municipality);
+
+    snprintf(chunk, sizeof(chunk),
+             "%s{\"node_id\":\"%s\",\"location\":{\"sitio\":\"%s\",\"barangay\":\"%s\",\"municipality\":\"%s\"},\"last_seen_epoch\":%lu,\"last_seen_tick_ms\":%lu,\"last_rssi\":%d,\"last_snr\":%d,\"online\":%s,\"learned_passively\":%s}",
+             first ? "" : ",",
+             escaped_id,
+             escaped_sitio,
+             escaped_barangay,
+             escaped_municipality,
+             (unsigned long)entry->last_seen_epoch,
+             (unsigned long)entry->last_seen_tick_ms,
+             entry->last_rssi,
+             entry->last_snr,
+             entry->online ? "true" : "false",
+             entry->learned_passively ? "true" : "false");
+    httpd_resp_send_chunk(request, chunk, HTTPD_RESP_USE_STRLEN);
+}
+
+static void send_route_json_chunk(httpd_req_t *request, const route_entry_t *entry, bool first)
+{
+    char escaped_id[FIELD_LEN * 2];
+    char chunk[256];
+
+    json_escape_string(escaped_id, sizeof(escaped_id), entry->node_id);
+    snprintf(chunk, sizeof(chunk),
+             "%s{\"node_id\":\"%s\",\"best_hop_distance\":%d,\"best_rssi\":%d,\"last_seen_tick_ms\":%lu,\"stale\":%s}",
+             first ? "" : ",",
+             escaped_id,
+             entry->best_hop_distance,
+             entry->best_rssi,
+             (unsigned long)entry->last_seen_tick_ms,
+             entry->stale ? "true" : "false");
+    httpd_resp_send_chunk(request, chunk, HTTPD_RESP_USE_STRLEN);
+}
+
 static esp_err_t status_handler(httpd_req_t *request)
 {
     wifi_sta_list_t clients = {0};
-    char response[512];
+    roster_entry_t roster_snapshot[MAX_ROSTER_ENTRIES];
+    route_entry_t route_snapshot[MAX_ROUTE_ENTRIES];
     char escaped_node[FIELD_LEN * 2];
     char escaped_name[FIELD_LEN * 2];
+    char escaped_role[FIELD_LEN * 2];
     char escaped_location[FIELD_LEN * 2];
     char escaped_ssid[FIELD_LEN * 2];
     char escaped_relay[8];
     size_t current_message_count;
+    size_t roster_count;
+    size_t route_count;
     esp_err_t session_result = require_session(request);
 
     if (session_result != ESP_OK) {
@@ -2225,29 +2354,45 @@ static esp_err_t status_handler(httpd_req_t *request)
     data_lock();
     current_message_count = message_count;
     data_unlock();
+    roster_count = roster_get_snapshot(roster_snapshot, MAX_ROSTER_ENTRIES);
+    route_count = route_table_get_snapshot(route_snapshot, MAX_ROUTE_ENTRIES);
 
     json_escape_string(escaped_node, sizeof(escaped_node), node_id);
     json_escape_string(escaped_name, sizeof(escaped_name), node_config.node_name);
+    json_escape_string(escaped_role, sizeof(escaped_role), node_config.node_role);
     json_escape_string(escaped_location, sizeof(escaped_location), node_config.location.barangay);
     json_escape_string(escaped_ssid, sizeof(escaped_ssid), ap_ssid);
     json_escape_string(escaped_relay, sizeof(escaped_relay), "true");
 
-    snprintf(response, sizeof(response),
-             "{\"node\":\"%s\",\"name\":\"%s\",\"location\":\"%s\",\"ssid\":\"%s\",\"clients\":%u,\"messages\":%u,\"configured\":%s,\"relay\":\"%s\",\"duplicate_warning\":%s,\"time_synced\":%s,\"epoch\":%lu}",
-             escaped_node,
-             escaped_name,
-             escaped_location,
-             escaped_ssid,
-             clients.num,
-             (unsigned int)current_message_count,
-             node_config.configured ? "true" : "false",
-             escaped_relay,
-             duplicate_node_id_warning ? "true" : "false",
-             time_synced ? "true" : "false",
-             (unsigned long)current_epoch_seconds());
-
     httpd_resp_set_type(request, "application/json");
-    return httpd_resp_send(request, response, HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(request, "{", 1);
+    {
+        char chunk[256];
+        snprintf(chunk, sizeof(chunk),
+                 "\"node\":\"%s\",\"name\":\"%s\",\"node_role\":\"%s\",\"location\":\"%s\",\"ssid\":\"%s\",\"clients\":%u,\"messages\":%u,\"configured\":%s,\"relay\":\"%s\",\"duplicate_warning\":%s,\"time_synced\":%s,\"epoch\":%lu,\"roster\":[",
+                 escaped_node,
+                 escaped_name,
+                 escaped_role,
+                 escaped_location,
+                 escaped_ssid,
+                 clients.num,
+                 (unsigned int)current_message_count,
+                 node_config.configured ? "true" : "false",
+                 escaped_relay,
+                 duplicate_node_id_warning ? "true" : "false",
+                 time_synced ? "true" : "false",
+                 (unsigned long)current_epoch_seconds());
+        httpd_resp_send_chunk(request, chunk, HTTPD_RESP_USE_STRLEN);
+    }
+    for (size_t i = 0; i < roster_count; i++) {
+        send_roster_json_chunk(request, &roster_snapshot[i], i == 0);
+    }
+    httpd_resp_send_chunk(request, "],\"routes\":[", HTTPD_RESP_USE_STRLEN);
+    for (size_t i = 0; i < route_count; i++) {
+        send_route_json_chunk(request, &route_snapshot[i], i == 0);
+    }
+    httpd_resp_send_chunk(request, "]}", 2);
+    return httpd_resp_send_chunk(request, NULL, 0);
 }
 
 static esp_err_t messages_handler(httpd_req_t *request)
@@ -2407,8 +2552,8 @@ static void start_wifi_ap(void)
     wifi_config.ap.max_connection = AP_MAX_CONNECTIONS;
     wifi_config.ap.authmode = WIFI_AUTH_OPEN;
 
-    if (strlen(AP_PASSWORD) >= 8) {
-        copy_field((char *)wifi_config.ap.password, sizeof(wifi_config.ap.password), AP_PASSWORD);
+    if (strlen(node_config.ap_password) >= 8) {
+        copy_field((char *)wifi_config.ap.password, sizeof(wifi_config.ap.password), node_config.ap_password);
         wifi_config.ap.authmode = WIFI_AUTH_WPA2_PSK;
     }
 
