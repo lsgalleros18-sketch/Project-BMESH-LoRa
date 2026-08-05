@@ -33,6 +33,7 @@
 #include "http/http_messages.h"
 #include "http/http_portal.h"
 #include "http/http_reset.h"
+#include "http/http_send.h"
 #include "http/http_status.h"
 #include "http/http_time.h"
 #include "http/http_sync.h"
@@ -191,7 +192,6 @@ static retry_entry_t retry_entries[MAX_MESSAGES];
 static size_t seen_packet_count;
 static uint32_t packet_counter;
 static uint32_t highest_seen_id;
-static TickType_t last_send_tick;
 static int64_t epoch_offset_sec;
 static bool time_synced;
 static uint8_t time_sync_distance;
@@ -1682,66 +1682,6 @@ static esp_err_t setup_handler(httpd_req_t *request)
     return ESP_OK;
 }
 
-static esp_err_t send_handler(httpd_req_t *request)
-{
-    char body[384] = {0};
-    char destination[FIELD_LEN];
-    char sender_name[FIELD_LEN] = {0};
-    char type[FIELD_LEN] = "TEST";
-    char priority[FIELD_LEN] = "NORMAL";
-    char payload[PAYLOAD_LEN] = "No message";
-    int received = 0;
-    esp_err_t session_result = http_auth_require_session(request);
-
-    if (session_result != ESP_OK) {
-        return session_result;
-    }
-
-    while (received < request->content_len && received < (int)sizeof(body) - 1) {
-        int ret = httpd_req_recv(request, body + received, MIN(request->content_len - received, (int)sizeof(body) - 1 - received));
-        if (ret <= 0) {
-            return ESP_FAIL;
-        }
-        received += ret;
-    }
-
-    copy_field(destination, sizeof(destination), node_config.default_destination);
-    form_value(body, "sender_name", sender_name, sizeof(sender_name));
-    form_value(body, "destination", destination, sizeof(destination));
-    copy_field_no_delims(destination, sizeof(destination), destination);
-    form_value(body, "type", type, sizeof(type));
-    copy_field_no_delims(type, sizeof(type), type);
-    form_value(body, "priority", priority, sizeof(priority));
-    copy_field_no_delims(priority, sizeof(priority), priority);
-    form_value(body, "payload", payload, sizeof(payload));
-
-    if ((xTaskGetTickCount() - last_send_tick) < pdMS_TO_TICKS(10000)) {
-        httpd_resp_set_status(request, "429 Too Many Requests");
-        httpd_resp_set_type(request, "text/html");
-        return httpd_resp_send(request, "<!doctype html><html><body><h2>Slow down.</h2><p>Please wait before sending again.</p></body></html>", HTTPD_RESP_USE_STRLEN);
-    }
-
-    last_send_tick = xTaskGetTickCount();
-    if (sender_name[0] != '\0') {
-        char named_payload[PAYLOAD_LEN];
-        size_t prefix_len;
-
-        named_payload[0] = '\0';
-        copy_field(named_payload, sizeof(named_payload), sender_name);
-        prefix_len = strlen(named_payload);
-        if (prefix_len < sizeof(named_payload) - 3) {
-            named_payload[prefix_len++] = ':';
-            named_payload[prefix_len++] = ' ';
-            named_payload[prefix_len] = '\0';
-            copy_field(named_payload + prefix_len, sizeof(named_payload) - prefix_len, payload);
-        }
-        copy_field(payload, sizeof(payload), named_payload);
-    }
-
-    queue_message(destination, type, priority, payload);
-    return http_auth_send_redirect(request, "/");
-}
-
 static void start_http_server(void)
 {
     static http_messages_context_t messages_context = {
@@ -1751,6 +1691,7 @@ static void start_http_server(void)
     static http_time_context_t time_context;
     static http_sync_context_t sync_context;
     static http_reset_context_t reset_context;
+    static http_send_context_t send_context;
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = HTTP_PORT;
     config.max_uri_handlers = 16;
@@ -1779,6 +1720,10 @@ static void start_http_server(void)
     reset_context = (http_reset_context_t){
         .erase_node_config = erase_node_config,
     };
+    send_context = (http_send_context_t){
+        .default_destination = node_config.default_destination,
+        .queue_message = queue_message,
+    };
 
     const httpd_uri_t routes[] = {
         {.uri = "/", .method = HTTP_GET, .handler = http_portal_index_handler},
@@ -1786,7 +1731,7 @@ static void start_http_server(void)
         {.uri = "/setup", .method = HTTP_POST, .handler = setup_handler},
         {.uri = "/reset", .method = HTTP_POST, .handler = http_reset_handler, .user_ctx = &reset_context},
         {.uri = "/settime", .method = HTTP_POST, .handler = http_time_handler, .user_ctx = &time_context},
-        {.uri = "/send", .method = HTTP_POST, .handler = send_handler},
+        {.uri = "/send", .method = HTTP_POST, .handler = http_send_handler, .user_ctx = &send_context},
         {.uri = "/sync", .method = HTTP_POST, .handler = http_sync_handler, .user_ctx = &sync_context},
         {.uri = "/api/status", .method = HTTP_GET, .handler = http_status_handler, .user_ctx = &status_context},
         {.uri = "/api/messages", .method = HTTP_GET, .handler = http_messages_handler, .user_ctx = &messages_context},
