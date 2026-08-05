@@ -34,6 +34,7 @@
 #include "http/http_portal.h"
 #include "http/http_status.h"
 #include "http/http_time.h"
+#include "http/http_sync.h"
 #include "roster.h"
 #include "route_table.h"
 #include "messages/message_store.h"
@@ -1754,18 +1755,6 @@ static esp_err_t send_handler(httpd_req_t *request)
     return http_auth_send_redirect(request, "/");
 }
 
-static esp_err_t sync_handler(httpd_req_t *request)
-{
-    esp_err_t session_result = http_auth_require_session(request);
-
-    if (session_result != ESP_OK) {
-        return session_result;
-    }
-
-    send_manual_sync_request();
-    return http_auth_send_redirect(request, "/");
-}
-
 static void start_http_server(void)
 {
     static http_messages_context_t messages_context = {
@@ -1773,6 +1762,7 @@ static void start_http_server(void)
     };
     static http_status_context_t status_context;
     static http_time_context_t time_context;
+    static http_sync_context_t sync_context;
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = HTTP_PORT;
     config.max_uri_handlers = 16;
@@ -1795,6 +1785,9 @@ static void start_http_server(void)
         .apply_time_sync = apply_time_sync,
         .send_time_sync_packet = send_time_sync_packet,
     };
+    sync_context = (http_sync_context_t){
+        .send_manual_sync_request = send_manual_sync_request,
+    };
 
     const httpd_uri_t routes[] = {
         {.uri = "/", .method = HTTP_GET, .handler = http_portal_index_handler},
@@ -1803,7 +1796,7 @@ static void start_http_server(void)
         {.uri = "/reset", .method = HTTP_POST, .handler = reset_handler},
         {.uri = "/settime", .method = HTTP_POST, .handler = http_time_handler, .user_ctx = &time_context},
         {.uri = "/send", .method = HTTP_POST, .handler = send_handler},
-        {.uri = "/sync", .method = HTTP_POST, .handler = sync_handler},
+        {.uri = "/sync", .method = HTTP_POST, .handler = http_sync_handler, .user_ctx = &sync_context},
         {.uri = "/api/status", .method = HTTP_GET, .handler = http_status_handler, .user_ctx = &status_context},
         {.uri = "/api/messages", .method = HTTP_GET, .handler = http_messages_handler, .user_ctx = &messages_context},
         {.uri = "/generate_204", .method = HTTP_GET, .handler = http_portal_captive_handler},
