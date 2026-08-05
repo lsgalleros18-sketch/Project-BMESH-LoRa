@@ -11,7 +11,6 @@
 #include "driver/rmt_tx.h"
 #include "driver/spi_master.h"
 #include "esp_event.h"
-#include "esp_http_server.h"
 #include "esp_littlefs.h"
 #include "esp_log.h"
 #include "esp_mac.h"
@@ -35,6 +34,7 @@
 #include "http/http_reset.h"
 #include "http/http_send.h"
 #include "http/http_setup.h"
+#include "http/http_server.h"
 #include "http/http_status.h"
 #include "http/http_time.h"
 #include "http/http_sync.h"
@@ -49,7 +49,6 @@
 #define AP_CHANNEL 6
 #define AP_MAX_CONNECTIONS 4
 #define DNS_PORT 53
-#define HTTP_PORT 80
 #define MAX_SEEN_PACKETS 64
 #define SEEN_PACKET_TTL_MS 60000
 #define FIELD_LEN 32
@@ -184,7 +183,6 @@ static int64_t epoch_offset_sec;
 static bool time_synced;
 static uint8_t time_sync_distance;
 static TickType_t last_time_sync_broadcast_tick;
-static httpd_handle_t http_server;
 static spi_device_handle_t lora_spi;
 static rmt_channel_handle_t rgb_led_channel;
 static rmt_encoder_handle_t rgb_led_encoder;
@@ -1611,12 +1609,6 @@ static void start_http_server(void)
     static http_reset_context_t reset_context;
     static http_send_context_t send_context;
     static http_setup_context_t setup_context;
-    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.server_port = HTTP_PORT;
-    config.max_uri_handlers = 16;
-    config.uri_match_fn = httpd_uri_match_wildcard;
-    config.stack_size = 20480;
-
     status_context = (http_status_context_t){
         .require_session = http_auth_require_session,
         .current_epoch_seconds = current_epoch_seconds,
@@ -1652,29 +1644,13 @@ static void start_http_server(void)
         .save_node_config = save_node_config,
     };
 
-    const httpd_uri_t routes[] = {
-        {.uri = "/", .method = HTTP_GET, .handler = http_portal_index_handler},
-        {.uri = "/login", .method = HTTP_POST, .handler = http_auth_login_handler},
-        {.uri = "/setup", .method = HTTP_POST, .handler = http_setup_handler, .user_ctx = &setup_context},
-        {.uri = "/reset", .method = HTTP_POST, .handler = http_reset_handler, .user_ctx = &reset_context},
-        {.uri = "/settime", .method = HTTP_POST, .handler = http_time_handler, .user_ctx = &time_context},
-        {.uri = "/send", .method = HTTP_POST, .handler = http_send_handler, .user_ctx = &send_context},
-        {.uri = "/sync", .method = HTTP_POST, .handler = http_sync_handler, .user_ctx = &sync_context},
-        {.uri = "/api/status", .method = HTTP_GET, .handler = http_status_handler, .user_ctx = &status_context},
-        {.uri = "/api/messages", .method = HTTP_GET, .handler = http_messages_handler, .user_ctx = &messages_context},
-        {.uri = "/generate_204", .method = HTTP_GET, .handler = http_portal_captive_handler},
-        {.uri = "/gen_204", .method = HTTP_GET, .handler = http_portal_captive_handler},
-        {.uri = "/hotspot-detect.html", .method = HTTP_GET, .handler = http_portal_captive_handler},
-        {.uri = "/connecttest.txt", .method = HTTP_GET, .handler = http_portal_captive_handler},
-        {.uri = "/ncsi.txt", .method = HTTP_GET, .handler = http_portal_captive_handler},
-        {.uri = "/*", .method = HTTP_GET, .handler = http_portal_captive_handler},
-    };
-
-    ESP_ERROR_CHECK(httpd_start(&http_server, &config));
-
-    for (size_t i = 0; i < sizeof(routes) / sizeof(routes[0]); i++) {
-        ESP_ERROR_CHECK(httpd_register_uri_handler(http_server, &routes[i]));
-    }
+    http_server_start(&messages_context,
+                      &status_context,
+                      &time_context,
+                      &sync_context,
+                      &reset_context,
+                      &send_context,
+                      &setup_context);
 }
 
 static void dns_task(void *parameter)
