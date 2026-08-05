@@ -33,6 +33,7 @@
 #include "http/http_messages.h"
 #include "http/http_portal.h"
 #include "http/http_status.h"
+#include "http/http_time.h"
 #include "roster.h"
 #include "route_table.h"
 #include "messages/message_store.h"
@@ -1679,38 +1680,6 @@ static esp_err_t setup_handler(httpd_req_t *request)
     return ESP_OK;
 }
 
-static esp_err_t settime_handler(httpd_req_t *request)
-{
-    char body[128] = {0};
-    char epoch_value[FIELD_LEN] = {0};
-    uint32_t epoch = 0;
-    int received = 0;
-    esp_err_t session_result = http_auth_require_session(request);
-
-    if (session_result != ESP_OK) {
-        return session_result;
-    }
-
-    while (received < request->content_len && received < (int)sizeof(body) - 1) {
-        int ret = httpd_req_recv(request, body + received, MIN(request->content_len - received, (int)sizeof(body) - 1 - received));
-        if (ret <= 0) {
-            return ESP_FAIL;
-        }
-        received += ret;
-    }
-
-    form_value(body, "epoch", epoch_value, sizeof(epoch_value));
-    epoch = (uint32_t)strtoul(epoch_value, NULL, 10);
-    if (epoch == 0) {
-        httpd_resp_set_status(request, "400 Bad Request");
-        return httpd_resp_send(request, "Invalid epoch", HTTPD_RESP_USE_STRLEN);
-    }
-
-    apply_time_sync(epoch, 0);
-    send_time_sync_packet(epoch, 0, 2);
-    return http_auth_send_redirect(request, "/");
-}
-
 static esp_err_t reset_handler(httpd_req_t *request)
 {
     esp_err_t session_result = http_auth_require_session(request);
@@ -1803,6 +1772,7 @@ static void start_http_server(void)
         .require_session = http_auth_require_session,
     };
     static http_status_context_t status_context;
+    static http_time_context_t time_context;
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = HTTP_PORT;
     config.max_uri_handlers = 16;
@@ -1821,13 +1791,17 @@ static void start_http_server(void)
         .duplicate_node_id_warning = &duplicate_node_id_warning,
         .time_synced = &time_synced,
     };
+    time_context = (http_time_context_t){
+        .apply_time_sync = apply_time_sync,
+        .send_time_sync_packet = send_time_sync_packet,
+    };
 
     const httpd_uri_t routes[] = {
         {.uri = "/", .method = HTTP_GET, .handler = http_portal_index_handler},
         {.uri = "/login", .method = HTTP_POST, .handler = http_auth_login_handler},
         {.uri = "/setup", .method = HTTP_POST, .handler = setup_handler},
         {.uri = "/reset", .method = HTTP_POST, .handler = reset_handler},
-        {.uri = "/settime", .method = HTTP_POST, .handler = settime_handler},
+        {.uri = "/settime", .method = HTTP_POST, .handler = http_time_handler, .user_ctx = &time_context},
         {.uri = "/send", .method = HTTP_POST, .handler = send_handler},
         {.uri = "/sync", .method = HTTP_POST, .handler = sync_handler},
         {.uri = "/api/status", .method = HTTP_GET, .handler = http_status_handler, .user_ctx = &status_context},
