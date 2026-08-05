@@ -34,12 +34,14 @@
 #include "http/http_portal.h"
 #include "http/http_reset.h"
 #include "http/http_send.h"
+#include "http/http_setup.h"
 #include "http/http_status.h"
 #include "http/http_time.h"
 #include "http/http_sync.h"
 #include "roster.h"
 #include "route_table.h"
 #include "messages/message_store.h"
+#include "node_config.h"
 #include "json/json_writer.h"
 #include "utils/json_utils.h"
 #include "utils/string_utils.h"
@@ -125,20 +127,6 @@
 #define LORA_MODEM_CONFIG_1 (LORA_BW_125_KHZ | LORA_CR_4_5 | LORA_EXPLICIT_HEADER_MODE)
 #define LORA_MODEM_CONFIG_2 ((LORA_SPREADING_FACTOR << 4) | LORA_TX_CONTINUOUS_MODE | LORA_RX_PAYLOAD_CRC_ON)
 #define LORA_MODEM_CONFIG_3 (LORA_LOW_DATA_RATE_OPTIMIZE_OFF | LORA_AGC_AUTO_ON)
-
-typedef struct {
-    bool configured;
-    char node_id[FIELD_LEN];
-    char node_name[FIELD_LEN];
-    char node_role[FIELD_LEN];
-    location_info_t location;          // was: char location[FIELD_LEN]
-    char default_destination[FIELD_LEN];
-    char default_priority[FIELD_LEN];
-    char ap_password[FIELD_LEN];
-    char web_pin[FIELD_LEN];
-    char duress_pin[FIELD_LEN];
-    char network_key[FIELD_LEN];
-} node_config_t;
 
 void location_encode(const location_info_t *loc, char *out, size_t out_size);
 void location_decode(const char *encoded, location_info_t *loc);
@@ -1612,76 +1600,6 @@ static void init_littlefs(void)
     }
 }
 
-static esp_err_t setup_handler(httpd_req_t *request)
-{
-    char body[384] = {0};
-    char raw_node_id[FIELD_LEN] = {0};
-    node_config_t new_config = {0};
-    int received = 0;
-
-    while (received < request->content_len && received < (int)sizeof(body) - 1) {
-        int ret = httpd_req_recv(request, body + received, MIN(request->content_len - received, (int)sizeof(body) - 1 - received));
-        if (ret <= 0) {
-            return ESP_FAIL;
-        }
-        received += ret;
-    }
-
-    form_value(body, "node_id", raw_node_id, sizeof(raw_node_id));
-    copy_node_id(new_config.node_id, sizeof(new_config.node_id), raw_node_id);
-    form_value(body, "node_name", new_config.node_name, sizeof(new_config.node_name));
-    form_value(body, "node_role", new_config.node_role, sizeof(new_config.node_role));
-    form_value(body, "sitio", new_config.location.sitio, sizeof(new_config.location.sitio));
-    copy_field_no_delims(new_config.location.sitio, sizeof(new_config.location.sitio), new_config.location.sitio);
-    form_value(body, "barangay", new_config.location.barangay, sizeof(new_config.location.barangay));
-    copy_field_no_delims(new_config.location.barangay, sizeof(new_config.location.barangay), new_config.location.barangay);
-    form_value(body, "municipality", new_config.location.municipality, sizeof(new_config.location.municipality));
-    copy_field_no_delims(new_config.location.municipality, sizeof(new_config.location.municipality), new_config.location.municipality);
-    form_value(body, "default_destination", new_config.default_destination, sizeof(new_config.default_destination));
-    form_value(body, "default_priority", new_config.default_priority, sizeof(new_config.default_priority));
-    form_value(body, "ap_password", new_config.ap_password, sizeof(new_config.ap_password));
-    form_value(body, "web_pin", new_config.web_pin, sizeof(new_config.web_pin));
-    form_value(body, "duress_pin", new_config.duress_pin, sizeof(new_config.duress_pin));
-    form_value(body, "network_key", new_config.network_key, sizeof(new_config.network_key));
-    new_config.configured = true;
-    if (new_config.node_id[0] == '\0') {
-        copy_field(new_config.node_id, sizeof(new_config.node_id), node_id);
-    }
-    if (new_config.node_name[0] == '\0') {
-        copy_field(new_config.node_name, sizeof(new_config.node_name), "Mesh Node");
-    }
-    if (new_config.location.barangay[0] == '\0') {
-        copy_field(new_config.location.barangay, sizeof(new_config.location.barangay), "Unknown");
-    }
-    if (new_config.default_destination[0] == '\0') {
-        copy_field(new_config.default_destination, sizeof(new_config.default_destination), "BRGY001");
-    }
-    if (new_config.node_role[0] == '\0') {
-        copy_field(new_config.node_role, sizeof(new_config.node_role), "relay-only");
-    }
-    if (new_config.default_priority[0] == '\0') {
-        copy_field(new_config.default_priority, sizeof(new_config.default_priority), "NORMAL");
-    }
-    if (new_config.ap_password[0] == '\0') {
-        copy_field(new_config.ap_password, sizeof(new_config.ap_password), AP_PASSWORD);
-    }
-    if (new_config.web_pin[0] == '\0') {
-        copy_field(new_config.web_pin, sizeof(new_config.web_pin), DEFAULT_WEB_PIN);
-    }
-    if (new_config.duress_pin[0] == '\0') {
-        copy_field(new_config.duress_pin, sizeof(new_config.duress_pin), "");
-    }
-    if (new_config.network_key[0] == '\0') {
-        copy_field(new_config.network_key, sizeof(new_config.network_key), DEFAULT_NETWORK_KEY);
-    }
-
-    ESP_ERROR_CHECK(save_node_config(&new_config));
-    http_portal_send_file(request, "reboot.html");
-    vTaskDelay(pdMS_TO_TICKS(500));
-    esp_restart();
-    return ESP_OK;
-}
-
 static void start_http_server(void)
 {
     static http_messages_context_t messages_context = {
@@ -1692,6 +1610,7 @@ static void start_http_server(void)
     static http_sync_context_t sync_context;
     static http_reset_context_t reset_context;
     static http_send_context_t send_context;
+    static http_setup_context_t setup_context;
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = HTTP_PORT;
     config.max_uri_handlers = 16;
@@ -1724,11 +1643,19 @@ static void start_http_server(void)
         .default_destination = node_config.default_destination,
         .queue_message = queue_message,
     };
+    setup_context = (http_setup_context_t){
+        .node_id = node_id,
+        .ap_password = AP_PASSWORD,
+        .default_web_pin = DEFAULT_WEB_PIN,
+        .default_network_key = DEFAULT_NETWORK_KEY,
+        .copy_node_id = copy_node_id,
+        .save_node_config = save_node_config,
+    };
 
     const httpd_uri_t routes[] = {
         {.uri = "/", .method = HTTP_GET, .handler = http_portal_index_handler},
         {.uri = "/login", .method = HTTP_POST, .handler = http_auth_login_handler},
-        {.uri = "/setup", .method = HTTP_POST, .handler = setup_handler},
+        {.uri = "/setup", .method = HTTP_POST, .handler = http_setup_handler, .user_ctx = &setup_context},
         {.uri = "/reset", .method = HTTP_POST, .handler = http_reset_handler, .user_ctx = &reset_context},
         {.uri = "/settime", .method = HTTP_POST, .handler = http_time_handler, .user_ctx = &time_context},
         {.uri = "/send", .method = HTTP_POST, .handler = http_send_handler, .user_ctx = &send_context},
