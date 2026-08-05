@@ -29,6 +29,7 @@
 #include "psa/crypto.h"
 
 #include "bems_crypto.h"
+#include "http/http_auth.h"
 #include "http/http_messages.h"
 #include "http/http_status.h"
 #include "roster.h"
@@ -57,9 +58,6 @@
 #define HIGHEST_SEEN_ID_KEY "highest_seen"
 #define DEFAULT_WEB_PIN "123456789"
 #define DEFAULT_NETWORK_KEY "CHANGEME1234567"
-#define SESSION_COOKIE_NAME "BMESH_SESSION"
-#define SESSION_TOKEN_LEN 17
-#define SESSION_IDLE_TIMEOUT_MS 900000
 #define LITTLEFS_BASE_PATH "/littlefs"
 #define PORTAL_FILE_BUFFER_SIZE 1536
 
@@ -184,8 +182,6 @@ static const char *AP_PASSWORD = "123456789";
 
 static char node_id[FIELD_LEN];
 static char ap_ssid[FIELD_LEN];
-static char session_token[SESSION_TOKEN_LEN];
-static TickType_t session_last_activity_tick;
 static node_config_t node_config;
 static seen_packet_t seen_packets[MAX_SEEN_PACKETS];
 static retry_entry_t retry_entries[MAX_MESSAGES];
@@ -193,8 +189,6 @@ static size_t seen_packet_count;
 static uint32_t packet_counter;
 static uint32_t highest_seen_id;
 static TickType_t last_send_tick;
-static TickType_t last_login_attempt_tick;
-static uint8_t failed_login_count;
 static int64_t epoch_offset_sec;
 static bool time_synced;
 static uint8_t time_sync_distance;
@@ -1590,73 +1584,6 @@ static void queue_message(const char *destination, const char *type, const char 
     }
 }
 
-static esp_err_t send_redirect(httpd_req_t *request, const char *location)
-{
-    httpd_resp_set_status(request, "302 Found");
-    httpd_resp_set_hdr(request, "Location", location);
-    httpd_resp_send(request, "", HTTPD_RESP_USE_STRLEN);
-    return ESP_OK;
-}
-
-static esp_err_t send_session_expired(httpd_req_t *request)
-{
-    httpd_resp_set_status(request, "401 Unauthorized");
-    httpd_resp_set_type(request, "application/json");
-    httpd_resp_set_hdr(request, "Cache-Control", "no-store");
-    return httpd_resp_send(request, "{\"error\":\"session expired, please reload\"}", HTTPD_RESP_USE_STRLEN);
-}
-
-static void init_session_token(void)
-{
-    uint32_t random_a = esp_random();
-    uint32_t random_b = esp_random();
-
-    snprintf(session_token, sizeof(session_token), "%08lX%08lX", (unsigned long)random_a, (unsigned long)random_b);
-    session_last_activity_tick = xTaskGetTickCount();
-}
-
-static bool request_has_session(httpd_req_t *request)
-{
-    char cookie[128] = {0};
-    char expected[64];
-    TickType_t now;
-
-    if (!node_config.configured) {
-        return true;
-    }
-
-    if (httpd_req_get_hdr_value_str(request, "Cookie", cookie, sizeof(cookie)) != ESP_OK) {
-        return false;
-    }
-
-    snprintf(expected, sizeof(expected), "%s=%s", SESSION_COOKIE_NAME, session_token);
-    if (strstr(cookie, expected) == NULL) {
-        return false;
-    }
-
-    now = xTaskGetTickCount();
-    if ((now - session_last_activity_tick) > pdMS_TO_TICKS(SESSION_IDLE_TIMEOUT_MS)) {
-        return false;
-    }
-
-    session_last_activity_tick = now;
-    return true;
-}
-
-static esp_err_t require_session(httpd_req_t *request)
-{
-    if (request_has_session(request)) {
-        return ESP_OK;
-    }
-
-    if (request->method == HTTP_POST &&
-        (strcmp(request->uri, "/send") == 0 || strcmp(request->uri, "/sync") == 0)) {
-        return send_session_expired(request);
-    }
-
-    return send_redirect(request, "/");
-}
-
 static esp_err_t send_portal_file(httpd_req_t *request, const char *filename)
 {
     static const char unavailable_html[] =
@@ -1724,53 +1651,11 @@ static esp_err_t index_handler(httpd_req_t *request)
     if (!node_config.configured) {
         return send_portal_file(request, "setup.html");
     }
-    if (!request_has_session(request)) {
+    if (!http_auth_request_has_session(request)) {
         return send_portal_file(request, "login.html");
     }
 
     return send_portal_file(request, "index.html");
-}
-
-static esp_err_t login_handler(httpd_req_t *request)
-{
-    char body[96] = {0};
-    char pin[FIELD_LEN] = {0};
-    char cookie[64];
-    int received = 0;
-    TickType_t now = xTaskGetTickCount();
-    uint8_t backoff_seconds;
-
-    // Check brute-force protection
-    if (failed_login_count > 0) {
-        backoff_seconds = MIN(failed_login_count, 6) * (1u << (MIN(failed_login_count, 4) - 1));
-        if ((now - last_login_attempt_tick) < pdMS_TO_TICKS(backoff_seconds * 1000)) {
-            httpd_resp_set_status(request, "429 Too Many Requests");
-            httpd_resp_set_type(request, "text/html");
-            return httpd_resp_send(request, "<!doctype html><html><body><h2>Slow down.</h2><p>Too many login attempts.</p></body></html>", HTTPD_RESP_USE_STRLEN);
-        }
-    }
-    last_login_attempt_tick = now;
-
-    while (received < request->content_len && received < (int)sizeof(body) - 1) {
-        int ret = httpd_req_recv(request, body + received, MIN(request->content_len - received, (int)sizeof(body) - 1 - received));
-        if (ret <= 0) {
-            return ESP_FAIL;
-        }
-        received += ret;
-    }
-
-    form_value(body, "pin", pin, sizeof(pin));
-    if (!constant_time_equal((const uint8_t *)pin, (const uint8_t *)node_config.web_pin, sizeof(pin))) {
-        failed_login_count++;
-        httpd_resp_set_status(request, "403 Forbidden");
-        return send_portal_file(request, "login.html");
-    }
-
-    failed_login_count = 0;
-    snprintf(cookie, sizeof(cookie), "%s=%s; Path=/; HttpOnly; SameSite=Lax", SESSION_COOKIE_NAME, session_token);
-    httpd_resp_set_hdr(request, "Set-Cookie", cookie);
-    session_last_activity_tick = xTaskGetTickCount();
-    return send_redirect(request, "/");
 }
 
 static esp_err_t setup_handler(httpd_req_t *request)
@@ -1849,7 +1734,7 @@ static esp_err_t settime_handler(httpd_req_t *request)
     char epoch_value[FIELD_LEN] = {0};
     uint32_t epoch = 0;
     int received = 0;
-    esp_err_t session_result = require_session(request);
+    esp_err_t session_result = http_auth_require_session(request);
 
     if (session_result != ESP_OK) {
         return session_result;
@@ -1872,12 +1757,12 @@ static esp_err_t settime_handler(httpd_req_t *request)
 
     apply_time_sync(epoch, 0);
     send_time_sync_packet(epoch, 0, 2);
-    return send_redirect(request, "/");
+    return http_auth_send_redirect(request, "/");
 }
 
 static esp_err_t reset_handler(httpd_req_t *request)
 {
-    esp_err_t session_result = require_session(request);
+    esp_err_t session_result = http_auth_require_session(request);
     if (session_result != ESP_OK) {
         return session_result;
     }
@@ -1898,7 +1783,7 @@ static esp_err_t send_handler(httpd_req_t *request)
     char priority[FIELD_LEN] = "NORMAL";
     char payload[PAYLOAD_LEN] = "No message";
     int received = 0;
-    esp_err_t session_result = require_session(request);
+    esp_err_t session_result = http_auth_require_session(request);
 
     if (session_result != ESP_OK) {
         return session_result;
@@ -1946,30 +1831,30 @@ static esp_err_t send_handler(httpd_req_t *request)
     }
 
     queue_message(destination, type, priority, payload);
-    return send_redirect(request, "/");
+    return http_auth_send_redirect(request, "/");
 }
 
 static esp_err_t sync_handler(httpd_req_t *request)
 {
-    esp_err_t session_result = require_session(request);
+    esp_err_t session_result = http_auth_require_session(request);
 
     if (session_result != ESP_OK) {
         return session_result;
     }
 
     send_manual_sync_request();
-    return send_redirect(request, "/");
+    return http_auth_send_redirect(request, "/");
 }
 
 static esp_err_t captive_handler(httpd_req_t *request)
 {
-    return send_redirect(request, "/");
+    return http_auth_send_redirect(request, "/");
 }
 
 static void start_http_server(void)
 {
     static http_messages_context_t messages_context = {
-        .require_session = require_session,
+        .require_session = http_auth_require_session,
     };
     static http_status_context_t status_context;
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
@@ -1979,7 +1864,7 @@ static void start_http_server(void)
     config.stack_size = 20480;
 
     status_context = (http_status_context_t){
-        .require_session = require_session,
+        .require_session = http_auth_require_session,
         .current_epoch_seconds = current_epoch_seconds,
         .node_id = node_id,
         .node_name = node_config.node_name,
@@ -1993,7 +1878,7 @@ static void start_http_server(void)
 
     const httpd_uri_t routes[] = {
         {.uri = "/", .method = HTTP_GET, .handler = index_handler},
-        {.uri = "/login", .method = HTTP_POST, .handler = login_handler},
+        {.uri = "/login", .method = HTTP_POST, .handler = http_auth_login_handler},
         {.uri = "/setup", .method = HTTP_POST, .handler = setup_handler},
         {.uri = "/reset", .method = HTTP_POST, .handler = reset_handler},
         {.uri = "/settime", .method = HTTP_POST, .handler = settime_handler},
@@ -2137,7 +2022,11 @@ void app_main(void)
     ESP_ERROR_CHECK(data_mutex == NULL ? ESP_ERR_NO_MEM : ESP_OK);
 
     init_identity();
-    init_session_token();
+    http_auth_init(&(http_auth_context_t){
+        .configured = &node_config.configured,
+        .web_pin = node_config.web_pin,
+        .send_portal_file = send_portal_file,
+    });
     load_packet_counter();
     load_highest_seen_id();
     rgb_led_init();
