@@ -31,6 +31,7 @@
 #include "bems_crypto.h"
 #include "roster.h"
 #include "route_table.h"
+#include "messages/message_store.h"
 #include "json/json_writer.h"
 #include "utils/json_utils.h"
 #include "utils/string_utils.h"
@@ -39,15 +40,12 @@
 #define AP_MAX_CONNECTIONS 4
 #define DNS_PORT 53
 #define HTTP_PORT 80
-#define MAX_MESSAGES 16
 #define MAX_SEEN_PACKETS 64
 #define SEEN_PACKET_TTL_MS 60000
 #define FIELD_LEN 32
 #define SITIO_LEN 24
 #define BARANGAY_LEN 24
 #define MUNICIPALITY_LEN 24
-#define PAYLOAD_LEN 140
-#define PACKET_LEN 320
 #define BOOT_BUTTON_GPIO 0
 #define RGB_LED_GPIO 48
 #define FACTORY_RESET_HOLD_MS 10000
@@ -140,8 +138,6 @@ typedef struct {
 
 void location_encode(const location_info_t *loc, char *out, size_t out_size);
 void location_decode(const char *encoded, location_info_t *loc);
-static void save_message_to_nvs(const emergency_message_t *message, int slot);
-static void load_messages_from_nvs(void);
 static void update_message_status(uint32_t id, const char *source, const char *status);
 static bool lora_channel_clear(void);
 static void retry_tracker_task(void *parameter);
@@ -189,10 +185,8 @@ static char ap_ssid[FIELD_LEN];
 static char session_token[SESSION_TOKEN_LEN];
 static TickType_t session_last_activity_tick;
 static node_config_t node_config;
-static emergency_message_t messages[MAX_MESSAGES];
 static seen_packet_t seen_packets[MAX_SEEN_PACKETS];
 static retry_entry_t retry_entries[MAX_MESSAGES];
-static size_t message_count;
 static size_t seen_packet_count;
 static uint32_t packet_counter;
 static uint32_t highest_seen_id;
@@ -217,8 +211,6 @@ static SemaphoreHandle_t lora_tx_done_semaphore;
 static SemaphoreHandle_t data_mutex;
 static roster_entry_t roster_snapshot_buffer[MAX_ROSTER_ENTRIES];
 static route_entry_t route_snapshot_buffer[MAX_ROUTE_ENTRIES];
-static emergency_message_t message_snapshot_buffer[MAX_MESSAGES];
-
 static void save_packet_counter(void);
 static void update_highest_seen_id(uint32_t id);
 static bool lora_transmit(const char *packet);
@@ -417,43 +409,6 @@ static void IRAM_ATTR lora_dio0_isr_handler(void *arg)
     if (high_priority_task_woken == pdTRUE) {
         portYIELD_FROM_ISR();
     }
-}
-
-static emergency_message_t *next_message_slot(void)
-{
-    emergency_message_t *message = NULL;
-
-    if (message_count < MAX_MESSAGES) {
-        message = &messages[message_count++];
-    } else {
-        size_t oldest_completed_index = MAX_MESSAGES;
-        TickType_t oldest_completed_tick = 0;
-
-        for (size_t i = 0; i < MAX_MESSAGES; i++) {
-            const emergency_message_t *candidate = &messages[i];
-            bool completed = strcmp(candidate->direction, "RX") == 0 ||
-                             strcmp(candidate->status, "ACKED") == 0 ||
-                             strcmp(candidate->status, "FAILED") == 0;
-
-            if (!completed) {
-                continue;
-            }
-
-            if (oldest_completed_index == MAX_MESSAGES || candidate->stored_epoch <= oldest_completed_tick) {
-                oldest_completed_index = i;
-                oldest_completed_tick = candidate->stored_epoch;
-            }
-        }
-
-        if (oldest_completed_index == MAX_MESSAGES) {
-            return NULL;
-        }
-
-        message = &messages[oldest_completed_index];
-    }
-
-    memset(message, 0, sizeof(*message));
-    return message;
 }
 
 static bool packet_seen(const char *source, uint32_t id)
@@ -735,14 +690,15 @@ static void send_sync_responses(const mesh_packet_t *request)
 {
     emergency_message_t snapshot[MAX_MESSAGES];
     size_t snapshot_count = 0;
+    size_t stored_message_count;
     uint32_t last_id = sync_last_id_from_payload(request->payload);
     char encoded_location[SITIO_LEN + BARANGAY_LEN + MUNICIPALITY_LEN + 2];
 
     location_encode(&node_config.location, encoded_location, sizeof(encoded_location));
 
-    data_lock();
-    for (size_t i = 0; i < message_count && snapshot_count < MAX_MESSAGES; i++) {
-        const emergency_message_t *message = &messages[i];
+    stored_message_count = message_store_copy_all(snapshot, MAX_MESSAGES);
+    for (size_t i = 0; i < stored_message_count; i++) {
+        const emergency_message_t *message = &snapshot[i];
 
         if (strcmp(message->direction, "RX") != 0 && strcmp(message->direction, "TX") != 0) {
             continue;
@@ -759,7 +715,6 @@ static void send_sync_responses(const mesh_packet_t *request)
 
         snapshot[snapshot_count++] = *message;
     }
-    data_unlock();
 
     for (size_t i = 0; i < snapshot_count; i++) {
         char sync_response[PACKET_LEN];
@@ -839,13 +794,15 @@ static void boot_sync_task(void *parameter)
 
 static void store_received_packet(const char *packet, const mesh_packet_t *parsed, int rssi, int snr)
 {
+    int nvs_slot;
     data_lock();
-    emergency_message_t *message = next_message_slot();
+    emergency_message_t *message = message_store_begin_write(&nvs_slot);
     bool counter_changed = false;
 
     if (message == NULL) {
-        ESP_LOGW(TAG, "Dropping received packet because message table is full of active entries");
+        message_store_end_update();
         data_unlock();
+        ESP_LOGW(TAG, "Dropping received packet because message table is full of active entries");
         return;
     }
 
@@ -891,9 +848,10 @@ static void store_received_packet(const char *packet, const mesh_packet_t *parse
         bool is_relevant = (strcmp(parsed->source, node_id) == 0) || 
                           (strcmp(parsed->destination, node_id) == 0);
         if (is_relevant) {
-            save_message_to_nvs(message, (int)(message_count - 1));
+            message_store_save_message_to_nvs(message, nvs_slot);
         }
     }
+    message_store_end_update();
     data_unlock();
 }
 
@@ -1148,13 +1106,7 @@ static void lora_init(void)
 static void update_message_status(uint32_t id, const char *source, const char *status)
 {
     data_lock();
-    for (size_t i = 0; i < message_count; i++) {
-        emergency_message_t *message = &messages[i];
-        if (message->id == id && strcmp(message->source, source) == 0) {
-            copy_field(message->status, sizeof(message->status), status);
-            break;
-        }
-    }
+    message_store_update_status(id, source, status);
     data_unlock();
 }
 
@@ -1192,26 +1144,22 @@ static void retry_tracker_task(void *parameter)
                 continue;
             }
 
-            for (size_t j = 0; j < message_count; j++) {
-                emergency_message_t *message = &messages[j];
-                if (message->id != entry->id || strcmp(message->source, entry->source) != 0) {
-                    continue;
-                }
-                if (strcmp(message->status, "ACKED") == 0) {
-                    entry->active = false;
-                    break;
-                }
-                if (entry->attempts >= 3) {
-                    copy_field(message->status, sizeof(message->status), "FAILED");
-                    entry->active = false;
-                    break;
-                }
+            emergency_message_t *message = message_store_begin_update(entry->id, entry->source);
+            if (message == NULL) {
+                continue;
+            }
+            if (strcmp(message->status, "ACKED") == 0) {
+                entry->active = false;
+            } else if (entry->attempts >= 3) {
+                copy_field(message->status, sizeof(message->status), "FAILED");
+                entry->active = false;
+            } else {
                 entry->attempts++;
                 entry->next_retry_tick = now + pdMS_TO_TICKS(5000 * entry->attempts);
                 lora_transmit(message->packet);
                 copy_field(message->status, sizeof(message->status), "SENT");
-                break;
             }
+            message_store_end_update();
         }
         data_unlock();
         vTaskDelay(pdMS_TO_TICKS(1000));
@@ -1343,75 +1291,6 @@ static void update_highest_seen_id(uint32_t id)
         highest_seen_id = id;
         save_highest_seen_id();
     }
-}
-
-static void save_message_to_nvs(const emergency_message_t *message, int slot)
-{
-    nvs_handle_t handle;
-    char key[16];
-    esp_err_t result;
-
-    if (slot < 0 || slot >= MAX_MESSAGES) {
-        return;
-    }
-
-    result = nvs_open(CONFIG_NAMESPACE, NVS_READWRITE, &handle);
-    if (result != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to open NVS for message save: %s", esp_err_to_name(result));
-        return;
-    }
-
-    snprintf(key, sizeof(key), "msg_%d", slot);
-    result = nvs_set_blob(handle, key, (const void *)message, sizeof(*message));
-    if (result == ESP_OK) {
-        result = nvs_commit(handle);
-    }
-
-    if (result != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to save message %d to NVS: %s", slot, esp_err_to_name(result));
-    }
-
-    nvs_close(handle);
-}
-
-static void load_messages_from_nvs(void)
-{
-    nvs_handle_t handle;
-    char key[16];
-    esp_err_t result;
-    size_t blob_size;
-    emergency_message_t loaded_message;
-
-    result = nvs_open(CONFIG_NAMESPACE, NVS_READONLY, &handle);
-    if (result != ESP_OK) {
-        ESP_LOGI(TAG, "No saved messages in NVS");
-        return;
-    }
-
-    message_count = 0;
-    for (int i = 0; i < MAX_MESSAGES; i++) {
-        snprintf(key, sizeof(key), "msg_%d", i);
-        blob_size = sizeof(loaded_message);
-        result = nvs_get_blob(handle, key, &loaded_message, &blob_size);
-        
-        if (result == ESP_OK && blob_size == sizeof(loaded_message)) {
-            if (strcmp(loaded_message.direction, "TX") == 0 || strcmp(loaded_message.direction, "RX") == 0) {
-                // Only restore messages where we are source or destination (skip pure relay traffic)
-                bool is_relevant = (strcmp(loaded_message.source, node_id) == 0) ||
-                                   (strcmp(loaded_message.destination, node_id) == 0);
-                if (is_relevant) {
-                    memcpy(&messages[message_count], &loaded_message, sizeof(loaded_message));
-                    message_count++;
-                    if (message_count >= MAX_MESSAGES) {
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    ESP_LOGI(TAG, "Loaded %zu messages from NVS", message_count);
-    nvs_close(handle);
 }
 
 static void config_set_defaults(void)
@@ -1668,11 +1547,13 @@ static void queue_message(const char *destination, const char *type, const char 
     char queued_source[FIELD_LEN];
     char queued_destination[FIELD_LEN];
     char queued_priority[FIELD_LEN];
+    int nvs_slot;
 
     data_lock();
-    emergency_message_t *message = next_message_slot();
+    emergency_message_t *message = message_store_begin_write(&nvs_slot);
 
     if (message == NULL) {
+        message_store_end_update();
         data_unlock();
         ESP_LOGW(TAG, "Message queue full; unable to enqueue %s -> %s", node_id, destination);
         return;
@@ -1696,7 +1577,8 @@ static void queue_message(const char *destination, const char *type, const char 
     copy_field(queued_priority, sizeof(queued_priority), message->priority);
     copy_field(packet, sizeof(packet), message->packet);
     save_packet_counter();
-    save_message_to_nvs(message, (int)(message_count - 1));
+    message_store_save_message_to_nvs(message, nvs_slot);
+    message_store_end_update();
     data_unlock();
 
     ESP_LOGI(TAG, "LoRa TX pending: %s", packet);
@@ -2145,9 +2027,7 @@ static esp_err_t status_handler(httpd_req_t *request)
     }
 
     esp_wifi_ap_get_sta_list(&clients);
-    data_lock();
-    current_message_count = message_count;
-    data_unlock();
+    current_message_count = message_store_count();
     roster_count = roster_get_snapshot(roster_snapshot_buffer, MAX_ROSTER_ENTRIES);
     route_count = route_table_get_snapshot(route_snapshot_buffer, MAX_ROUTE_ENTRIES);
 
@@ -2208,6 +2088,7 @@ static esp_err_t messages_handler(httpd_req_t *request)
     size_t snapshot_count = 0;
     esp_err_t session_result = require_session(request);
     esp_err_t chunk_result;
+    const emergency_message_t *snapshot;
 
     if (session_result != ESP_OK) {
         ESP_LOGW(TAG, "/api/messages rejected: %s", esp_err_to_name(session_result));
@@ -2221,24 +2102,15 @@ static esp_err_t messages_handler(httpd_req_t *request)
     if (chunk_result != ESP_OK) {
         return chunk_result;
     }
-    data_lock();
-    ESP_LOGI(TAG, "messages_handler: message_count=%u", (unsigned int)message_count);
-    for (size_t i = 0; i < message_count && snapshot_count < MAX_MESSAGES; i++) {
-        ESP_LOGI(TAG, "messages_handler: snapshot copy i=%u snapshot_count=%u src_index=%u id=%lu",
-                 (unsigned int)i,
-                 (unsigned int)snapshot_count,
-                 (unsigned int)(message_count - 1 - i),
-                 (unsigned long)messages[message_count - 1 - i].id);
-        message_snapshot_buffer[snapshot_count++] = messages[message_count - 1 - i];
-    }
-    data_unlock();
+    snapshot = message_store_snapshot(&snapshot_count);
+    ESP_LOGI(TAG, "messages_handler: message_count=%u", (unsigned int)snapshot_count);
     ESP_LOGI(TAG, "messages_handler: snapshot_count=%u after copy", (unsigned int)snapshot_count);
     for (size_t i = 0; i < snapshot_count; i++) {
         ESP_LOGI(TAG, "messages_handler: serializing snapshot[%u] id=%lu first=%d",
                  (unsigned int)i,
-                 (unsigned long)message_snapshot_buffer[i].id,
+                 (unsigned long)snapshot[i].id,
                  i == 0 ? 1 : 0);
-        write_message_json_chunk(request, &message_snapshot_buffer[i], i == 0);
+        write_message_json_chunk(request, &snapshot[i], i == 0);
     }
     ESP_LOGI(TAG, "messages_handler: sending closing ']'");
     chunk_result = httpd_resp_send_chunk(request, "]", 1);
@@ -2419,7 +2291,7 @@ void app_main(void)
     rgb_led_init();
     init_factory_reset_button();
     load_node_config();
-    load_messages_from_nvs();
+    message_store_load_messages_from_nvs(node_id);
     lora_init();
     init_littlefs();
     xTaskCreate(boot_sync_task, "boot_sync_task", 4096, NULL, 4, NULL);
