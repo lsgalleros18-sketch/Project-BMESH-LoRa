@@ -31,6 +31,7 @@
 #include "bems_crypto.h"
 #include "http/http_auth.h"
 #include "http/http_messages.h"
+#include "http/http_portal.h"
 #include "http/http_status.h"
 #include "roster.h"
 #include "route_table.h"
@@ -59,7 +60,6 @@
 #define DEFAULT_WEB_PIN "123456789"
 #define DEFAULT_NETWORK_KEY "CHANGEME1234567"
 #define LITTLEFS_BASE_PATH "/littlefs"
-#define PORTAL_FILE_BUFFER_SIZE 1536
 
 #define LORA_MISO_GPIO 5
 #define LORA_DIO0_GPIO 16
@@ -1584,43 +1584,6 @@ static void queue_message(const char *destination, const char *type, const char 
     }
 }
 
-static esp_err_t send_portal_file(httpd_req_t *request, const char *filename)
-{
-    static const char unavailable_html[] =
-        "<!doctype html><html><body><h2>Portal unavailable</h2><p>The portal files could not be mounted. Restart the node or reflash its filesystem image.</p></body></html>";
-    char path[64];
-    char buffer[PORTAL_FILE_BUFFER_SIZE];
-    FILE *file;
-    esp_err_t result = ESP_OK;
-    size_t bytes_read;
-
-    httpd_resp_set_type(request, "text/html");
-    if (!littlefs_mounted) {
-        httpd_resp_set_status(request, "503 Service Unavailable");
-        return httpd_resp_send(request, unavailable_html, HTTPD_RESP_USE_STRLEN);
-    }
-    if (snprintf(path, sizeof(path), "%s/%s", LITTLEFS_BASE_PATH, filename) >= (int)sizeof(path)) {
-        return ESP_FAIL;
-    }
-    file = fopen(path, "r");
-    if (file == NULL) {
-        ESP_LOGE(TAG, "Portal file not found: %s", path);
-        httpd_resp_set_status(request, "500 Internal Server Error");
-        return httpd_resp_send(request, unavailable_html, HTTPD_RESP_USE_STRLEN);
-    }
-    while ((bytes_read = fread(buffer, 1, sizeof(buffer), file)) > 0) {
-        result = httpd_resp_send_chunk(request, buffer, bytes_read);
-        if (result != ESP_OK) {
-            break;
-        }
-    }
-    if (ferror(file)) {
-        result = ESP_FAIL;
-    }
-    fclose(file);
-    return result == ESP_OK ? httpd_resp_send_chunk(request, NULL, 0) : result;
-}
-
 static void init_littlefs(void)
 {
     esp_vfs_littlefs_conf_t config = {
@@ -1644,18 +1607,6 @@ static void init_littlefs(void)
     } else {
         ESP_LOGW(TAG, "LittleFS mounted, but space query failed: %s", esp_err_to_name(result));
     }
-}
-
-static esp_err_t index_handler(httpd_req_t *request)
-{
-    if (!node_config.configured) {
-        return send_portal_file(request, "setup.html");
-    }
-    if (!http_auth_request_has_session(request)) {
-        return send_portal_file(request, "login.html");
-    }
-
-    return send_portal_file(request, "index.html");
 }
 
 static esp_err_t setup_handler(httpd_req_t *request)
@@ -1722,7 +1673,7 @@ static esp_err_t setup_handler(httpd_req_t *request)
     }
 
     ESP_ERROR_CHECK(save_node_config(&new_config));
-    send_portal_file(request, "reboot.html");
+    http_portal_send_file(request, "reboot.html");
     vTaskDelay(pdMS_TO_TICKS(500));
     esp_restart();
     return ESP_OK;
@@ -1768,7 +1719,7 @@ static esp_err_t reset_handler(httpd_req_t *request)
     }
 
     erase_node_config();
-    send_portal_file(request, "reboot.html");
+    http_portal_send_file(request, "reboot.html");
     vTaskDelay(pdMS_TO_TICKS(500));
     esp_restart();
     return ESP_OK;
@@ -1846,11 +1797,6 @@ static esp_err_t sync_handler(httpd_req_t *request)
     return http_auth_send_redirect(request, "/");
 }
 
-static esp_err_t captive_handler(httpd_req_t *request)
-{
-    return http_auth_send_redirect(request, "/");
-}
-
 static void start_http_server(void)
 {
     static http_messages_context_t messages_context = {
@@ -1877,7 +1823,7 @@ static void start_http_server(void)
     };
 
     const httpd_uri_t routes[] = {
-        {.uri = "/", .method = HTTP_GET, .handler = index_handler},
+        {.uri = "/", .method = HTTP_GET, .handler = http_portal_index_handler},
         {.uri = "/login", .method = HTTP_POST, .handler = http_auth_login_handler},
         {.uri = "/setup", .method = HTTP_POST, .handler = setup_handler},
         {.uri = "/reset", .method = HTTP_POST, .handler = reset_handler},
@@ -1886,12 +1832,12 @@ static void start_http_server(void)
         {.uri = "/sync", .method = HTTP_POST, .handler = sync_handler},
         {.uri = "/api/status", .method = HTTP_GET, .handler = http_status_handler, .user_ctx = &status_context},
         {.uri = "/api/messages", .method = HTTP_GET, .handler = http_messages_handler, .user_ctx = &messages_context},
-        {.uri = "/generate_204", .method = HTTP_GET, .handler = captive_handler},
-        {.uri = "/gen_204", .method = HTTP_GET, .handler = captive_handler},
-        {.uri = "/hotspot-detect.html", .method = HTTP_GET, .handler = captive_handler},
-        {.uri = "/connecttest.txt", .method = HTTP_GET, .handler = captive_handler},
-        {.uri = "/ncsi.txt", .method = HTTP_GET, .handler = captive_handler},
-        {.uri = "/*", .method = HTTP_GET, .handler = captive_handler},
+        {.uri = "/generate_204", .method = HTTP_GET, .handler = http_portal_captive_handler},
+        {.uri = "/gen_204", .method = HTTP_GET, .handler = http_portal_captive_handler},
+        {.uri = "/hotspot-detect.html", .method = HTTP_GET, .handler = http_portal_captive_handler},
+        {.uri = "/connecttest.txt", .method = HTTP_GET, .handler = http_portal_captive_handler},
+        {.uri = "/ncsi.txt", .method = HTTP_GET, .handler = http_portal_captive_handler},
+        {.uri = "/*", .method = HTTP_GET, .handler = http_portal_captive_handler},
     };
 
     ESP_ERROR_CHECK(httpd_start(&http_server, &config));
@@ -2022,10 +1968,15 @@ void app_main(void)
     ESP_ERROR_CHECK(data_mutex == NULL ? ESP_ERR_NO_MEM : ESP_OK);
 
     init_identity();
+    http_portal_init(&(http_portal_context_t){
+        .configured = &node_config.configured,
+        .littlefs_mounted = &littlefs_mounted,
+        .littlefs_base_path = LITTLEFS_BASE_PATH,
+    });
     http_auth_init(&(http_auth_context_t){
         .configured = &node_config.configured,
         .web_pin = node_config.web_pin,
-        .send_portal_file = send_portal_file,
+        .send_portal_file = http_portal_send_file,
     });
     load_packet_counter();
     load_highest_seen_id();
