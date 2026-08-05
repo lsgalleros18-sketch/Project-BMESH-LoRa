@@ -32,6 +32,7 @@
 #include "http/http_auth.h"
 #include "http/http_messages.h"
 #include "http/http_portal.h"
+#include "http/http_reset.h"
 #include "http/http_status.h"
 #include "http/http_time.h"
 #include "http/http_sync.h"
@@ -1681,20 +1682,6 @@ static esp_err_t setup_handler(httpd_req_t *request)
     return ESP_OK;
 }
 
-static esp_err_t reset_handler(httpd_req_t *request)
-{
-    esp_err_t session_result = http_auth_require_session(request);
-    if (session_result != ESP_OK) {
-        return session_result;
-    }
-
-    erase_node_config();
-    http_portal_send_file(request, "reboot.html");
-    vTaskDelay(pdMS_TO_TICKS(500));
-    esp_restart();
-    return ESP_OK;
-}
-
 static esp_err_t send_handler(httpd_req_t *request)
 {
     char body[384] = {0};
@@ -1763,6 +1750,7 @@ static void start_http_server(void)
     static http_status_context_t status_context;
     static http_time_context_t time_context;
     static http_sync_context_t sync_context;
+    static http_reset_context_t reset_context;
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = HTTP_PORT;
     config.max_uri_handlers = 16;
@@ -1788,12 +1776,15 @@ static void start_http_server(void)
     sync_context = (http_sync_context_t){
         .send_manual_sync_request = send_manual_sync_request,
     };
+    reset_context = (http_reset_context_t){
+        .erase_node_config = erase_node_config,
+    };
 
     const httpd_uri_t routes[] = {
         {.uri = "/", .method = HTTP_GET, .handler = http_portal_index_handler},
         {.uri = "/login", .method = HTTP_POST, .handler = http_auth_login_handler},
         {.uri = "/setup", .method = HTTP_POST, .handler = setup_handler},
-        {.uri = "/reset", .method = HTTP_POST, .handler = reset_handler},
+        {.uri = "/reset", .method = HTTP_POST, .handler = http_reset_handler, .user_ctx = &reset_context},
         {.uri = "/settime", .method = HTTP_POST, .handler = http_time_handler, .user_ctx = &time_context},
         {.uri = "/send", .method = HTTP_POST, .handler = send_handler},
         {.uri = "/sync", .method = HTTP_POST, .handler = http_sync_handler, .user_ctx = &sync_context},
