@@ -29,6 +29,7 @@
 #include "psa/crypto.h"
 
 #include "bems_crypto.h"
+#include "http/http_messages.h"
 #include "roster.h"
 #include "route_table.h"
 #include "messages/message_store.h"
@@ -2083,49 +2084,6 @@ static esp_err_t status_handler(httpd_req_t *request)
     return httpd_resp_send_chunk(request, NULL, 0);
 }
 
-static esp_err_t messages_handler(httpd_req_t *request)
-{
-    size_t snapshot_count = 0;
-    esp_err_t session_result = require_session(request);
-    esp_err_t chunk_result;
-    const emergency_message_t *snapshot;
-
-    if (session_result != ESP_OK) {
-        ESP_LOGW(TAG, "/api/messages rejected: %s", esp_err_to_name(session_result));
-        return session_result;
-    }
-
-    httpd_resp_set_type(request, "application/json");
-    ESP_LOGI(TAG, "messages_handler: sending opening '['");
-    chunk_result = httpd_resp_send_chunk(request, "[", 1);
-    ESP_LOGI(TAG, "messages_handler: opening '[' result=%s", esp_err_to_name(chunk_result));
-    if (chunk_result != ESP_OK) {
-        return chunk_result;
-    }
-    snapshot = message_store_snapshot(&snapshot_count);
-    ESP_LOGI(TAG, "messages_handler: message_count=%u", (unsigned int)snapshot_count);
-    ESP_LOGI(TAG, "messages_handler: snapshot_count=%u after copy", (unsigned int)snapshot_count);
-    for (size_t i = 0; i < snapshot_count; i++) {
-        ESP_LOGI(TAG, "messages_handler: serializing snapshot[%u] id=%lu first=%d",
-                 (unsigned int)i,
-                 (unsigned long)snapshot[i].id,
-                 i == 0 ? 1 : 0);
-        write_message_json_chunk(request, &snapshot[i], i == 0);
-    }
-    ESP_LOGI(TAG, "messages_handler: sending closing ']'");
-    chunk_result = httpd_resp_send_chunk(request, "]", 1);
-    ESP_LOGI(TAG, "messages_handler: closing ']' result=%s", esp_err_to_name(chunk_result));
-    if (chunk_result != ESP_OK) {
-        return chunk_result;
-    }
-    httpd_resp_set_type(request, "application/json");
-    ESP_LOGI(TAG, "messages_handler: sending final NULL chunk");
-    chunk_result = httpd_resp_send_chunk(request, NULL, 0);
-    ESP_LOGI(TAG, "messages_handler: final NULL chunk result=%s", esp_err_to_name(chunk_result));
-    ESP_LOGI(TAG, "/api/messages served: %u messages", (unsigned int)snapshot_count);
-    return chunk_result;
-}
-
 static esp_err_t captive_handler(httpd_req_t *request)
 {
     return send_redirect(request, "/");
@@ -2133,6 +2091,9 @@ static esp_err_t captive_handler(httpd_req_t *request)
 
 static void start_http_server(void)
 {
+    static http_messages_context_t messages_context = {
+        .require_session = require_session,
+    };
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = HTTP_PORT;
     config.max_uri_handlers = 16;
@@ -2148,7 +2109,7 @@ static void start_http_server(void)
         {.uri = "/send", .method = HTTP_POST, .handler = send_handler},
         {.uri = "/sync", .method = HTTP_POST, .handler = sync_handler},
         {.uri = "/api/status", .method = HTTP_GET, .handler = status_handler},
-        {.uri = "/api/messages", .method = HTTP_GET, .handler = messages_handler},
+        {.uri = "/api/messages", .method = HTTP_GET, .handler = http_messages_handler, .user_ctx = &messages_context},
         {.uri = "/generate_204", .method = HTTP_GET, .handler = captive_handler},
         {.uri = "/gen_204", .method = HTTP_GET, .handler = captive_handler},
         {.uri = "/hotspot-detect.html", .method = HTTP_GET, .handler = captive_handler},
