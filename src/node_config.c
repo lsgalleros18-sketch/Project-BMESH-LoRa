@@ -153,6 +153,7 @@ void node_config_load(void)
     nvs_handle_t handle;
     uint8_t configured = 0;
     bool migrated_location = false;
+    bool regenerated_secret = false;
     char legacy_location[FIELD_LEN] = {0};
 
     ensure_mutex();
@@ -192,15 +193,19 @@ void node_config_load(void)
 
     if (node_config.web_pin[0] == '\0') {
         random_hex_string(node_config.web_pin, sizeof(node_config.web_pin), 4);
+        regenerated_secret = true;
     }
     if (node_config.ap_password[0] == '\0') {
         random_hex_string(node_config.ap_password, sizeof(node_config.ap_password), 8);
+        regenerated_secret = true;
     }
     if (node_config.network_key[0] == '\0') {
         random_hex_string(node_config.network_key, sizeof(node_config.network_key), 16);
+        regenerated_secret = true;
     }
     if (node_config.duress_pin[0] == '\0') {
         random_hex_string(node_config.duress_pin, sizeof(node_config.duress_pin), 4);
+        regenerated_secret = true;
     }
     if (node_config.node_role[0] == '\0') {
         copy_field(node_config.node_role, sizeof(node_config.node_role), "relay-only");
@@ -209,8 +214,8 @@ void node_config_load(void)
         copy_field(node_config.default_priority, sizeof(node_config.default_priority), "NORMAL");
     }
 
-    if (!node_config.configured) {
-        ESP_LOGW("node_config", "Provisioning defaults generated: web_pin=%s network_key=%s", node_config.web_pin, node_config.network_key);
+    if (regenerated_secret) {
+        ESP_LOGW("node_config", "Regenerated missing credentials: configured=%d web_pin=%s network_key=%s", node_config.configured ? 1 : 0, node_config.web_pin, node_config.network_key);
         (void)node_config_save(&node_config);
     }
 

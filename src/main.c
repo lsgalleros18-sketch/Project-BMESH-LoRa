@@ -43,14 +43,14 @@
 #include "messages/message_store.h"
 #include "node_config.h"
 #include "json/json_writer.h"
+#include "mesh_control.h"
+#include "radio/lora_radio.h"
 #include "utils/json_utils.h"
 #include "utils/string_utils.h"
 
 #define AP_CHANNEL 6
 #define AP_MAX_CONNECTIONS 4
 #define DNS_PORT 53
-#define MAX_SEEN_PACKETS 64
-#define SEEN_PACKET_TTL_MS 60000
 #define FIELD_LEN 32
 #define SITIO_LEN 24
 #define BARANGAY_LEN 24
@@ -66,83 +66,11 @@
 #define DEFAULT_NETWORK_KEY "CHANGEME1234567"
 #define LITTLEFS_BASE_PATH "/littlefs"
 
-#define LORA_MISO_GPIO 5
-#define LORA_DIO0_GPIO 16
-#define LORA_SCK_GPIO 7
-#define LORA_MOSI_GPIO 6
-#define LORA_RST_GPIO 4
-#define LORA_NSS_GPIO 8
-#define LORA_SPI_HOST SPI2_HOST
-#define LORA_FREQUENCY_HZ 433000000UL
-#define LORA_MAX_PAYLOAD 255
-
-#define REG_FIFO 0x00
-#define REG_OP_MODE 0x01
-#define REG_FRF_MSB 0x06
-#define REG_FRF_MID 0x07
-#define REG_FRF_LSB 0x08
-#define REG_PA_CONFIG 0x09
-#define REG_LNA 0x0C
-#define REG_FIFO_ADDR_PTR 0x0D
-#define REG_FIFO_TX_BASE_ADDR 0x0E
-#define REG_FIFO_RX_BASE_ADDR 0x0F
-#define REG_FIFO_RX_CURRENT_ADDR 0x10
-#define REG_IRQ_FLAGS 0x12
-#define REG_RX_NB_BYTES 0x13
-#define REG_PKT_SNR_VALUE 0x19
-#define REG_PKT_RSSI_VALUE 0x1A
-#define REG_MODEM_CONFIG_1 0x1D
-#define REG_MODEM_CONFIG_2 0x1E
-#define REG_PREAMBLE_MSB 0x20
-#define REG_PREAMBLE_LSB 0x21
-#define REG_PAYLOAD_LENGTH 0x22
-#define REG_MODEM_CONFIG_3 0x26
-#define REG_SYNC_WORD 0x39
-#define REG_DIO_MAPPING_1 0x40
-#define REG_IRQ_FLAGS_1 0x3E
-#define REG_VERSION 0x42
-
-#define MODE_LONG_RANGE_MODE 0x80
-#define MODE_SLEEP 0x00
-#define MODE_STDBY 0x01
-#define MODE_TX 0x03
-#define MODE_RX_CONTINUOUS 0x05
-
-#define IRQ_TX_DONE_MASK 0x08
-#define IRQ_PAYLOAD_CRC_ERROR_MASK 0x20
-#define IRQ_RX_DONE_MASK 0x40
-
-#define IRQ1_CAD_DONE_MASK 0x04
-#define IRQ1_CAD_DETECTED_MASK 0x01
-
-#define LORA_BW_125_KHZ 0x70
-#define LORA_CR_4_5 0x02
-#define LORA_EXPLICIT_HEADER_MODE 0x00
-#define LORA_SPREADING_FACTOR 7
-#define LORA_TX_CONTINUOUS_MODE 0x00
-#define LORA_RX_PAYLOAD_CRC_ON 0x04
-#define LORA_LOW_DATA_RATE_OPTIMIZE_OFF 0x00
-#define LORA_AGC_AUTO_ON 0x04
-#define LORA_MODEM_CONFIG_1 (LORA_BW_125_KHZ | LORA_CR_4_5 | LORA_EXPLICIT_HEADER_MODE)
-#define LORA_MODEM_CONFIG_2 ((LORA_SPREADING_FACTOR << 4) | LORA_TX_CONTINUOUS_MODE | LORA_RX_PAYLOAD_CRC_ON)
-#define LORA_MODEM_CONFIG_3 (LORA_LOW_DATA_RATE_OPTIMIZE_OFF | LORA_AGC_AUTO_ON)
-
 void location_encode(const location_info_t *loc, char *out, size_t out_size);
 void location_decode(const char *encoded, location_info_t *loc);
-static void update_message_status(uint32_t id, const char *source, const char *status);
 static bool lora_channel_clear(void);
 static void retry_tracker_task(void *parameter);
 static void time_sync_task(void *parameter);
-static uint32_t current_epoch_seconds(void);
-static void apply_time_sync(uint32_t epoch, uint8_t distance);
-static void send_time_sync_packet(uint32_t epoch, uint8_t distance, uint8_t hops);
-static void broadcast_time_sync_if_synced(void);
-
-typedef struct {
-    uint32_t id;
-    TickType_t seen_tick;
-    char source[FIELD_LEN];
-} seen_packet_t;
 
 typedef struct {
     bool valid;
@@ -174,15 +102,8 @@ static const char *AP_PASSWORD = "123456789";
 static char node_id[FIELD_LEN];
 static char ap_ssid[FIELD_LEN];
 static node_config_t node_config;
-static seen_packet_t seen_packets[MAX_SEEN_PACKETS];
 static retry_entry_t retry_entries[MAX_MESSAGES];
-static size_t seen_packet_count;
 static uint32_t packet_counter;
-static uint32_t highest_seen_id;
-static int64_t epoch_offset_sec;
-static bool time_synced;
-static uint8_t time_sync_distance;
-static TickType_t last_time_sync_broadcast_tick;
 static spi_device_handle_t lora_spi;
 static rmt_channel_handle_t rgb_led_channel;
 static rmt_encoder_handle_t rgb_led_encoder;
@@ -195,8 +116,7 @@ static SemaphoreHandle_t lora_dio0_semaphore;
 static SemaphoreHandle_t lora_tx_done_semaphore;
 static SemaphoreHandle_t data_mutex;
 static void save_packet_counter(void);
-static void update_highest_seen_id(uint32_t id);
-static bool lora_transmit(const char *packet);
+bool lora_transmit(const char *packet);
 static esp_err_t save_node_config(const node_config_t *config);
 
 static void data_lock(void)
@@ -394,132 +314,6 @@ static void IRAM_ATTR lora_dio0_isr_handler(void *arg)
     }
 }
 
-static bool packet_seen(const char *source, uint32_t id)
-{
-    bool seen = false;
-    TickType_t now = xTaskGetTickCount();
-    TickType_t ttl_ticks = pdMS_TO_TICKS(SEEN_PACKET_TTL_MS);
-
-    data_lock();
-    for (size_t i = 0; i < seen_packet_count;) {
-        if ((now - seen_packets[i].seen_tick) > ttl_ticks) {
-            seen_packets[i] = seen_packets[seen_packet_count - 1];
-            seen_packet_count--;
-            continue;
-        }
-
-        if (seen_packets[i].id == id && strcmp(seen_packets[i].source, source) == 0) {
-            seen = true;
-            break;
-        }
-
-        i++;
-    }
-
-    data_unlock();
-    return seen;
-}
-
-static void remember_packet(const char *source, uint32_t id)
-{
-    seen_packet_t *seen_packet;
-    TickType_t now = xTaskGetTickCount();
-    TickType_t ttl_ticks = pdMS_TO_TICKS(SEEN_PACKET_TTL_MS);
-    size_t slot_index = 0;
-
-    data_lock();
-    for (size_t i = 0; i < seen_packet_count;) {
-        if ((now - seen_packets[i].seen_tick) > ttl_ticks) {
-            seen_packets[i] = seen_packets[seen_packet_count - 1];
-            seen_packet_count--;
-            continue;
-        }
-
-        i++;
-    }
-
-    if (seen_packet_count < MAX_SEEN_PACKETS) {
-        seen_packet = &seen_packets[seen_packet_count++];
-    } else {
-        for (size_t i = 1; i < seen_packet_count; i++) {
-            if ((now - seen_packets[i].seen_tick) > (now - seen_packets[slot_index].seen_tick)) {
-                slot_index = i;
-            }
-        }
-        seen_packet = &seen_packets[slot_index];
-    }
-
-    seen_packet->id = id;
-    seen_packet->seen_tick = now;
-    copy_field(seen_packet->source, sizeof(seen_packet->source), source);
-    data_unlock();
-}
-
-static bool parse_mesh_packet(const char *packet, mesh_packet_t *parsed)
-{
-    char packet_copy[PACKET_LEN];
-    char *fields[10] = {0};
-    char *cursor = packet_copy;
-    size_t field_count = 0;
-
-    memset(parsed, 0, sizeof(*parsed));
-    copy_field(packet_copy, sizeof(packet_copy), packet);
-
-    while (field_count < sizeof(fields) / sizeof(fields[0]) && cursor != NULL) {
-        fields[field_count++] = cursor;
-        if (field_count == sizeof(fields) / sizeof(fields[0])) {
-            break;
-        }
-
-        cursor = strchr(cursor, '|');
-        if (cursor != NULL) {
-            *cursor = '\0';
-            cursor++;
-        }
-    }
-
-    if (field_count < 10 || strcmp(fields[0], "BEMS") != 0) {
-        return false;
-    }
-
-    parsed->valid = true;
-    parsed->id = (uint32_t)strtoul(fields[1], NULL, 10);
-    parsed->hops = strncmp(fields[6], "HOPS=", 5) == 0 ? atoi(fields[6] + 5) : 0;
-    copy_field(parsed->source, sizeof(parsed->source), fields[2]);
-    copy_field(parsed->destination, sizeof(parsed->destination), fields[3]);
-    copy_field(parsed->type, sizeof(parsed->type), fields[4]);
-    copy_field(parsed->priority, sizeof(parsed->priority), fields[5]);
-    copy_field(parsed->relay, sizeof(parsed->relay), fields[7]);
-    copy_field(parsed->location_raw, sizeof(parsed->location_raw), fields[8]);
-    location_decode(fields[8], &parsed->location);
-    copy_field(parsed->payload, sizeof(parsed->payload), fields[9]);
-    return true;
-}
-
-static void build_forward_packet(const mesh_packet_t *parsed, char *packet, size_t packet_size)
-{
-    int next_hops = MAX(parsed->hops - 1, 0);
-    char encoded_location[SITIO_LEN + BARANGAY_LEN + MUNICIPALITY_LEN + 2];
-
-    location_encode(&parsed->location, encoded_location, sizeof(encoded_location));
-
-    snprintf(packet, packet_size, "BEMS|%lu|%.*s|%.*s|%.*s|%.*s|HOPS=%d|%.*s|%s|%.*s",
-             (unsigned long)parsed->id,
-             31,
-             parsed->source,
-             31,
-             parsed->destination,
-             31,
-             parsed->type,
-             31,
-             parsed->priority,
-             next_hops,
-             31,
-             parsed->relay,
-             encoded_location,
-             48,
-             parsed->payload);
-}
 
 typedef struct {
     mesh_packet_t packet;
@@ -551,225 +345,13 @@ static void delayed_forward_task(void *parameter)
     vTaskDelete(NULL);
 }
 
-static void send_ack_packet(const mesh_packet_t *parsed)
-{
-    char ack_packet[PACKET_LEN];
-    char encoded_location[SITIO_LEN + BARANGAY_LEN + MUNICIPALITY_LEN + 2];
-
-    location_encode(&node_config.location, encoded_location, sizeof(encoded_location));
-
-    snprintf(ack_packet, sizeof(ack_packet), "BEMS|%lu|%.*s|%.*s|ACK|NORMAL|HOPS=0|RELAY=%u|LOC=%s|ACK for %lu",
-             (unsigned long)parsed->id,
-             31,
-             node_id,
-             31,
-             parsed->source,
-             1,
-             encoded_location,
-             (unsigned long)parsed->id);
-
-    ESP_LOGI(TAG, "Sending ACK to %s for packet %lu", parsed->source, (unsigned long)parsed->id);
-    lora_transmit(ack_packet);
-}
-
-static uint32_t sync_last_id_from_payload(const char *payload)
-{
-    if (strncmp(payload, "last_id=", 8) == 0) {
-        return (uint32_t)strtoul(payload + 8, NULL, 10);
-    }
-
-    return 0;
-}
-
-static uint32_t ack_id_from_payload(const char *payload)
-{
-    if (strncmp(payload, "ACK for ", 8) == 0) {
-        return (uint32_t)strtoul(payload + 8, NULL, 10);
-    }
-
-    return 0;
-}
-
-static bool is_control_packet_type(const char *type)
-{
-    return strcmp(type, "ACK") == 0 || strcmp(type, "SYNC_REQ") == 0 || strcmp(type, "SYNC_RESP") == 0 || strcmp(type, "TIME_SYNC") == 0;
-}
-
-static uint32_t current_epoch_seconds(void)
-{
-    return (uint32_t)(epoch_offset_sec + (int64_t)(xTaskGetTickCount() / configTICK_RATE_HZ));
-}
-
-static void apply_time_sync(uint32_t epoch, uint8_t distance)
-{
-    uint32_t now_ticks = xTaskGetTickCount();
-    uint32_t now_seconds = now_ticks / configTICK_RATE_HZ;
-
-    epoch_offset_sec = (int64_t)epoch - (int64_t)now_seconds;
-    time_synced = true;
-    time_sync_distance = distance;
-    last_time_sync_broadcast_tick = 0;
-}
-
-static uint32_t time_sync_epoch_from_payload(const char *payload)
-{
-    if (strncmp(payload, "epoch=", 6) == 0) {
-        return (uint32_t)strtoul(payload + 6, NULL, 10);
-    }
-    return 0;
-}
-
-static uint8_t time_sync_dist_from_payload(const char *payload)
-{
-    const char *dist_ptr = strstr(payload, "~dist=");
-    if (dist_ptr != NULL) {
-        return (uint8_t)strtoul(dist_ptr + 6, NULL, 10);
-    }
-    return 0;
-}
-
-static void send_time_sync_packet(uint32_t epoch, uint8_t distance, uint8_t hops)
-{
-    char packet[PACKET_LEN];
-    char encoded_location[SITIO_LEN + BARANGAY_LEN + MUNICIPALITY_LEN + 2];
-    uint32_t message_id;
-
-    data_lock();
-    message_id = ++packet_counter;
-    save_packet_counter();
-    data_unlock();
-
-    location_encode(&node_config.location, encoded_location, sizeof(encoded_location));
-
-    snprintf(packet, sizeof(packet), "BEMS|%lu|%.*s|ALL|TIME_SYNC|NORMAL|HOPS=%u|RELAY=1|LOC=%s|epoch=%lu~dist=%u",
-             (unsigned long)message_id,
-             31,
-             node_id,
-             hops,
-             encoded_location,
-             (unsigned long)epoch,
-             distance);
-    lora_transmit(packet);
-}
-
-static void broadcast_time_sync_if_synced(void)
-{
-    if (!time_synced) {
-        return;
-    }
-
-    if ((xTaskGetTickCount() - last_time_sync_broadcast_tick) >= pdMS_TO_TICKS(15 * 60 * 1000)) {
-        send_time_sync_packet(current_epoch_seconds(), time_sync_distance, 2);
-        last_time_sync_broadcast_tick = xTaskGetTickCount();
-    }
-}
-
-static bool is_private_destination_for_other_node(const char *destination, const char *requester)
-{
-    return strcmp(destination, "ALL") != 0 && strcmp(destination, requester) != 0;
-}
-
-static void send_sync_responses(const mesh_packet_t *request)
-{
-    emergency_message_t snapshot[MAX_MESSAGES];
-    size_t snapshot_count = 0;
-    size_t stored_message_count;
-    uint32_t last_id = sync_last_id_from_payload(request->payload);
-    char encoded_location[SITIO_LEN + BARANGAY_LEN + MUNICIPALITY_LEN + 2];
-
-    location_encode(&node_config.location, encoded_location, sizeof(encoded_location));
-
-    stored_message_count = message_store_copy_all(snapshot, MAX_MESSAGES);
-    for (size_t i = 0; i < stored_message_count; i++) {
-        const emergency_message_t *message = &snapshot[i];
-
-        if (strcmp(message->direction, "RX") != 0 && strcmp(message->direction, "TX") != 0) {
-            continue;
-        }
-        if (message->id <= last_id) {
-            continue;
-        }
-        if (strcmp(message->destination, "ALL") != 0 && strcmp(message->destination, request->source) != 0) {
-            continue;
-        }
-        if (is_private_destination_for_other_node(message->destination, request->source)) {
-            continue;
-        }
-
-        snapshot[snapshot_count++] = *message;
-    }
-
-    for (size_t i = 0; i < snapshot_count; i++) {
-        char sync_response[PACKET_LEN];
-        const char *original_packet = strstr(snapshot[i].packet, "BEMS|");
-        int prefix_len;
-        size_t original_len;
-
-        vTaskDelay(pdMS_TO_TICKS(200 + (esp_random() % 1001)));
-        if (original_packet == NULL) {
-            original_packet = snapshot[i].packet;
-        }
-
-        prefix_len = snprintf(sync_response, sizeof(sync_response), "BEMS|%lu|%.*s|%.*s|SYNC_RESP|NORMAL|HOPS=0|RELAY=0|LOC=%s|",
-                              (unsigned long)snapshot[i].id,
-                              31,
-                              node_id,
-                              31,
-                              request->source,
-                              encoded_location);
-        original_len = strlen(original_packet);
-
-        if (prefix_len < 0 || (size_t)prefix_len >= sizeof(sync_response) || (size_t)prefix_len + original_len > BEMS_MAX_PLAINTEXT) {
-            ESP_LOGW(TAG, "Skipping oversized SYNC_RESP for packet %lu", (unsigned long)snapshot[i].id);
-            continue;
-        }
-        copy_field(sync_response + prefix_len, sizeof(sync_response) - (size_t)prefix_len, original_packet);
-
-        ESP_LOGI(TAG, "SYNC_RESP to %s for packet %lu", request->source, (unsigned long)snapshot[i].id);
-        lora_transmit(sync_response);
-    }
-}
-
-static void send_sync_request(uint32_t last_id)
-{
-    char sync_request[PACKET_LEN];
-    char encoded_location[SITIO_LEN + BARANGAY_LEN + MUNICIPALITY_LEN + 2];
-    uint32_t request_id;
-
-    data_lock();
-    request_id = ++packet_counter;
-    save_packet_counter();
-    data_unlock();
-
-    location_encode(&node_config.location, encoded_location, sizeof(encoded_location));
-
-    snprintf(sync_request, sizeof(sync_request), "BEMS|%lu|%.*s|ALL|SYNC_REQ|NORMAL|HOPS=1|RELAY=0|LOC=%s|last_id=%lu",
-             (unsigned long)request_id,
-             31,
-             node_id,
-             encoded_location,
-             (unsigned long)last_id);
-
-    ESP_LOGI(TAG, "Broadcasting SYNC_REQ with last_id=%lu", (unsigned long)last_id);
-    lora_transmit(sync_request);
-}
-
-static void send_boot_sync_request(void)
-{
-    send_sync_request(highest_seen_id);
-}
-
-static void send_manual_sync_request(void)
-{
-    send_sync_request(0);
-}
 
 static void boot_sync_task(void *parameter)
 {
     vTaskDelay(pdMS_TO_TICKS(1500));
 
     if (node_config.configured && lora_ready) {
-        send_boot_sync_request();
+        mesh_control_send_boot_sync_request();
     }
 
     vTaskDelete(NULL);
@@ -814,10 +396,10 @@ static void store_received_packet(const char *packet, const mesh_packet_t *parse
         message->hops = 0;
     }
     copy_field(message->status, sizeof(message->status), parsed->valid ? "RECEIVED" : "RECEIVED");
-    message->stored_epoch = time_synced ? current_epoch_seconds() : 0;
+    message->stored_epoch = mesh_control_is_time_synced() ? mesh_control_current_epoch_seconds() : 0;
     snprintf(message->packet, sizeof(message->packet), "RSSI=%d SNR=%d | %.*s", rssi, snr, 250, packet);
-    if (parsed->valid && !is_control_packet_type(parsed->type)) {
-        update_highest_seen_id(message->id);
+    if (parsed->valid && strcmp(parsed->type, "ACK") != 0 && strcmp(parsed->type, "SYNC_REQ") != 0 && strcmp(parsed->type, "SYNC_RESP") != 0 && strcmp(parsed->type, "TIME_SYNC") != 0) {
+        mesh_control_update_highest_seen_id(message->id);
     }
     if (parsed->valid) {
         roster_touch(parsed->source, &parsed->location, message->stored_epoch, rssi, snr);
@@ -838,7 +420,7 @@ static void store_received_packet(const char *packet, const mesh_packet_t *parse
     data_unlock();
 }
 
-static bool lora_transmit(const char *packet)
+bool lora_transmit(const char *packet)
 {
     uint8_t frame[LORA_MAX_PAYLOAD];
     size_t length = 0;
@@ -899,21 +481,13 @@ static void lora_rx_task(void *parameter)
         }
 
         if (lora_ready && (lora_read_reg(REG_IRQ_FLAGS) & IRQ_RX_DONE_MASK) != 0) {
-            uint8_t flags = lora_read_reg(REG_IRQ_FLAGS);
-            lora_write_reg(REG_IRQ_FLAGS, 0xFF);
+            size_t length = 0;
+            int rssi = 0;
+            int snr = 0;
 
-            if ((flags & IRQ_PAYLOAD_CRC_ERROR_MASK) == 0) {
-                uint8_t length = lora_read_reg(REG_RX_NB_BYTES);
-                uint8_t current_addr = lora_read_reg(REG_FIFO_RX_CURRENT_ADDR);
-                int rssi = (int)lora_read_reg(REG_PKT_RSSI_VALUE) - 164;
-                int snr = ((int8_t)lora_read_reg(REG_PKT_SNR_VALUE)) / 4;
-
-                lora_write_reg(REG_FIFO_ADDR_PTR, current_addr);
-                lora_read_fifo(payload, length);
-                payload[length] = '\0';
-
+            if (lora_read_raw_frame(payload, &length, &rssi, &snr)) {
                 if (!bems_decrypt_frame(payload, length, decrypted_packet, sizeof(decrypted_packet))) {
-                    ESP_LOGW(TAG, "Rejected unauthenticated LoRa frame RSSI=%d SNR=%d length=%u", rssi, snr, length);
+                    ESP_LOGW(TAG, "Rejected unauthenticated LoRa frame RSSI=%d SNR=%d length=%u", rssi, snr, (unsigned int)length);
                     continue;
                 }
 
@@ -932,7 +506,7 @@ static void lora_rx_task(void *parameter)
                         remember_packet(parsed.source, parsed.id);
 
                         if (is_sync_req) {
-                            send_sync_responses(&parsed);
+                            mesh_control_send_sync_responses(&parsed);
                             continue;
                         }
 
@@ -950,11 +524,11 @@ static void lora_rx_task(void *parameter)
                         }
 
                         if (strcmp(parsed.type, "TIME_SYNC") == 0) {
-                            uint32_t epoch = time_sync_epoch_from_payload(parsed.payload);
-                            uint8_t dist = time_sync_dist_from_payload(parsed.payload);
+                            uint32_t epoch = mesh_control_current_epoch_seconds();
+                            uint8_t dist = mesh_control_get_time_sync_distance();
 
-                            if ((epoch != 0) && (!time_synced || dist < time_sync_distance)) {
-                                apply_time_sync(epoch, dist);
+                            if ((epoch != 0) && (!mesh_control_is_time_synced() || dist < mesh_control_get_time_sync_distance())) {
+                                mesh_control_apply_time_sync(epoch, dist);
                             }
                             continue;
                         }
@@ -964,7 +538,7 @@ static void lora_rx_task(void *parameter)
                         }
 
                         if (is_for_me && !is_ack) {
-                            send_ack_packet(&parsed);
+                            mesh_control_send_ack_packet(&parsed);
                         }
 
                         if (is_ack && is_for_me) {
@@ -973,7 +547,7 @@ static void lora_rx_task(void *parameter)
                             }
                             uint32_t ack_id = ack_id_from_payload(parsed.payload);
                             if (ack_id != 0) {
-                                update_message_status(ack_id, node_id, "ACKED");
+                                message_store_update_status(ack_id, node_id, "ACKED");
                             }
                         }
 
@@ -989,10 +563,10 @@ static void lora_rx_task(void *parameter)
                                 ESP_LOGW(TAG, "Failed to allocate delayed forward args for %s/%lu", parsed.source, (unsigned long)parsed.id);
                             }
                         }
+                    } else {
+                        mesh_packet_t raw_packet = {0};
+                        store_received_packet(decrypted_packet, &raw_packet, rssi, snr);
                     }
-                } else {
-                    mesh_packet_t raw_packet = {0};
-                    store_received_packet(decrypted_packet, &raw_packet, rssi, snr);
                 }
             }
         }
@@ -1086,13 +660,6 @@ static void lora_init(void)
     ESP_LOGI(TAG, "SX1278 ready on 433 MHz");
 }
 
-static void update_message_status(uint32_t id, const char *source, const char *status)
-{
-    data_lock();
-    message_store_update_status(id, source, status);
-    data_unlock();
-}
-
 static void retry_tracker_add_by_value(uint32_t id, const char *source, const char *destination, const char *priority)
 {
     if (strcmp(priority, "HIGH") != 0 || strcmp(destination, "ALL") == 0) {
@@ -1152,7 +719,7 @@ static void retry_tracker_task(void *parameter)
 static void time_sync_task(void *parameter)
 {
     while (true) {
-        broadcast_time_sync_if_synced();
+        mesh_control_broadcast_time_sync_if_synced();
         vTaskDelay(pdMS_TO_TICKS(30000));
     }
 }
@@ -1224,56 +791,6 @@ static void save_packet_counter(void)
     }
 
     nvs_close(handle);
-}
-
-static void load_highest_seen_id(void)
-{
-    nvs_handle_t handle;
-    uint32_t stored_id = 0;
-
-    if (nvs_open(CONFIG_NAMESPACE, NVS_READONLY, &handle) != ESP_OK) {
-        ESP_LOGI(TAG, "No saved highest seen ID; starting at 0");
-        return;
-    }
-
-    if (nvs_get_u32(handle, HIGHEST_SEEN_ID_KEY, &stored_id) == ESP_OK) {
-        highest_seen_id = stored_id;
-        ESP_LOGI(TAG, "Highest seen ID restored: %lu", (unsigned long)highest_seen_id);
-    } else {
-        ESP_LOGI(TAG, "No saved highest seen ID; starting at 0");
-    }
-
-    nvs_close(handle);
-}
-
-static void save_highest_seen_id(void)
-{
-    nvs_handle_t handle;
-    esp_err_t result = nvs_open(CONFIG_NAMESPACE, NVS_READWRITE, &handle);
-
-    if (result != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to open NVS for highest seen ID: %s", esp_err_to_name(result));
-        return;
-    }
-
-    result = nvs_set_u32(handle, HIGHEST_SEEN_ID_KEY, highest_seen_id);
-    if (result == ESP_OK) {
-        result = nvs_commit(handle);
-    }
-
-    if (result != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to save highest seen ID: %s", esp_err_to_name(result));
-    }
-
-    nvs_close(handle);
-}
-
-static void update_highest_seen_id(uint32_t id)
-{
-    if (id > highest_seen_id) {
-        highest_seen_id = id;
-        save_highest_seen_id();
-    }
 }
 
 static void config_set_defaults(void)
@@ -1550,7 +1067,7 @@ static void queue_message(const char *destination, const char *type, const char 
     copy_field(message->priority, sizeof(message->priority), priority);
     copy_field(message->payload, sizeof(message->payload), payload);
     copy_field(message->status, sizeof(message->status), "PENDING");
-    message->stored_epoch = time_synced ? current_epoch_seconds() : 0;
+    message->stored_epoch = mesh_control_is_time_synced() ? mesh_control_current_epoch_seconds() : 0;
     build_packet(message);
     compute_thread_key(message->thread_key, sizeof(message->thread_key), message->source, message->destination);
     message->origin_location = node_config.location;
@@ -1566,10 +1083,10 @@ static void queue_message(const char *destination, const char *type, const char 
 
     ESP_LOGI(TAG, "LoRa TX pending: %s", packet);
     if (lora_transmit(packet)) {
-        update_message_status(queued_id, queued_source, "SENT");
+        message_store_update_status(queued_id, queued_source, "SENT");
         retry_tracker_add_by_value(queued_id, queued_source, queued_destination, queued_priority);
     } else {
-        update_message_status(queued_id, queued_source, "FAILED");
+        message_store_update_status(queued_id, queued_source, "FAILED");
     }
 }
 
@@ -1611,7 +1128,7 @@ static void start_http_server(void)
     static http_setup_context_t setup_context;
     status_context = (http_status_context_t){
         .require_session = http_auth_require_session,
-        .current_epoch_seconds = current_epoch_seconds,
+        .current_epoch_seconds = mesh_control_current_epoch_seconds,
         .node_id = node_id,
         .node_name = node_config.node_name,
         .node_role = node_config.node_role,
@@ -1619,14 +1136,14 @@ static void start_http_server(void)
         .ssid = ap_ssid,
         .configured = &node_config.configured,
         .duplicate_node_id_warning = &duplicate_node_id_warning,
-        .time_synced = &time_synced,
+        .time_synced = mesh_control_time_synced_ref(),
     };
     time_context = (http_time_context_t){
-        .apply_time_sync = apply_time_sync,
-        .send_time_sync_packet = send_time_sync_packet,
+        .apply_time_sync = mesh_control_apply_time_sync,
+        .send_time_sync_packet = mesh_control_send_time_sync_packet,
     };
     sync_context = (http_sync_context_t){
-        .send_manual_sync_request = send_manual_sync_request,
+        .send_manual_sync_request = mesh_control_send_manual_sync_request,
     };
     reset_context = (http_reset_context_t){
         .erase_node_config = erase_node_config,
@@ -1785,7 +1302,7 @@ void app_main(void)
         .send_portal_file = http_portal_send_file,
     });
     load_packet_counter();
-    load_highest_seen_id();
+    mesh_control_load_highest_seen_id();
     rgb_led_init();
     init_factory_reset_button();
     load_node_config();

@@ -2,19 +2,15 @@
 
 #include <string.h>
 
-#include "esp_err.h"
+#include "driver/gpio.h"
 #include "driver/spi_master.h"
- #include "driver/gpio.h"
- #include "esp_log.h"
- #include "freertos/FreeRTOS.h"
- #include "freertos/semphr.h"
- #include "freertos/task.h"
+#include "esp_err.h"
+#include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include "freertos/task.h"
 
 static spi_device_handle_t lora_spi;
-Exit code: 0
-Wall time: 0.2 seconds
-Output:
-
 static const char *TAG = "barangay_mesh";
 static bool lora_ready;
 static volatile bool radio_in_tx;
@@ -22,12 +18,17 @@ static SemaphoreHandle_t lora_dio0_semaphore;
 static SemaphoreHandle_t lora_tx_done_semaphore;
 extern void lora_rx_task(void *parameter);
 
+static uint8_t lora_read_reg(uint8_t address);
+static void lora_write_reg(uint8_t address, uint8_t value);
+static void lora_write_fifo(const uint8_t *data, size_t length);
+static void lora_read_fifo(uint8_t *data, size_t length);
+
 static void lora_set_mode(uint8_t mode)
 {
     lora_write_reg(REG_OP_MODE, MODE_LONG_RANGE_MODE | mode);
 }
 
-static bool lora_channel_clear(void)
+bool lora_channel_clear(void)
 {
     for (int attempt = 0; attempt < 3; attempt++) {
         lora_set_mode(MODE_STDBY);
@@ -81,8 +82,7 @@ static void IRAM_ATTR lora_dio0_isr_handler(void *arg)
     }
 }
 
-
-static void lora_init(void)
+void lora_radio_init(void)
 {
     spi_bus_config_t bus_config = {
         .mosi_io_num = LORA_MOSI_GPIO,
@@ -169,8 +169,10 @@ static void lora_init(void)
     ESP_LOGI(TAG, "SX1278 ready on 433 MHz");
 }
 
-
-
+bool lora_radio_is_ready(void)
+{
+    return lora_ready;
+}
 
 static esp_err_t lora_transfer(uint8_t address, const uint8_t *tx_data, uint8_t *rx_data, size_t length)
 {
@@ -219,4 +221,43 @@ static void lora_write_fifo(const uint8_t *data, size_t length)
 static void lora_read_fifo(uint8_t *data, size_t length)
 {
     lora_transfer(REG_FIFO & 0x7F, NULL, data, length);
+}
+
+bool lora_read_raw_frame(uint8_t *payload, size_t *length, int *rssi, int *snr)
+{
+    uint8_t flags;
+    uint8_t frame_length;
+    uint8_t current_addr;
+
+    if ((lora_read_reg(REG_IRQ_FLAGS) & IRQ_RX_DONE_MASK) == 0) {
+        return false;
+    }
+
+    flags = lora_read_reg(REG_IRQ_FLAGS);
+    lora_write_reg(REG_IRQ_FLAGS, 0xFF);
+
+    if ((flags & IRQ_PAYLOAD_CRC_ERROR_MASK) != 0) {
+        return false;
+    }
+
+    frame_length = lora_read_reg(REG_RX_NB_BYTES);
+    current_addr = lora_read_reg(REG_FIFO_RX_CURRENT_ADDR);
+    *rssi = (int)lora_read_reg(REG_PKT_RSSI_VALUE) - 164;
+    *snr = ((int8_t)lora_read_reg(REG_PKT_SNR_VALUE)) / 4;
+
+    lora_write_reg(REG_FIFO_ADDR_PTR, current_addr);
+    lora_read_fifo(payload, frame_length);
+    payload[frame_length] = '\0';
+    *length = frame_length;
+    return true;
+}
+
+bool lora_transmit_raw_frame(const uint8_t *frame, size_t length)
+{
+    lora_write_reg(REG_DIO_MAPPING_1, 0x40);
+    lora_write_reg(REG_IRQ_FLAGS, 0xFF);
+    lora_write_reg(REG_FIFO_ADDR_PTR, 0x00);
+    lora_write_fifo(frame, length);
+    lora_write_reg(REG_PAYLOAD_LENGTH, (uint8_t)length);
+    return true;
 }

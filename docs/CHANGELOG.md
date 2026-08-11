@@ -23,3 +23,8 @@ This file is updated by the release helper in `scripts/release.ps1`.
 ## Unreleased
 
 - No release has been cut since the last version bump.
+
+//
+pio run -e esp32-s3-devkitm-1 -t buildfs
+pio run -e esp32-s3-devkitm-1 -t uploadfs
+//

@@ -242,9 +242,9 @@ void build_forward_packet(const mesh_packet_t *parsed, char *packet, size_t pack
              next_hops,
              31,
              parsed->relay,
-             encoded_location,
-             120,
-             parsed->payload);
+              encoded_location,
+              48,
+              parsed->payload);
 }
 
 bool packet_seen(const char *source, uint32_t id)

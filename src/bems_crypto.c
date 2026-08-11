@@ -3,10 +3,12 @@
 #include <stddef.h>
 #include <stdlib.h>
 #include "esp_random.h"
+#include "esp_log.h"
 #include "psa/crypto.h"
 #include "node_config.h"
 
 #define LORA_MAX_PAYLOAD 255
+static const char *TAG = "bems_crypto";
 
 void secure_zero(void *data, size_t length)
 {
@@ -33,7 +35,12 @@ bool crypto_init_once(void)
     static bool crypto_ready;
 
     if (!crypto_ready) {
-        crypto_ready = psa_crypto_init() == PSA_SUCCESS;
+        psa_status_t status = psa_crypto_init();
+        if (status != PSA_SUCCESS) {
+            ESP_LOGE(TAG, "psa_crypto_init failed: status=%d", (int)status);
+            return false;
+        }
+        crypto_ready = true;
     }
 
     return crypto_ready;
@@ -53,6 +60,7 @@ bool derive_crypto_keys(uint8_t aes_key[16], uint8_t hmac_key[32])
     }
 
     if (!node_config_is_provisioned()) {
+        ESP_LOGW(TAG, "node not provisioned (missing web_pin/network_key)");
         return false;
     }
 
@@ -61,6 +69,7 @@ bool derive_crypto_keys(uint8_t aes_key[16], uint8_t hmac_key[32])
     memcpy(&material[key_len], "BMESH AES-128", 13);
     status = psa_hash_compute(PSA_ALG_SHA_256, material, key_len + 13, digest, sizeof(digest), &hash_length);
     if (status != PSA_SUCCESS || hash_length < sizeof(digest)) {
+        ESP_LOGE(TAG, "psa_hash_compute for AES key failed: status=%d hash_length=%u", (int)status, (unsigned int)hash_length);
         secure_zero(material, sizeof(material));
         secure_zero(digest, sizeof(digest));
         return false;
@@ -72,6 +81,9 @@ bool derive_crypto_keys(uint8_t aes_key[16], uint8_t hmac_key[32])
     secure_zero(material, sizeof(material));
     secure_zero(digest, sizeof(digest));
 
+    if (status != PSA_SUCCESS || hash_length != 32) {
+        ESP_LOGE(TAG, "psa_hash_compute for HMAC key failed: status=%d hash_length=%u", (int)status, (unsigned int)hash_length);
+    }
     return status == PSA_SUCCESS && hash_length == 32;
 }
 
@@ -86,6 +98,7 @@ bool aes_ctr_crypt(uint8_t *data, size_t length, const uint8_t nonce[BEMS_NONCE_
     size_t output_length = 0;
     size_t finish_length = 0;
     psa_status_t status;
+    const char *failure_stage = NULL;
 
     if (!derive_crypto_keys(aes_key, unused_hmac_key)) {
         secure_zero(unused_hmac_key, sizeof(unused_hmac_key));
@@ -102,15 +115,32 @@ bool aes_ctr_crypt(uint8_t *data, size_t length, const uint8_t nonce[BEMS_NONCE_
     status = psa_import_key(&attributes, aes_key, sizeof(aes_key), &key_id);
     if (status == PSA_SUCCESS) {
         status = psa_cipher_encrypt_setup(&operation, key_id, PSA_ALG_CTR);
+        if (status != PSA_SUCCESS) {
+            failure_stage = "psa_cipher_encrypt_setup";
+        }
+    } else {
+        failure_stage = "psa_import_key";
     }
     if (status == PSA_SUCCESS) {
         status = psa_cipher_set_iv(&operation, counter, sizeof(counter));
+        if (status != PSA_SUCCESS) {
+            failure_stage = "psa_cipher_set_iv";
+        }
     }
     if (status == PSA_SUCCESS) {
         status = psa_cipher_update(&operation, data, length, data, length, &output_length);
+        if (status != PSA_SUCCESS) {
+            failure_stage = "psa_cipher_update";
+        }
     }
     if (status == PSA_SUCCESS) {
         status = psa_cipher_finish(&operation, data + output_length, length - output_length, &finish_length);
+        if (status != PSA_SUCCESS) {
+            failure_stage = "psa_cipher_finish";
+        }
+    }
+    if (status != PSA_SUCCESS) {
+        ESP_LOGE(TAG, "%s failed: status=%d", failure_stage ? failure_stage : "AES-CTR operation", (int)status);
     }
 
     psa_cipher_abort(&operation);
