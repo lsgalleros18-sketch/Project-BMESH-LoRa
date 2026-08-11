@@ -68,9 +68,10 @@
 #define LORA_MODEM_CONFIG_2 ((LORA_SPREADING_FACTOR << 4) | LORA_TX_CONTINUOUS_MODE | LORA_RX_PAYLOAD_CRC_ON)
 #define LORA_MODEM_CONFIG_3 (LORA_LOW_DATA_RATE_OPTIMIZE_OFF | LORA_AGC_AUTO_ON)
 
-bool lora_read_raw_frame(uint8_t *payload, size_t *length, int *rssi, int *snr);
-bool lora_transmit_raw_frame(const uint8_t *frame, size_t length);
 bool lora_transmit(const char *packet);
+typedef void (*lora_rx_callback_t)(void *parameter);
+void lora_handle_rx_packet(const uint8_t *payload, size_t length, int rssi, int snr);
+
 void lora_radio_init(void);
 bool lora_radio_is_ready(void);
 bool lora_channel_clear(void);

@@ -1,5 +1,6 @@
 #include "node_config.h"
 
+#include <ctype.h>
 #include <string.h>
 
 #include "esp_log.h"
@@ -13,6 +14,8 @@
 static node_config_t node_config;
 static char node_id[FIELD_LEN];
 static SemaphoreHandle_t config_mutex;
+static const char *DEFAULT_WEB_PIN = "123456789";
+static const char *DEFAULT_NETWORK_KEY = "CHANGEME1234567";
 
 static void config_lock(void)
 {
@@ -53,6 +56,24 @@ static void copy_field(char *destination, size_t destination_size, const char *s
     destination[write_index] = '\0';
 }
 
+void node_config_copy_node_id(char *destination, size_t destination_size, const char *source)
+{
+    size_t write_index = 0;
+
+    if (destination_size == 0) {
+        return;
+    }
+
+    while (*source != '\0' && write_index < destination_size - 1) {
+        unsigned char character = (unsigned char)*source++;
+        if (isalnum(character) || character == '-' || character == '_') {
+            destination[write_index++] = (char)toupper(character);
+        }
+    }
+
+    destination[write_index] = '\0';
+}
+
 static void random_hex_string(char *destination, size_t destination_size, size_t bytes)
 {
     static const char digits[] = "0123456789ABCDEF";
@@ -83,6 +104,16 @@ node_config_t *node_config_get(void)
 const char *node_config_get_node_id(void)
 {
     return node_id;
+}
+
+const char *node_config_get_node_name(void)
+{
+    return node_config.node_name;
+}
+
+const char *node_config_get_default_destination(void)
+{
+    return node_config.default_destination;
 }
 
 const char *node_config_get_web_pin(void)
@@ -141,10 +172,10 @@ void node_config_set_defaults(void)
     copy_field(node_config.location.municipality, sizeof(node_config.location.municipality), "");
     copy_field(node_config.default_destination, sizeof(node_config.default_destination), "BRGY001");
     copy_field(node_config.default_priority, sizeof(node_config.default_priority), "NORMAL");
-    node_config.ap_password[0] = '\0';
-    node_config.web_pin[0] = '\0';
+    copy_field(node_config.ap_password, sizeof(node_config.ap_password), "");
+    copy_field(node_config.web_pin, sizeof(node_config.web_pin), DEFAULT_WEB_PIN);
     node_config.duress_pin[0] = '\0';
-    node_config.network_key[0] = '\0';
+    copy_field(node_config.network_key, sizeof(node_config.network_key), DEFAULT_NETWORK_KEY);
     config_unlock();
 }
 
@@ -153,7 +184,6 @@ void node_config_load(void)
     nvs_handle_t handle;
     uint8_t configured = 0;
     bool migrated_location = false;
-    bool regenerated_secret = false;
     char legacy_location[FIELD_LEN] = {0};
 
     ensure_mutex();
@@ -192,31 +222,22 @@ void node_config_load(void)
     node_config.configured = configured == 1;
 
     if (node_config.web_pin[0] == '\0') {
-        random_hex_string(node_config.web_pin, sizeof(node_config.web_pin), 4);
-        regenerated_secret = true;
+        copy_field(node_config.web_pin, sizeof(node_config.web_pin), DEFAULT_WEB_PIN);
     }
     if (node_config.ap_password[0] == '\0') {
-        random_hex_string(node_config.ap_password, sizeof(node_config.ap_password), 8);
-        regenerated_secret = true;
+        copy_field(node_config.ap_password, sizeof(node_config.ap_password), "");
     }
     if (node_config.network_key[0] == '\0') {
-        random_hex_string(node_config.network_key, sizeof(node_config.network_key), 16);
-        regenerated_secret = true;
+        copy_field(node_config.network_key, sizeof(node_config.network_key), DEFAULT_NETWORK_KEY);
     }
     if (node_config.duress_pin[0] == '\0') {
         random_hex_string(node_config.duress_pin, sizeof(node_config.duress_pin), 4);
-        regenerated_secret = true;
     }
     if (node_config.node_role[0] == '\0') {
         copy_field(node_config.node_role, sizeof(node_config.node_role), "relay-only");
     }
     if (node_config.default_priority[0] == '\0') {
         copy_field(node_config.default_priority, sizeof(node_config.default_priority), "NORMAL");
-    }
-
-    if (regenerated_secret) {
-        ESP_LOGW("node_config", "Regenerated missing credentials: configured=%d web_pin=%s network_key=%s", node_config.configured ? 1 : 0, node_config.web_pin, node_config.network_key);
-        (void)node_config_save(&node_config);
     }
 
     if (migrated_location) {

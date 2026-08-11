@@ -10,18 +10,22 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
+#include "bems_crypto.h"
+
 static spi_device_handle_t lora_spi;
 static const char *TAG = "barangay_mesh";
 static bool lora_ready;
 static volatile bool radio_in_tx;
 static SemaphoreHandle_t lora_dio0_semaphore;
 static SemaphoreHandle_t lora_tx_done_semaphore;
-extern void lora_rx_task(void *parameter);
+static bool (*lora_read_frame_callback)(uint8_t *payload, size_t *length, int *rssi, int *snr);
 
+static bool lora_read_raw_frame(uint8_t *payload, size_t *length, int *rssi, int *snr);
 static uint8_t lora_read_reg(uint8_t address);
 static void lora_write_reg(uint8_t address, uint8_t value);
 static void lora_write_fifo(const uint8_t *data, size_t length);
 static void lora_read_fifo(uint8_t *data, size_t length);
+static bool lora_transmit_raw_frame(const uint8_t *frame, size_t length);
 
 static void lora_set_mode(uint8_t mode)
 {
@@ -79,6 +83,27 @@ static void IRAM_ATTR lora_dio0_isr_handler(void *arg)
 
     if (high_priority_task_woken == pdTRUE) {
         portYIELD_FROM_ISR();
+    }
+}
+
+static void lora_rx_task(void *parameter)
+{
+    uint8_t payload[LORA_MAX_PAYLOAD + 1];
+
+    while (true) {
+        if (lora_dio0_semaphore != NULL) {
+            xSemaphoreTake(lora_dio0_semaphore, portMAX_DELAY);
+        }
+
+        if (lora_ready && lora_read_frame_callback != NULL) {
+            size_t length = 0;
+            int rssi = 0;
+            int snr = 0;
+
+            if (lora_read_frame_callback(payload, &length, &rssi, &snr)) {
+                lora_handle_rx_packet(payload, length, rssi, snr);
+            }
+        }
     }
 }
 
@@ -164,9 +189,57 @@ void lora_radio_init(void)
 
     lora_ready = true;
     lora_receive_mode();
+    lora_read_frame_callback = lora_read_raw_frame;
     xTaskCreate(lora_rx_task, "lora_rx_task", 4096, NULL, 6, NULL);
 
     ESP_LOGI(TAG, "SX1278 ready on 433 MHz");
+}
+
+bool lora_transmit(const char *packet)
+{
+    uint8_t frame[LORA_MAX_PAYLOAD];
+    size_t length = 0;
+
+    if (!lora_ready) {
+        ESP_LOGW(TAG, "SX1278 is not ready; packet kept in local log only");
+        return false;
+    }
+
+    if (!bems_encrypt_packet(packet, frame, sizeof(frame), &length)) {
+        ESP_LOGW(TAG, "Failed to encrypt LoRa packet");
+        return false;
+    }
+
+    if (lora_tx_done_semaphore == NULL) {
+        ESP_LOGW(TAG, "LoRa TX done semaphore is not ready");
+        return false;
+    }
+
+    if (!lora_channel_clear()) {
+        ESP_LOGW(TAG, "Channel busy; TX skipped");
+        return false;
+    }
+
+    xSemaphoreTake(lora_tx_done_semaphore, 0);
+    radio_in_tx = true;
+    if (lora_transmit_raw_frame(frame, length)) {
+        lora_write_reg(REG_IRQ_FLAGS, 0xFF);
+        lora_set_mode(MODE_TX);
+
+        if (xSemaphoreTake(lora_tx_done_semaphore, pdMS_TO_TICKS(5000)) == pdTRUE) {
+            radio_in_tx = false;
+            lora_write_reg(REG_IRQ_FLAGS, 0xFF);
+            lora_receive_mode();
+            ESP_LOGI(TAG, "SX1278 encrypted TX done: %u bytes", (unsigned int)length);
+            return true;
+        }
+    }
+
+    radio_in_tx = false;
+    lora_write_reg(REG_IRQ_FLAGS, 0xFF);
+    lora_receive_mode();
+    ESP_LOGW(TAG, "SX1278 TX timeout");
+    return false;
 }
 
 bool lora_radio_is_ready(void)
@@ -223,7 +296,7 @@ static void lora_read_fifo(uint8_t *data, size_t length)
     lora_transfer(REG_FIFO & 0x7F, NULL, data, length);
 }
 
-bool lora_read_raw_frame(uint8_t *payload, size_t *length, int *rssi, int *snr)
+static bool lora_read_raw_frame(uint8_t *payload, size_t *length, int *rssi, int *snr)
 {
     uint8_t flags;
     uint8_t frame_length;
@@ -252,7 +325,7 @@ bool lora_read_raw_frame(uint8_t *payload, size_t *length, int *rssi, int *snr)
     return true;
 }
 
-bool lora_transmit_raw_frame(const uint8_t *frame, size_t length)
+static bool lora_transmit_raw_frame(const uint8_t *frame, size_t length)
 {
     lora_write_reg(REG_DIO_MAPPING_1, 0x40);
     lora_write_reg(REG_IRQ_FLAGS, 0xFF);

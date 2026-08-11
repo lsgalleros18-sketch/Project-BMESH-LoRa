@@ -11,10 +11,12 @@
 #include "freertos/semphr.h"
 #include "nvs.h"
 
+#include "bems_crypto.h"
 #include "mesh_protocol.h"
 #include "messages/message_store.h"
 #include "node_config.h"
 #include "radio/lora_radio.h"
+#include "utils/string_utils.h"
 
 static const char *TAG = "barangay_mesh";
 static uint32_t highest_seen_id;
@@ -24,10 +26,12 @@ static uint8_t time_sync_distance;
 static TickType_t last_time_sync_broadcast_tick;
 
 static void load_highest_seen_id_impl(void);
+static void save_highest_seen_id(void);
 static uint32_t sync_last_id_from_payload(const char *payload);
 static uint32_t time_sync_epoch_from_payload(const char *payload);
 static uint8_t time_sync_dist_from_payload(const char *payload);
-static bool is_control_packet_type(const char *type);
+bool mesh_control_is_control_packet_type(const char *type);
+bool mesh_control_handle_time_sync_packet(const char *payload);
 static bool is_private_destination_for_other_node(const char *destination, const char *requester);
 void mesh_control_send_ack_packet(const mesh_packet_t *parsed);
 void mesh_control_send_sync_responses(const mesh_packet_t *request);
@@ -46,6 +50,7 @@ void mesh_control_update_highest_seen_id(uint32_t id)
 {
     if (id > highest_seen_id) {
         highest_seen_id = id;
+        save_highest_seen_id();
     }
 }
 
@@ -87,6 +92,7 @@ void mesh_control_send_time_sync_packet(uint32_t epoch, uint8_t distance, uint8_
     uint32_t message_id;
 
     message_id = ++highest_seen_id;
+    save_highest_seen_id();
     location_encode(&node_config_get()->location, encoded_location, sizeof(encoded_location));
 
     snprintf(packet, sizeof(packet), "BEMS|%lu|%.*s|ALL|TIME_SYNC|NORMAL|HOPS=%u|RELAY=1|LOC=%s|epoch=%lu~dist=%u",
@@ -119,6 +125,7 @@ void mesh_control_send_sync_request(uint32_t last_id)
     uint32_t request_id;
 
     request_id = ++highest_seen_id;
+    save_highest_seen_id();
     location_encode(&node_config_get()->location, encoded_location, sizeof(encoded_location));
 
     snprintf(sync_request, sizeof(sync_request), "BEMS|%lu|%.*s|ALL|SYNC_REQ|NORMAL|HOPS=1|RELAY=0|LOC=%s|last_id=%lu",
@@ -152,11 +159,33 @@ static void load_highest_seen_id_impl(void)
         return;
     }
 
-    if (nvs_get_u32(handle, "highest_seen", &stored_id) == ESP_OK) {
+    if (nvs_get_u32(handle, MESH_CONTROL_HIGHEST_SEEN_ID_KEY, &stored_id) == ESP_OK) {
         highest_seen_id = stored_id;
         ESP_LOGI(TAG, "Highest seen ID restored: %lu", (unsigned long)highest_seen_id);
     } else {
         ESP_LOGI(TAG, "No saved highest seen ID; starting at 0");
+    }
+
+    nvs_close(handle);
+}
+
+static void save_highest_seen_id(void)
+{
+    nvs_handle_t handle;
+    esp_err_t result = nvs_open("bems_config", NVS_READWRITE, &handle);
+
+    if (result != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to open NVS for highest seen ID: %s", esp_err_to_name(result));
+        return;
+    }
+
+    result = nvs_set_u32(handle, MESH_CONTROL_HIGHEST_SEEN_ID_KEY, highest_seen_id);
+    if (result == ESP_OK) {
+        result = nvs_commit(handle);
+    }
+
+    if (result != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to save highest seen ID: %s", esp_err_to_name(result));
     }
 
     nvs_close(handle);
@@ -187,9 +216,25 @@ static uint8_t time_sync_dist_from_payload(const char *payload)
     return 0;
 }
 
-static bool is_control_packet_type(const char *type)
+bool mesh_control_is_control_packet_type(const char *type)
 {
     return strcmp(type, "ACK") == 0 || strcmp(type, "SYNC_REQ") == 0 || strcmp(type, "SYNC_RESP") == 0 || strcmp(type, "TIME_SYNC") == 0;
+}
+
+bool mesh_control_handle_time_sync_packet(const char *payload)
+{
+    uint32_t epoch = time_sync_epoch_from_payload(payload);
+    uint8_t dist = time_sync_dist_from_payload(payload);
+
+    if (epoch == 0) {
+        return false;
+    }
+
+    if (!mesh_control_is_time_synced() || dist < mesh_control_get_time_sync_distance()) {
+        mesh_control_apply_time_sync(epoch, dist);
+    }
+
+    return true;
 }
 
 static bool is_private_destination_for_other_node(const char *destination, const char *requester)

@@ -20,6 +20,8 @@ typedef struct {
 
 node_config_t *node_config_get(void);
 const char *node_config_get_node_id(void);
+const char *node_config_get_node_name(void);
+const char *node_config_get_default_destination(void);
 const char *node_config_get_web_pin(void);
 const char *node_config_get_network_key(void);
 const char *node_config_get_ap_password(void);
@@ -28,6 +30,7 @@ const char *node_config_get_node_role(void);
 const char *node_config_get_default_priority(void);
 bool node_config_is_provisioned(void);
 void node_config_set_identity(const char *node_id);
+void node_config_copy_node_id(char *destination, size_t destination_size, const char *source);
 void node_config_load(void);
 int node_config_save(const node_config_t *config);
 void node_config_set_defaults(void);
