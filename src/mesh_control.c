@@ -13,20 +13,17 @@
 
 #include "bems_crypto.h"
 #include "mesh_protocol.h"
+#include "mesh/mesh_sequence.h"
 #include "messages/message_store.h"
 #include "node_config.h"
 #include "radio/lora_radio.h"
 #include "utils/string_utils.h"
 
 static const char *TAG = "barangay_mesh";
-static uint32_t highest_seen_id;
 static int64_t epoch_offset_sec;
 static bool time_synced;
 static uint8_t time_sync_distance;
 static TickType_t last_time_sync_broadcast_tick;
-
-static void load_highest_seen_id_impl(void);
-static void save_highest_seen_id(void);
 static uint32_t sync_last_id_from_payload(const char *payload);
 static uint32_t time_sync_epoch_from_payload(const char *payload);
 static uint8_t time_sync_dist_from_payload(const char *payload);
@@ -38,20 +35,17 @@ void mesh_control_send_sync_responses(const mesh_packet_t *request);
 
 void mesh_control_load_highest_seen_id(void)
 {
-    load_highest_seen_id_impl();
+    mesh_sequence_init();
 }
 
 uint32_t mesh_control_get_highest_seen_id(void)
 {
-    return highest_seen_id;
+    return mesh_sequence_peek();
 }
 
 void mesh_control_update_highest_seen_id(uint32_t id)
 {
-    if (id > highest_seen_id) {
-        highest_seen_id = id;
-        save_highest_seen_id();
-    }
+    mesh_sequence_update(id);
 }
 
 uint32_t mesh_control_current_epoch_seconds(void)
@@ -91,15 +85,17 @@ void mesh_control_send_time_sync_packet(uint32_t epoch, uint8_t distance, uint8_
     char encoded_location[SITIO_LEN + BARANGAY_LEN + MUNICIPALITY_LEN + 2];
     uint32_t message_id;
 
-    message_id = ++highest_seen_id;
-    save_highest_seen_id();
+    message_id = mesh_sequence_next();
+    mesh_sequence_save();
     location_encode(&node_config_get()->location, encoded_location, sizeof(encoded_location));
 
-    snprintf(packet, sizeof(packet), "BEMS|%lu|%.*s|ALL|TIME_SYNC|NORMAL|HOPS=%u|RELAY=1|LOC=%s|epoch=%lu~dist=%u",
+    snprintf(packet, sizeof(packet), "BEMS|%lu|%.*s|ALL|TIME_SYNC|NORMAL|HOPS=%u|RELAY=%.*s|LOC=%s|epoch=%lu~dist=%u",
              (unsigned long)message_id,
              31,
              node_config_get_node_id(),
              hops,
+             31,
+             node_config_get_node_id(),
              encoded_location,
              (unsigned long)epoch,
              distance);
@@ -124,12 +120,14 @@ void mesh_control_send_sync_request(uint32_t last_id)
     char encoded_location[SITIO_LEN + BARANGAY_LEN + MUNICIPALITY_LEN + 2];
     uint32_t request_id;
 
-    request_id = ++highest_seen_id;
-    save_highest_seen_id();
+    request_id = mesh_sequence_next();
+    mesh_sequence_save();
     location_encode(&node_config_get()->location, encoded_location, sizeof(encoded_location));
 
-    snprintf(sync_request, sizeof(sync_request), "BEMS|%lu|%.*s|ALL|SYNC_REQ|NORMAL|HOPS=1|RELAY=0|LOC=%s|last_id=%lu",
+    snprintf(sync_request, sizeof(sync_request), "BEMS|%lu|%.*s|ALL|SYNC_REQ|NORMAL|HOPS=1|RELAY=%.*s|LOC=%s|last_id=%lu",
              (unsigned long)request_id,
+             31,
+             node_config_get_node_id(),
              31,
              node_config_get_node_id(),
              encoded_location,
@@ -141,54 +139,12 @@ void mesh_control_send_sync_request(uint32_t last_id)
 
 void mesh_control_send_boot_sync_request(void)
 {
-    mesh_control_send_sync_request(highest_seen_id);
+    mesh_control_send_sync_request(mesh_sequence_peek());
 }
 
 void mesh_control_send_manual_sync_request(void)
 {
     mesh_control_send_sync_request(0);
-}
-
-static void load_highest_seen_id_impl(void)
-{
-    nvs_handle_t handle;
-    uint32_t stored_id = 0;
-
-    if (nvs_open("bems_config", NVS_READONLY, &handle) != ESP_OK) {
-        ESP_LOGI(TAG, "No saved highest seen ID; starting at 0");
-        return;
-    }
-
-    if (nvs_get_u32(handle, MESH_CONTROL_HIGHEST_SEEN_ID_KEY, &stored_id) == ESP_OK) {
-        highest_seen_id = stored_id;
-        ESP_LOGI(TAG, "Highest seen ID restored: %lu", (unsigned long)highest_seen_id);
-    } else {
-        ESP_LOGI(TAG, "No saved highest seen ID; starting at 0");
-    }
-
-    nvs_close(handle);
-}
-
-static void save_highest_seen_id(void)
-{
-    nvs_handle_t handle;
-    esp_err_t result = nvs_open("bems_config", NVS_READWRITE, &handle);
-
-    if (result != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to open NVS for highest seen ID: %s", esp_err_to_name(result));
-        return;
-    }
-
-    result = nvs_set_u32(handle, MESH_CONTROL_HIGHEST_SEEN_ID_KEY, highest_seen_id);
-    if (result == ESP_OK) {
-        result = nvs_commit(handle);
-    }
-
-    if (result != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to save highest seen ID: %s", esp_err_to_name(result));
-    }
-
-    nvs_close(handle);
 }
 
 static uint32_t sync_last_id_from_payload(const char *payload)
@@ -246,16 +202,20 @@ void mesh_control_send_ack_packet(const mesh_packet_t *parsed)
 {
     char ack_packet[PACKET_LEN];
     char encoded_location[SITIO_LEN + BARANGAY_LEN + MUNICIPALITY_LEN + 2];
+    uint32_t ack_id;
 
+    ack_id = mesh_sequence_next();
+    mesh_sequence_save();
     location_encode(&node_config_get()->location, encoded_location, sizeof(encoded_location));
 
-    snprintf(ack_packet, sizeof(ack_packet), "BEMS|%lu|%.*s|%.*s|ACK|NORMAL|HOPS=0|RELAY=%u|LOC=%s|ACK for %lu",
-             (unsigned long)parsed->id,
+    snprintf(ack_packet, sizeof(ack_packet), "BEMS|%lu|%.*s|%.*s|ACK|NORMAL|HOPS=0|RELAY=%.*s|LOC=%s|ACK for %lu",
+             (unsigned long)ack_id,
              31,
              node_config_get_node_id(),
              31,
              parsed->source,
-             1,
+             31,
+             node_config_get_node_id(),
              encoded_location,
              (unsigned long)parsed->id);
 
@@ -298,28 +258,33 @@ void mesh_control_send_sync_responses(const mesh_packet_t *request)
         const char *original_packet = strstr(snapshot[i].packet, "BEMS|");
         int prefix_len;
         size_t original_len;
+        uint32_t response_id;
 
         vTaskDelay(pdMS_TO_TICKS(200 + (esp_random() % 1001)));
         if (original_packet == NULL) {
             original_packet = snapshot[i].packet;
         }
 
-        prefix_len = snprintf(sync_response, sizeof(sync_response), "BEMS|%lu|%.*s|%.*s|SYNC_RESP|NORMAL|HOPS=0|RELAY=0|LOC=%s|",
-                              (unsigned long)snapshot[i].id,
+        response_id = mesh_sequence_next();
+        mesh_sequence_save();
+        prefix_len = snprintf(sync_response, sizeof(sync_response), "BEMS|%lu|%.*s|%.*s|SYNC_RESP|NORMAL|HOPS=0|RELAY=%.*s|LOC=%s|",
+                              (unsigned long)response_id,
                               31,
                               node_config_get_node_id(),
                               31,
                               request->source,
+                              31,
+                              node_config_get_node_id(),
                               encoded_location);
         original_len = strlen(original_packet);
 
         if (prefix_len < 0 || (size_t)prefix_len >= sizeof(sync_response) || (size_t)prefix_len + original_len > BEMS_MAX_PLAINTEXT) {
-            ESP_LOGW(TAG, "Skipping oversized SYNC_RESP for packet %lu", (unsigned long)snapshot[i].id);
+            ESP_LOGW(TAG, "Skipping oversized SYNC_RESP for packet %lu", (unsigned long)response_id);
             continue;
         }
         copy_field(sync_response + prefix_len, sizeof(sync_response) - (size_t)prefix_len, original_packet);
 
-        ESP_LOGI(TAG, "SYNC_RESP to %s for packet %lu", request->source, (unsigned long)snapshot[i].id);
+        ESP_LOGI(TAG, "SYNC_RESP to %s for packet %lu", request->source, (unsigned long)response_id);
         lora_transmit(sync_response);
     }
 }

@@ -72,3 +72,29 @@ The old split docs were consolidated into this file:
 - `docs/ROADMAP.md`
 - `docs/CHANGELOG.md`
 - `BUG_REPORT.md`
+
+
+
+
+
+shit worth to implement:
+
+18. What I would copy from the reference
+
+This is the important answer given what you've been doing with your refactor.
+
+HIGH VALUE
+
+Neighbor discovery / HELLO concept	YES
+Neighbor freshness	YES
+RSSI-based next-hop scoring	YES
+Exclude previous hop	YES
+Top-N route candidates	YES
+Random selection among good candidates	YES
+Explicit transmission queue	YES
+ACK pending state machine	YES
+ACK replay protection	YES
+Alternate route / ALT concept	YES
+Limit alternate attempts	YES
+Central message scheduler	YES
+TTL-based forwarding	YES

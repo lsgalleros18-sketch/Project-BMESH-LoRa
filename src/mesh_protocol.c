@@ -7,26 +7,39 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 
+enum {
+    DEDUP_EXPIRY_BUCKET_MS = 1000,
+    DEDUP_EXPIRY_BUCKET_COUNT = SEEN_PACKET_TTL_MS / DEDUP_EXPIRY_BUCKET_MS,
+};
+
 typedef struct {
     uint32_t id;
     TickType_t seen_tick;
     char source[FIELD_LEN];
-    int next_index;
+    int16_t next_hash;
+    int16_t next_expiry;
+    uint8_t expiry_bucket;
     bool active;
 } seen_packet_t;
 
 static SemaphoreHandle_t mesh_mutex;
 static seen_packet_t seen_packets[MAX_SEEN_PACKETS];
-static int seen_bucket_heads[MAX_SEEN_BUCKETS];
-static int seen_free_list[MAX_SEEN_PACKETS];
-static size_t seen_free_count;
-static size_t seen_packet_count;
+static int16_t hash_buckets[MAX_SEEN_BUCKETS];
+static int16_t expiry_wheel[DEDUP_EXPIRY_BUCKET_COUNT];
+static int16_t free_list_head;
+static uint32_t last_expiry_bucket;
+static bool dedup_initialized;
 
 static void ensure_mutex(void)
 {
     if (mesh_mutex == NULL) {
         mesh_mutex = xSemaphoreCreateMutex();
     }
+}
+
+static uint32_t dedup_now_ms(void)
+{
+    return (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
 }
 
 static void mesh_lock(void)
@@ -64,61 +77,75 @@ static int seen_bucket_index(const char *source, uint32_t id)
     return (int)(seen_hash(source, id) % MAX_SEEN_BUCKETS);
 }
 
-static void seen_remove_index(int bucket_index, int entry_index, int previous_index, bool recycle_slot)
+static bool seen_entry_matches(const seen_packet_t *entry, const char *source, uint32_t id)
 {
-    if (previous_index >= 0) {
-        seen_packets[previous_index].next_index = seen_packets[entry_index].next_index;
-    } else {
-        seen_bucket_heads[bucket_index] = seen_packets[entry_index].next_index;
-    }
-
-    seen_packets[entry_index].active = false;
-    seen_packets[entry_index].next_index = -1;
-    if (recycle_slot && seen_free_count < MAX_SEEN_PACKETS) {
-        seen_free_list[seen_free_count++] = entry_index;
-    }
-    if (seen_packet_count > 0) {
-        seen_packet_count--;
-    }
+    return entry->id == id && strcmp(entry->source, source) == 0;
 }
 
-static void prune_expired_bucket(int bucket_index, TickType_t now, TickType_t ttl_ticks)
+static void remove_from_hash(int16_t index)
 {
-    int previous_index = -1;
-    int current_index = seen_bucket_heads[bucket_index];
+    int bucket_index;
+    int16_t *cursor;
 
-    while (current_index >= 0) {
-        int next_index = seen_packets[current_index].next_index;
-
-        if ((now - seen_packets[current_index].seen_tick) > ttl_ticks) {
-            seen_remove_index(bucket_index, current_index, previous_index, true);
-        } else {
-            previous_index = current_index;
-        }
-
-        current_index = next_index;
-    }
-}
-
-static void seen_init_storage(void)
-{
-    static bool initialized;
-
-    if (initialized) {
+    if (index < 0 || index >= MAX_SEEN_PACKETS) {
         return;
     }
 
-    for (size_t i = 0; i < MAX_SEEN_BUCKETS; i++) {
-        seen_bucket_heads[i] = -1;
+    bucket_index = seen_bucket_index(seen_packets[index].source, seen_packets[index].id);
+    cursor = &hash_buckets[bucket_index];
+    while (*cursor != -1) {
+        if (*cursor == index) {
+            *cursor = seen_packets[index].next_hash;
+            break;
+        }
+        cursor = &seen_packets[*cursor].next_hash;
     }
+}
+
+static void remove_from_expiry(int16_t index)
+{
+    int16_t *cursor;
+    uint8_t bucket;
+
+    if (index < 0 || index >= MAX_SEEN_PACKETS) {
+        return;
+    }
+
+    bucket = seen_packets[index].expiry_bucket;
+    cursor = &expiry_wheel[bucket];
+    while (*cursor != -1) {
+        if (*cursor == index) {
+            *cursor = seen_packets[index].next_expiry;
+            break;
+        }
+        cursor = &seen_packets[*cursor].next_expiry;
+    }
+}
+
+static void dedup_init_storage(void)
+{
+    if (dedup_initialized) {
+        return;
+    }
+
     for (size_t i = 0; i < MAX_SEEN_PACKETS; i++) {
-        seen_free_list[i] = (int)(MAX_SEEN_PACKETS - 1 - i);
         seen_packets[i].active = false;
-        seen_packets[i].next_index = -1;
+        seen_packets[i].next_hash = -1;
+        seen_packets[i].next_expiry = -1;
     }
-    seen_free_count = MAX_SEEN_PACKETS;
-    seen_packet_count = 0;
-    initialized = true;
+    for (size_t i = 0; i < MAX_SEEN_BUCKETS; i++) {
+        hash_buckets[i] = -1;
+    }
+    for (size_t i = 0; i < DEDUP_EXPIRY_BUCKET_COUNT; i++) {
+        expiry_wheel[i] = -1;
+    }
+    free_list_head = 0;
+    for (int16_t i = 0; i < MAX_SEEN_PACKETS - 1; i++) {
+        seen_packets[i].next_hash = i + 1;
+    }
+    seen_packets[MAX_SEEN_PACKETS - 1].next_hash = -1;
+    last_expiry_bucket = 0;
+    dedup_initialized = true;
 }
 
 static void copy_field(char *destination, size_t destination_size, const char *source)
@@ -137,6 +164,66 @@ static void copy_field(char *destination, size_t destination_size, const char *s
     }
 
     destination[write_index] = '\0';
+}
+
+static void expire_current_and_prior_buckets(uint32_t now_ms)
+{
+    uint32_t current_bucket = now_ms / DEDUP_EXPIRY_BUCKET_MS;
+    uint32_t bucket_span = current_bucket - last_expiry_bucket;
+
+    if (bucket_span > DEDUP_EXPIRY_BUCKET_COUNT) {
+        bucket_span = DEDUP_EXPIRY_BUCKET_COUNT;
+    }
+
+    for (uint32_t step = 0; step < bucket_span; step++) {
+        uint32_t wheel_index = last_expiry_bucket % DEDUP_EXPIRY_BUCKET_COUNT;
+        int16_t index = expiry_wheel[last_expiry_bucket % DEDUP_EXPIRY_BUCKET_COUNT];
+        while (index != -1) {
+            int16_t next = seen_packets[index].next_expiry;
+            if (seen_packets[index].active &&
+                (now_ms - (uint32_t)seen_packets[index].seen_tick) >= SEEN_PACKET_TTL_MS) {
+                remove_from_hash(index);
+                remove_from_expiry(index);
+                seen_packets[index].active = false;
+                seen_packets[index].next_hash = free_list_head;
+                free_list_head = index;
+            }
+            index = next;
+        }
+        expiry_wheel[wheel_index] = -1;
+        last_expiry_bucket++;
+    }
+}
+
+static int16_t alloc_entry(void)
+{
+    int16_t index;
+
+    if (free_list_head == -1) {
+        return -1;
+    }
+    index = free_list_head;
+    free_list_head = seen_packets[index].next_hash;
+    return index;
+}
+
+static void insert_entry(int16_t index, const char *source, uint32_t id, TickType_t now_ticks)
+{
+    int bucket = seen_bucket_index(source, id);
+    uint32_t bucket_id = (uint32_t)now_ticks / DEDUP_EXPIRY_BUCKET_MS;
+    uint8_t expiry_bucket = (uint8_t)(bucket_id % DEDUP_EXPIRY_BUCKET_COUNT);
+
+    seen_packets[index].id = id;
+    seen_packets[index].seen_tick = now_ticks;
+    copy_field(seen_packets[index].source, sizeof(seen_packets[index].source), source);
+    seen_packets[index].expiry_bucket = expiry_bucket;
+    seen_packets[index].active = true;
+
+    seen_packets[index].next_hash = hash_buckets[bucket];
+    hash_buckets[bucket] = index;
+
+    seen_packets[index].next_expiry = expiry_wheel[expiry_bucket];
+    expiry_wheel[expiry_bucket] = index;
 }
 
 void location_encode(const location_info_t *loc, char *out, size_t out_size)
@@ -250,20 +337,22 @@ void build_forward_packet(const mesh_packet_t *parsed, char *packet, size_t pack
 bool packet_seen(const char *source, uint32_t id)
 {
     bool seen = false;
-    TickType_t now = xTaskGetTickCount();
-    TickType_t ttl_ticks = pdMS_TO_TICKS(SEEN_PACKET_TTL_MS);
+    uint32_t now_ms = dedup_now_ms();
     int bucket_index;
+    int16_t index;
 
     ensure_mutex();
-    seen_init_storage();
+    dedup_init_storage();
     mesh_lock();
+    expire_current_and_prior_buckets(now_ms);
     bucket_index = seen_bucket_index(source, id);
-    prune_expired_bucket(bucket_index, now, ttl_ticks);
-    for (int current_index = seen_bucket_heads[bucket_index]; current_index >= 0; current_index = seen_packets[current_index].next_index) {
-        if (seen_packets[current_index].id == id && strcmp(seen_packets[current_index].source, source) == 0) {
+    index = hash_buckets[bucket_index];
+    while (index != -1) {
+        if (seen_packets[index].active && seen_entry_matches(&seen_packets[index], source, id)) {
             seen = true;
             break;
         }
+        index = seen_packets[index].next_hash;
     }
     mesh_unlock();
     return seen;
@@ -271,54 +360,73 @@ bool packet_seen(const char *source, uint32_t id)
 
 void remember_packet(const char *source, uint32_t id)
 {
-    seen_packet_t *seen_packet;
-    TickType_t now = xTaskGetTickCount();
-    TickType_t ttl_ticks = pdMS_TO_TICKS(SEEN_PACKET_TTL_MS);
+    uint32_t now_ms = dedup_now_ms();
+    TickType_t now_ticks = xTaskGetTickCount();
     int bucket_index;
-    int slot_index;
+    int16_t index;
+    int16_t slot_index;
 
     ensure_mutex();
-    seen_init_storage();
+    dedup_init_storage();
     mesh_lock();
+    expire_current_and_prior_buckets(now_ms);
     bucket_index = seen_bucket_index(source, id);
-    prune_expired_bucket(bucket_index, now, ttl_ticks);
-
-    if (seen_free_count > 0) {
-        slot_index = seen_free_list[--seen_free_count];
-    } else {
-        int oldest_index = -1;
-        TickType_t oldest_tick = 0;
-
-        for (int current_index = seen_bucket_heads[bucket_index]; current_index >= 0; current_index = seen_packets[current_index].next_index) {
-            if (oldest_index < 0 || (now - seen_packets[current_index].seen_tick) > (now - oldest_tick)) {
-                oldest_index = current_index;
-                oldest_tick = seen_packets[current_index].seen_tick;
-            }
-        }
-
-        if (oldest_index < 0) {
+    index = hash_buckets[bucket_index];
+    while (index != -1) {
+        if (seen_packets[index].active && seen_entry_matches(&seen_packets[index], source, id)) {
             mesh_unlock();
             return;
         }
-
-        int previous_index = -1;
-        for (int current_index = seen_bucket_heads[bucket_index]; current_index >= 0; current_index = seen_packets[current_index].next_index) {
-            if (current_index == oldest_index) {
-                break;
-            }
-            previous_index = current_index;
-        }
-        seen_remove_index(bucket_index, oldest_index, previous_index, false);
-        slot_index = oldest_index;
+        index = seen_packets[index].next_hash;
     }
 
-    seen_packet = &seen_packets[slot_index];
-    seen_packet->id = id;
-    seen_packet->seen_tick = now;
-    copy_field(seen_packet->source, sizeof(seen_packet->source), source);
-    seen_packet->active = true;
-    seen_packet->next_index = seen_bucket_heads[bucket_index];
-    seen_bucket_heads[bucket_index] = slot_index;
-    seen_packet_count++;
+    slot_index = alloc_entry();
+    if (slot_index == -1) {
+        mesh_unlock();
+        return;
+    }
+
+    insert_entry(slot_index, source, id, now_ticks);
+    mesh_unlock();
+}
+
+void deduplication_debug_reset_for_test(void)
+{
+    ensure_mutex();
+    dedup_init_storage();
+    mesh_lock();
+    memset(seen_packets, 0, sizeof(seen_packets));
+    for (size_t i = 0; i < MAX_SEEN_BUCKETS; i++) {
+        hash_buckets[i] = -1;
+    }
+    for (size_t i = 0; i < DEDUP_EXPIRY_BUCKET_COUNT; i++) {
+        expiry_wheel[i] = -1;
+    }
+    free_list_head = 0;
+    for (int16_t i = 0; i < MAX_SEEN_PACKETS - 1; i++) {
+        seen_packets[i].next_hash = i + 1;
+    }
+    seen_packets[MAX_SEEN_PACKETS - 1].next_hash = -1;
+    last_expiry_bucket = 0;
+    mesh_unlock();
+}
+
+void deduplication_debug_set_seen_tick_for_test(const char *source, uint32_t id, TickType_t seen_tick)
+{
+    int bucket_index;
+    int16_t index;
+
+    ensure_mutex();
+    dedup_init_storage();
+    mesh_lock();
+    bucket_index = seen_bucket_index(source, id);
+    index = hash_buckets[bucket_index];
+    while (index != -1) {
+        if (seen_packets[index].active && seen_entry_matches(&seen_packets[index], source, id)) {
+            seen_packets[index].seen_tick = seen_tick;
+            break;
+        }
+        index = seen_packets[index].next_hash;
+    }
     mesh_unlock();
 }

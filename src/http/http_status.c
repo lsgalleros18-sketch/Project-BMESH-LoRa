@@ -48,15 +48,19 @@ static void send_roster_json_chunk(httpd_req_t *request, const roster_entry_t *e
 static void send_route_json_chunk(httpd_req_t *request, const route_entry_t *entry, bool first)
 {
     char escaped_id[FIELD_LEN * 2];
+    char escaped_next_hop[FIELD_LEN * 2];
     char chunk[256];
 
-    json_escape_string(escaped_id, sizeof(escaped_id), entry->node_id);
+    json_escape_string(escaped_id, sizeof(escaped_id), entry->destination);
+    json_escape_string(escaped_next_hop, sizeof(escaped_next_hop), entry->next_hop);
     snprintf(chunk, sizeof(chunk),
-             "%s{\"node_id\":\"%s\",\"best_hop_distance\":%d,\"best_rssi\":%d,\"last_seen_tick_ms\":%lu,\"stale\":%s}",
+             "%s{\"destination\":\"%s\",\"next_hop\":\"%s\",\"hop_count\":%d,\"best_rssi\":%d,\"cost\":%lu,\"last_seen_tick_ms\":%lu,\"stale\":%s}",
              first ? "" : ",",
              escaped_id,
-             entry->best_hop_distance,
+             escaped_next_hop,
+             entry->hop_count,
              entry->best_rssi,
+             (unsigned long)entry->cost,
              (unsigned long)entry->last_seen_tick_ms,
              entry->stale ? "true" : "false");
     httpd_resp_send_chunk(request, chunk, HTTPD_RESP_USE_STRLEN);

@@ -50,10 +50,21 @@ static uint32_t now_ms(void)
     return (uint32_t)(esp_timer_get_time() / 1000ULL);
 }
 
-static size_t find_route_index(const char *node_id)
+static uint32_t route_cost_ms(const route_entry_t *entry, uint32_t now)
+{
+    uint32_t age_ms = now - entry->last_seen_tick_ms;
+    uint32_t hop_cost = (entry->hop_count < 0 ? 0u : (uint32_t)entry->hop_count) * 1000u;
+    uint32_t rssi_penalty = entry->best_rssi < 0 ? (uint32_t)(-entry->best_rssi) : 0u;
+    uint32_t age_penalty = age_ms / 1000u;
+
+    return hop_cost + rssi_penalty + age_penalty;
+}
+
+static size_t find_route_index(const char *destination, const char *next_hop)
 {
     for (size_t i = 0; i < route_count; i++) {
-        if (strcmp(route_table[i].node_id, node_id) == 0) {
+        if (strcmp(route_table[i].destination, destination) == 0 &&
+            strcmp(route_table[i].next_hop, next_hop) == 0) {
             return i;
         }
     }
@@ -71,6 +82,14 @@ static void refresh_stale_state(route_entry_t *entry, uint32_t now)
     entry->stale = route_is_stale_locked(entry, now);
 }
 
+static bool route_is_valid(const char *destination, const char *next_hop, int hop_count)
+{
+    return destination != NULL && destination[0] != '\0' &&
+           next_hop != NULL && next_hop[0] != '\0' &&
+           strcmp(destination, next_hop) != 0 &&
+           hop_count > 0;
+}
+
 void route_table_init(void)
 {
     if (route_mutex == NULL) {
@@ -78,19 +97,21 @@ void route_table_init(void)
     }
 }
 
-void route_table_learn(const char *node_id, int hop_distance_from_origin, int rssi)
+void route_table_learn(const char *destination, const char *next_hop, int hop_count, int rssi)
 {
     uint32_t now = now_ms();
     size_t index;
+    uint32_t new_cost;
 
-    if (node_id == NULL || node_id[0] == '\0') {
+    if (!route_is_valid(destination, next_hop, hop_count)) {
         return;
     }
 
     route_table_init();
     route_lock();
 
-    index = find_route_index(node_id);
+    index = find_route_index(destination, next_hop);
+    new_cost = (uint32_t)hop_count * 1000u + (rssi < 0 ? (uint32_t)(-rssi) : 0u);
     if (index == SIZE_MAX) {
         if (route_count < MAX_ROUTE_ENTRIES) {
             index = route_count++;
@@ -103,16 +124,20 @@ void route_table_learn(const char *node_id, int hop_distance_from_origin, int rs
             }
             index = oldest_index;
         }
-        copy_field(route_table[index].node_id, sizeof(route_table[index].node_id), node_id);
-        route_table[index].best_hop_distance = hop_distance_from_origin;
+        memset(&route_table[index], 0, sizeof(route_table[index]));
+        copy_field(route_table[index].destination, sizeof(route_table[index].destination), destination);
+        copy_field(route_table[index].next_hop, sizeof(route_table[index].next_hop), next_hop);
+    }
+
+    refresh_stale_state(&route_table[index], now);
+    if (route_table[index].stale ||
+        hop_count < route_table[index].hop_count ||
+        (hop_count == route_table[index].hop_count && rssi > route_table[index].best_rssi) ||
+        new_cost < route_cost_ms(&route_table[index], now) ||
+        route_table[index].hop_count == 0) {
+        route_table[index].hop_count = hop_count;
         route_table[index].best_rssi = rssi;
-    } else {
-        refresh_stale_state(&route_table[index], now);
-        if (route_table[index].stale || hop_distance_from_origin < route_table[index].best_hop_distance ||
-            (hop_distance_from_origin == route_table[index].best_hop_distance && rssi > route_table[index].best_rssi)) {
-            route_table[index].best_hop_distance = hop_distance_from_origin;
-            route_table[index].best_rssi = rssi;
-        }
+        route_table[index].cost = new_cost;
     }
 
     route_table[index].last_seen_tick_ms = now;
@@ -121,28 +146,54 @@ void route_table_learn(const char *node_id, int hop_distance_from_origin, int rs
     route_unlock();
 }
 
-bool route_table_lookup(const char *node_id, route_entry_t *out)
+bool route_table_get_best(const char *destination, route_entry_t *out)
 {
     bool found = false;
-    size_t index;
     uint32_t now;
+    uint32_t best_cost = UINT32_MAX;
+    route_entry_t best = {0};
 
-    if (node_id == NULL || node_id[0] == '\0' || out == NULL) {
+    if (destination == NULL || destination[0] == '\0' || out == NULL) {
         return false;
     }
 
     route_table_init();
+    now = now_ms();
     route_lock();
-    index = find_route_index(node_id);
-    if (index != SIZE_MAX) {
-        now = now_ms();
-        *out = route_table[index];
-        refresh_stale_state(out, now);
-        found = true;
+    for (size_t i = 0; i < route_count; i++) {
+        route_entry_t candidate = route_table[i];
+
+        if (strcmp(candidate.destination, destination) != 0) {
+            continue;
+        }
+
+        refresh_stale_state(&candidate, now);
+        if (candidate.stale || candidate.hop_count <= 0 || strcmp(candidate.next_hop, destination) == 0) {
+            continue;
+        }
+
+        if (!found ||
+            candidate.cost < best_cost ||
+            (candidate.cost == best_cost && candidate.hop_count < best.hop_count) ||
+            (candidate.cost == best_cost && candidate.hop_count == best.hop_count && candidate.best_rssi > best.best_rssi) ||
+            (candidate.cost == best_cost && candidate.hop_count == best.hop_count && candidate.best_rssi == best.best_rssi &&
+             strcmp(candidate.next_hop, best.next_hop) < 0)) {
+            best = candidate;
+            best_cost = candidate.cost;
+            found = true;
+        }
     }
     route_unlock();
 
+    if (found) {
+        *out = best;
+    }
     return found;
+}
+
+bool route_table_lookup(const char *destination, route_entry_t *out)
+{
+    return route_table_get_best(destination, out);
 }
 
 size_t route_table_get_snapshot(route_entry_t *out, size_t out_capacity)
@@ -165,4 +216,28 @@ size_t route_table_get_snapshot(route_entry_t *out, size_t out_capacity)
     route_unlock();
 
     return count;
+}
+
+void route_table_debug_set_last_seen_for_test(const char *destination, const char *next_hop, uint32_t last_seen_tick_ms)
+{
+    size_t index;
+    uint32_t now = now_ms();
+
+    route_table_init();
+    route_lock();
+    index = find_route_index(destination, next_hop);
+    if (index != SIZE_MAX) {
+        route_table[index].last_seen_tick_ms = last_seen_tick_ms;
+        refresh_stale_state(&route_table[index], now);
+    }
+    route_unlock();
+}
+
+void route_table_debug_reset_for_test(void)
+{
+    route_table_init();
+    route_lock();
+    memset(route_table, 0, sizeof(route_table));
+    route_count = 0;
+    route_unlock();
 }

@@ -73,6 +73,45 @@ static emergency_message_t *next_message_slot_locked(void)
     return message;
 }
 
+static bool message_matches(const emergency_message_t *message, uint32_t id, const char *source)
+{
+    return message != NULL && message->id == id && strcmp(message->source, source) == 0;
+}
+
+static bool message_is_restorable(const emergency_message_t *message)
+{
+    if (message == NULL) {
+        return false;
+    }
+    if (message->id == 0) {
+        return false;
+    }
+    return strcmp(message->direction, "TX") == 0 || strcmp(message->direction, "RX") == 0;
+}
+
+static size_t find_message_index(uint32_t id, const char *source)
+{
+    for (size_t i = 0; i < message_count; i++) {
+        if (message_matches(&messages[i], id, source)) {
+            return i;
+        }
+    }
+    return SIZE_MAX;
+}
+
+static void compact_remove_index(size_t index)
+{
+    if (index >= message_count) {
+        return;
+    }
+
+    if (index + 1 < message_count) {
+        memmove(&messages[index], &messages[index + 1], (message_count - index - 1) * sizeof(messages[0]));
+    }
+    memset(&messages[message_count - 1], 0, sizeof(messages[0]));
+    message_count--;
+}
+
 void message_store_save_message_to_nvs(const emergency_message_t *message, int slot)
 {
     nvs_handle_t handle;
@@ -124,17 +163,23 @@ void message_store_load_messages_from_nvs(const char *node_id)
         result = nvs_get_blob(handle, key, &loaded_message, &blob_size);
 
         if (result == ESP_OK && blob_size == sizeof(loaded_message)) {
-            if (strcmp(loaded_message.direction, "TX") == 0 || strcmp(loaded_message.direction, "RX") == 0) {
-                // Only restore messages where we are source or destination (skip pure relay traffic)
-                bool is_relevant = (strcmp(loaded_message.source, node_id) == 0) ||
-                                   (strcmp(loaded_message.destination, node_id) == 0);
-                if (is_relevant) {
-                    memcpy(&messages[message_count], &loaded_message, sizeof(loaded_message));
-                    message_count++;
-                    if (message_count >= MAX_MESSAGES) {
-                        break;
-                    }
-                }
+            if (!message_is_restorable(&loaded_message)) {
+                continue;
+            }
+            if (loaded_message.direction[0] == '\0' || loaded_message.source[0] == '\0' || loaded_message.destination[0] == '\0') {
+                continue;
+            }
+            if ((strcmp(loaded_message.source, node_id) != 0) &&
+                (strcmp(loaded_message.destination, node_id) != 0)) {
+                continue;
+            }
+            if (find_message_index(loaded_message.id, loaded_message.source) != SIZE_MAX) {
+                continue;
+            }
+            memcpy(&messages[message_count], &loaded_message, sizeof(loaded_message));
+            message_count++;
+            if (message_count >= MAX_MESSAGES) {
+                break;
             }
         }
     }
@@ -144,6 +189,86 @@ void message_store_load_messages_from_nvs(const char *node_id)
     nvs_close(handle);
 }
 
+bool message_store_add(const emergency_message_t *message, int *nvs_slot)
+{
+    emergency_message_t *slot;
+    int slot_index;
+
+    if (message == NULL) {
+        return false;
+    }
+
+    lock();
+    slot = next_message_slot_locked();
+    if (slot == NULL) {
+        unlock();
+        return false;
+    }
+
+    memcpy(slot, message, sizeof(*slot));
+    slot_index = (int)(slot - messages);
+    if (nvs_slot != NULL) {
+        *nvs_slot = slot_index;
+    }
+    unlock();
+    return true;
+}
+
+bool message_store_get(size_t index, emergency_message_t *out)
+{
+    bool found = false;
+
+    if (out == NULL) {
+        return false;
+    }
+
+    lock();
+    if (index < message_count) {
+        *out = messages[index];
+        found = true;
+    }
+    unlock();
+    return found;
+}
+
+bool message_store_find(uint32_t id, const char *source, emergency_message_t *out)
+{
+    bool found = false;
+    size_t index;
+
+    if (source == NULL || source[0] == '\0' || out == NULL) {
+        return false;
+    }
+
+    lock();
+    index = find_message_index(id, source);
+    if (index != SIZE_MAX) {
+        *out = messages[index];
+        found = true;
+    }
+    unlock();
+    return found;
+}
+
+bool message_store_remove(uint32_t id, const char *source)
+{
+    size_t index;
+
+    if (source == NULL || source[0] == '\0') {
+        return false;
+    }
+
+    lock();
+    index = find_message_index(id, source);
+    if (index == SIZE_MAX) {
+        unlock();
+        return false;
+    }
+    compact_remove_index(index);
+    unlock();
+    return true;
+}
+
 emergency_message_t *message_store_begin_write(int *nvs_slot)
 {
     emergency_message_t *message;
@@ -151,7 +276,7 @@ emergency_message_t *message_store_begin_write(int *nvs_slot)
     lock();
     message = next_message_slot_locked();
     if (nvs_slot != NULL) {
-        *nvs_slot = (int)(message_count - 1);
+        *nvs_slot = message == NULL ? -1 : (int)(message - messages);
     }
     return message;
 }

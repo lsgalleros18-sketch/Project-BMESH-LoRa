@@ -28,6 +28,10 @@ typedef struct {
 } emergency_message_t;
 
 void message_store_load_messages_from_nvs(const char *node_id);
+bool message_store_add(const emergency_message_t *message, int *nvs_slot);
+bool message_store_get(size_t index, emergency_message_t *out);
+bool message_store_find(uint32_t id, const char *source, emergency_message_t *out);
+bool message_store_remove(uint32_t id, const char *source);
 emergency_message_t *message_store_begin_write(int *nvs_slot);
 emergency_message_t *message_store_begin_update(uint32_t id, const char *source);
 void message_store_end_update(void);

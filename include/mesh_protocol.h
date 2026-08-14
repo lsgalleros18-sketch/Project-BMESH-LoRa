@@ -3,12 +3,14 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+
+#include "freertos/FreeRTOS.h"
 #include "bems_common.h"
 #define PAYLOAD_LEN 140
 #define PACKET_LEN 320
-#define MAX_SEEN_PACKETS 64
+#define MAX_SEEN_PACKETS 256
 #define SEEN_PACKET_TTL_MS 60000
-#define MAX_SEEN_BUCKETS 32
+#define MAX_SEEN_BUCKETS 64
 
 typedef struct {
     bool valid;
@@ -41,3 +43,5 @@ bool packet_seen(const char *source, uint32_t id);
 
 // Remembers a packet as seen
 void remember_packet(const char *source, uint32_t id);
+void deduplication_debug_reset_for_test(void);
+void deduplication_debug_set_seen_tick_for_test(const char *source, uint32_t id, TickType_t seen_tick);
