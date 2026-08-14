@@ -63,7 +63,7 @@ static void data_lock(void);
 static void data_unlock(void);
 static uint32_t ack_id_from_payload(const char *payload);
 static int hops_for_priority(const char *priority);
-static void build_packet(emergency_message_t *message);
+static bool build_packet_v2(emergency_message_t *message, const char *next_hop, uint8_t *packet_buf, size_t packet_buf_size, size_t *packet_len);
 static void store_received_packet(const char *packet, const mesh_packet_t *parsed, int rssi, int snr);
 static void delayed_forward_task(void *parameter);
 static void queue_message(const char *destination, const char *type, const char *priority, const char *payload);
@@ -76,6 +76,26 @@ typedef struct {
     bool route_known;
     route_entry_t route;
 } forward_packet_task_args_t;
+
+bool app_runtime_should_forward_packet(const mesh_packet_t *packet, const route_entry_t *route, const char *local_node_id)
+{
+    if (packet == NULL || local_node_id == NULL || local_node_id[0] == '\0') {
+        return false;
+    }
+    if (packet->hops <= 0) {
+        return false;
+    }
+    if (mesh_control_is_control_packet_type(packet->type)) {
+        return false;
+    }
+    if (strcmp(packet->destination, local_node_id) == 0) {
+        return false;
+    }
+    if (route == NULL || route->destination[0] == '\0' || route->stale || packet->next_hop[0] == '\0') {
+        return true;
+    }
+    return strcmp(packet->next_hop, local_node_id) == 0;
+}
 
 static void data_lock(void)
 {
@@ -93,19 +113,36 @@ static void data_unlock(void)
 
 static uint32_t ack_id_from_payload(const char *payload)
 {
-    const char *marker = strrchr(payload, ' ');
+    const char *marker;
+    char *end_ptr = NULL;
+    uint32_t ack_id;
 
-    if (marker == NULL) {
+    if (payload == NULL) {
         return 0;
     }
 
-    return (uint32_t)strtoul(marker + 1, NULL, 10);
+    if (strncmp(payload, "ACK for ", 8) != 0) {
+        return 0;
+    }
+
+    marker = payload + 8;
+    if (*marker == '\0') {
+        return 0;
+    }
+
+    ack_id = (uint32_t)strtoul(marker, &end_ptr, 10);
+    if (end_ptr == marker || *end_ptr != '\0') {
+        return 0;
+    }
+
+    return ack_id;
 }
 
 static void delayed_forward_task(void *parameter)
 {
     forward_packet_task_args_t *args = (forward_packet_task_args_t *)parameter;
-    char forward_packet[PACKET_LEN];
+    uint8_t forward_packet[PACKET_LEN];
+    size_t forward_packet_len = 0;
     uint32_t delay_ms = 100 + (esp_random() % 500);
 
     vTaskDelay(pdMS_TO_TICKS(delay_ms));
@@ -114,9 +151,10 @@ static void delayed_forward_task(void *parameter)
         ESP_LOGI(TAG, "Suppressed duplicate forward for %s/%lu after %u ms", args->packet.source, (unsigned long)args->packet.id, (unsigned int)delay_ms);
         vPortFree(args);
         vTaskDelete(NULL);
+        return;
     }
 
-    if (args->packet.hops > 0) {
+    if (app_runtime_should_forward_packet(&args->packet, args->route_known ? &args->route : NULL, node_id)) {
         if (args->route_known) {
             ESP_LOGI(TAG, "Route-selected forward for %s -> %s via %s (hop=%d rssi=%d age=%lu ms)",
                      args->packet.source,
@@ -129,9 +167,26 @@ static void delayed_forward_task(void *parameter)
             ESP_LOGI(TAG, "Flood fallback forward for %s -> %s", args->packet.source, args->packet.destination);
         }
         copy_field(args->packet.relay, sizeof(args->packet.relay), node_id);
-        build_forward_packet(&args->packet, forward_packet, sizeof(forward_packet));
+        if (args->route_known) {
+            copy_field(args->packet.next_hop, sizeof(args->packet.next_hop), args->route.next_hop);
+        } else {
+            args->packet.next_hop[0] = '\0';
+        }
+        if (!build_forward_packet_v2(&args->packet, forward_packet, sizeof(forward_packet), &forward_packet_len)) {
+            ESP_LOGW(TAG, "Failed to build V2 forward packet for %s/%lu", args->packet.source, (unsigned long)args->packet.id);
+            vPortFree(args);
+            vTaskDelete(NULL);
+            return;
+        }
         ESP_LOGI(TAG, "Forwarding packet %s/%lu after %u ms delay", args->packet.source, (unsigned long)args->packet.id, (unsigned int)delay_ms);
-        lora_transmit(forward_packet);
+        lora_transmit_bytes(forward_packet, forward_packet_len);
+    } else if (args->route_known) {
+        ESP_LOGI(TAG, "Suppressed route-forward for %s -> %s via %s (relay=%s, local=%s)",
+                 args->packet.source,
+                 args->packet.destination,
+                 args->route.next_hop,
+                 args->packet.relay,
+                 node_id);
     }
 
     vPortFree(args);
@@ -196,7 +251,7 @@ static void store_received_packet(const char *packet, const mesh_packet_t *parse
         bool is_relevant = (strcmp(parsed->source, node_id) == 0) ||
                           (strcmp(parsed->destination, node_id) == 0);
         if (is_relevant) {
-            message_store_save_message_to_nvs(&message, nvs_slot);
+            storage_message_save(&message, nvs_slot);
         }
     }
     data_unlock();
@@ -204,15 +259,19 @@ static void store_received_packet(const char *packet, const mesh_packet_t *parse
 
 void lora_handle_rx_packet(const uint8_t *payload, size_t length, int rssi, int snr)
 {
-    char decrypted_packet[PACKET_LEN];
-    if (!bems_decrypt_frame(payload, length, decrypted_packet, sizeof(decrypted_packet))) {
+    uint8_t decrypted_packet[PACKET_LEN];
+    size_t decrypted_len = 0;
+    bool is_v2;
+
+    if (!bems_decrypt_frame_bytes(payload, length, decrypted_packet, sizeof(decrypted_packet), &decrypted_len)) {
         ESP_LOGW(TAG, "Rejected unauthenticated LoRa frame RSSI=%d SNR=%d length=%u", rssi, snr, (unsigned int)length);
         return;
     }
 
-    ESP_LOGI(TAG, "SX1278 RX RSSI=%d SNR=%d: %s", rssi, snr, decrypted_packet);
+    is_v2 = mesh_packet_is_v2(decrypted_packet, decrypted_len);
+    ESP_LOGI(TAG, "SX1278 RX RSSI=%d SNR=%d length=%u format=%s", rssi, snr, (unsigned int)decrypted_len, is_v2 ? "V2" : "V1");
     mesh_packet_t parsed;
-    if (parse_mesh_packet(decrypted_packet, &parsed)) {
+    if ((is_v2 ? parse_mesh_packet_v2(decrypted_packet, decrypted_len, &parsed) : (decrypted_packet[decrypted_len] = 0, parse_mesh_packet((const char *)decrypted_packet, &parsed)))) {
         uint32_t now_ticks = xTaskGetTickCount();
         bool from_self = strcmp(parsed.source, node_id) == 0;
         bool replay_allowed = replay_protection_accept(parsed.source, parsed.id, now_ticks);
@@ -224,38 +283,35 @@ void lora_handle_rx_packet(const uint8_t *payload, size_t length, int rssi, int 
         route_entry_t route = {0};
         bool route_known = false;
 
-            if (!from_self && replay_allowed) {
-                remember_packet(parsed.source, parsed.id);
-                if (is_sync_req) {
-                    mesh_control_send_sync_responses(&parsed);
-                    return;
-                }
-
+        if (!from_self && replay_allowed) {
+            remember_packet(parsed.source, parsed.id);
+            if (is_sync_req) {
+                mesh_control_send_sync_responses(&parsed);
+                return;
+            }
             if (is_sync_resp) {
-                mesh_packet_t synced_packet;
-
-                if (is_for_me && parse_mesh_packet(parsed.payload, &synced_packet) && replay_protection_accept(synced_packet.source, synced_packet.id, now_ticks)) {
-                    store_received_packet(parsed.payload, &synced_packet, rssi, snr);
+                mesh_packet_t synced_packets[8];
+                size_t synced_count = mesh_control_decode_sync_response_records((const uint8_t *)parsed.payload, parsed.payload_len, synced_packets, 8);
+                for (size_t i = 0; i < synced_count; i++) {
+                    if (replay_protection_accept(synced_packets[i].source, synced_packets[i].id, now_ticks)) {
+                        store_received_packet(synced_packets[i].payload, &synced_packets[i], rssi, snr);
+                    }
                 }
                 if (is_for_me && strcmp(parsed.source, node_id) != 0) {
                     duplicate_node_id_warning = true;
                 }
                 return;
             }
-
             if (strcmp(parsed.type, "TIME_SYNC") == 0) {
                 (void)mesh_control_handle_time_sync_packet(parsed.payload);
                 return;
             }
-
             if (is_broadcast || is_for_me) {
-                store_received_packet(decrypted_packet, &parsed, rssi, snr);
+                store_received_packet((const char *)decrypted_packet, &parsed, rssi, snr);
             }
-
             if (is_for_me && !is_ack) {
                 mesh_control_send_ack_packet(&parsed);
             }
-
             if (is_ack && is_for_me) {
                 if (strcmp(parsed.source, node_id) != 0) {
                     duplicate_node_id_warning = true;
@@ -265,14 +321,11 @@ void lora_handle_rx_packet(const uint8_t *payload, size_t length, int rssi, int 
                     (void)tx_scheduler_acknowledge(ack_id, parsed.source);
                 }
             }
-
             if (!is_broadcast && !is_for_me && !mesh_control_is_control_packet_type(parsed.type)) {
                 route_known = route_table_get_best(parsed.destination, &route);
             }
-
             if (parsed.hops > 0 && !is_for_me && !mesh_control_is_control_packet_type(parsed.type)) {
                 forward_packet_task_args_t *forward_args = (forward_packet_task_args_t *)pvPortMalloc(sizeof(*forward_args));
-
                 if (forward_args != NULL) {
                     forward_args->packet = parsed;
                     forward_args->rssi = rssi;
@@ -290,7 +343,7 @@ void lora_handle_rx_packet(const uint8_t *payload, size_t length, int rssi, int 
             }
         } else if (from_self) {
             mesh_packet_t raw_packet = {0};
-            store_received_packet(decrypted_packet, &raw_packet, rssi, snr);
+            store_received_packet((const char *)decrypted_packet, &raw_packet, rssi, snr);
         }
     }
 }
@@ -315,46 +368,37 @@ static int hops_for_priority(const char *priority)
     return 3;
 }
 
-static void build_packet(emergency_message_t *message)
+static bool build_packet_v2(emergency_message_t *message, const char *next_hop, uint8_t *packet_buf, size_t packet_buf_size, size_t *packet_len)
 {
-    char encoded_location[SITIO_LEN + BARANGAY_LEN + MUNICIPALITY_LEN + 2];
-    size_t offset = 0;
-    int written;
+    mesh_packet_t packet = {0};
 
-    location_encode(&node_config_get()->location, encoded_location, sizeof(encoded_location));
+    packet.valid = true;
+    packet.id = message->id;
+    packet.hops = hops_for_priority(message->priority);
+    copy_field(packet.source, sizeof(packet.source), node_id);
+    copy_field(packet.destination, sizeof(packet.destination), message->destination);
+    copy_field(packet.type, sizeof(packet.type), message->type);
+    copy_field(packet.priority, sizeof(packet.priority), message->priority);
+    copy_field(packet.relay, sizeof(packet.relay), node_id);
+    copy_field(packet.next_hop, sizeof(packet.next_hop), next_hop == NULL ? "" : next_hop);
+    packet.location = node_config_get()->location;
 
-    written = snprintf(message->packet + offset, sizeof(message->packet) - offset, "BEMS|%lu|%.*s|%.*s|%.*s|%.*s|HOPS=%d|RELAY=%.*s|LOC=%s|",
-                       (unsigned long)message->id,
-                       31,
-                       node_id,
-                       31,
-                       message->destination,
-                       31,
-                       message->type,
-                       31,
-                       message->priority,
-                       hops_for_priority(message->priority),
-                       31,
-                       node_id,
-                       encoded_location);
-    if (written < 0 || (size_t)written >= sizeof(message->packet) - offset) {
-        message->packet[0] = '\0';
-        return;
+    if (!build_forward_packet_v2(&packet, packet_buf, packet_buf_size, packet_len)) {
+        return false;
     }
-    offset += (size_t)written;
-
-    written = snprintf(message->packet + offset, sizeof(message->packet) - offset, "%.*s", 120, message->payload);
-    if (written < 0 || (size_t)written >= sizeof(message->packet) - offset) {
-        message->packet[sizeof(message->packet) - 1] = '\0';
-        return;
-    }
+    snprintf(message->packet, sizeof(message->packet), "V2 %s -> %s type=%s hops=%d", packet.source, packet.destination, packet.type, packet.hops);
+    ESP_LOGI(TAG, "Built V2 packet for %s -> %s", packet.source, packet.destination);
+    return true;
 }
 
 static void queue_message(const char *destination, const char *type, const char *priority, const char *payload)
 {
-    char packet[PACKET_LEN];
+    char next_hop[FIELD_LEN] = {0};
+    uint8_t packet_buf[PACKET_LEN] = {0};
+    size_t packet_len = 0;
     emergency_message_t message = {0};
     int nvs_slot = -1;
+    route_entry_t route = {0};
 
     message.id = mesh_sequence_next();
     copy_field(message.direction, sizeof(message.direction), "TX");
@@ -365,10 +409,14 @@ static void queue_message(const char *destination, const char *type, const char 
     copy_field(message.payload, sizeof(message.payload), payload);
     copy_field(message.status, sizeof(message.status), "PENDING");
     message.stored_epoch = mesh_control_is_time_synced() ? mesh_control_current_epoch_seconds() : 0;
-    build_packet(&message);
+    if (route_table_get_best(destination, &route)) {
+        copy_field(next_hop, sizeof(next_hop), route.next_hop);
+    }
+    if (!build_packet_v2(&message, next_hop, packet_buf, sizeof(packet_buf), &packet_len)) {
+        return;
+    }
     compute_thread_key(message.thread_key, sizeof(message.thread_key), message.source, message.destination);
     message.origin_location = node_config_get()->location;
-    copy_field(packet, sizeof(packet), message.packet);
     mesh_sequence_save();
 
     data_lock();
@@ -377,10 +425,11 @@ static void queue_message(const char *destination, const char *type, const char 
         ESP_LOGW(TAG, "Message queue full; unable to enqueue %s -> %s", node_id, destination);
         return;
     }
-    message_store_save_message_to_nvs(&message, nvs_slot);
+    storage_message_save(&message, nvs_slot);
     data_unlock();
 
-    ESP_LOGI(TAG, "Queued LoRa TX: %s", packet);
+    ESP_LOGI(TAG, "Queued LoRa TX: %s", message.packet);
+    (void)lora_transmit_bytes(packet_buf, packet_len);
     (void)tx_scheduler_enqueue(&message, nvs_slot);
 }
 

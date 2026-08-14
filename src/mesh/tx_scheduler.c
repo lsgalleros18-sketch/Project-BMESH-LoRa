@@ -12,6 +12,7 @@
 #include "messages/message_store.h"
 #include "radio/lora_radio.h"
 #include "route_table.h"
+#include "storage/storage.h"
 #include "utils/string_utils.h"
 
 #define TX_RETRY_MAX_ATTEMPTS 3
@@ -58,11 +59,17 @@ static void unlock(void)
     }
 }
 
-static tx_entry_t *find_entry(uint32_t id, const char *source)
+static tx_entry_t *find_entry(uint32_t id, const char *ack_sender)
 {
     for (size_t i = 0; i < MAX_MESSAGES; i++) {
         tx_entry_t *entry = &tx_entries[i];
-        if (entry->active && entry->message.id == id && strcmp(entry->message.source, source) == 0) {
+        /*
+         * ACKs are received from the packet destination, so match against the
+         * original queued message destination rather than the sender field.
+         */
+        if (entry->active &&
+            entry->message.id == id &&
+            strcmp(entry->message.destination, ack_sender) == 0) {
             return entry;
         }
     }
@@ -83,14 +90,16 @@ static void set_status(tx_entry_t *entry, const char *status)
 {
     copy_field(entry->message.status, sizeof(entry->message.status), status);
     if (entry->nvs_slot >= 0) {
-        message_store_save_message_to_nvs(&entry->message, entry->nvs_slot);
+        storage_message_save(&entry->message, entry->nvs_slot);
     }
     message_store_update_status(entry->message.id, entry->message.source, status);
 }
 
 static void send_current_packet(tx_entry_t *entry)
 {
-    char route_packet[PACKET_LEN];
+    mesh_packet_t packet = {0};
+    uint8_t route_packet[PACKET_LEN];
+    size_t route_packet_len = 0;
     route_entry_t route = {0};
 
     if (route_table_get_best(entry->message.destination, &route)) {
@@ -102,8 +111,21 @@ static void send_current_packet(tx_entry_t *entry)
                  route.best_rssi,
                  (unsigned long)route.cost);
     }
-    copy_field(route_packet, sizeof(route_packet), entry->message.packet);
-    if (lora_transmit(route_packet)) {
+    packet.valid = true;
+    packet.id = entry->message.id;
+    packet.hops = entry->message.hops;
+    copy_field(packet.source, sizeof(packet.source), entry->message.source);
+    copy_field(packet.destination, sizeof(packet.destination), entry->message.destination);
+    copy_field(packet.type, sizeof(packet.type), entry->message.type);
+    copy_field(packet.priority, sizeof(packet.priority), entry->message.priority);
+    copy_field(packet.relay, sizeof(packet.relay), entry->message.source);
+    copy_field(packet.payload, sizeof(packet.payload), entry->message.payload);
+    if (!build_forward_packet_v2(&packet, route_packet, sizeof(route_packet), &route_packet_len)) {
+        entry->state = TX_STATE_RETRY_PENDING;
+        entry->next_action_tick = xTaskGetTickCount() + pdMS_TO_TICKS(TX_ACK_TIMEOUT_MS);
+        return;
+    }
+    if (lora_transmit_bytes(route_packet, route_packet_len)) {
         entry->attempts++;
         entry->state = TX_STATE_WAITING_ACK;
         entry->next_action_tick = xTaskGetTickCount() + pdMS_TO_TICKS(TX_ACK_TIMEOUT_MS);

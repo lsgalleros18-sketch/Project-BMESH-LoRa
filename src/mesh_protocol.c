@@ -4,12 +4,17 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "bems_crypto.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 
 enum {
     DEDUP_EXPIRY_BUCKET_MS = 1000,
     DEDUP_EXPIRY_BUCKET_COUNT = SEEN_PACKET_TTL_MS / DEDUP_EXPIRY_BUCKET_MS,
+    V2_MAGIC = 0xB2,
+    V2_FLAG_NEXT_HOP = 0x01u,
+    V2_FLAG_LOCATION = 0x02u,
+    V2_BROADCAST_ID = 0xFFu,
 };
 
 typedef struct {
@@ -60,6 +65,10 @@ static uint32_t seen_hash(const char *source, uint32_t id)
 {
     uint32_t hash = 2166136261u;
 
+    if (source == NULL) {
+        source = "";
+    }
+
     while (*source != '\0') {
         hash ^= (uint8_t)*source++;
         hash *= 16777619u;
@@ -80,6 +89,41 @@ static int seen_bucket_index(const char *source, uint32_t id)
 static bool seen_entry_matches(const seen_packet_t *entry, const char *source, uint32_t id)
 {
     return entry->id == id && strcmp(entry->source, source) == 0;
+}
+
+static void copy_field(char *destination, size_t destination_size, const char *source)
+{
+    size_t write_index = 0;
+
+    if (destination == NULL || destination_size == 0) {
+        return;
+    }
+
+    if (source == NULL) {
+        destination[0] = '\0';
+        return;
+    }
+
+    while (*source != '\0' && write_index < destination_size - 1) {
+        unsigned char character = (unsigned char)*source++;
+        if (character >= 32 && character <= 126) {
+            destination[write_index++] = (char)character;
+        }
+    }
+
+    destination[write_index] = '\0';
+}
+
+static void update_thread_key(mesh_packet_t *parsed)
+{
+    if (parsed == NULL) {
+        return;
+    }
+    if (parsed->broadcast_destination || parsed->destination[0] == '\0' || strcmp(parsed->destination, "ALL") == 0) {
+        copy_field(parsed->thread_key, sizeof(parsed->thread_key), "ANNOUNCEMENTS");
+    } else {
+        copy_field(parsed->thread_key, sizeof(parsed->thread_key), parsed->source);
+    }
 }
 
 static void remove_from_hash(int16_t index)
@@ -148,24 +192,6 @@ static void dedup_init_storage(void)
     dedup_initialized = true;
 }
 
-static void copy_field(char *destination, size_t destination_size, const char *source)
-{
-    size_t write_index = 0;
-
-    if (destination_size == 0) {
-        return;
-    }
-
-    while (*source != '\0' && write_index < destination_size - 1) {
-        unsigned char character = (unsigned char)*source++;
-        if (character >= 32 && character <= 126) {
-            destination[write_index++] = (char)character;
-        }
-    }
-
-    destination[write_index] = '\0';
-}
-
 static void expire_current_and_prior_buckets(uint32_t now_ms)
 {
     uint32_t current_bucket = now_ms / DEDUP_EXPIRY_BUCKET_MS;
@@ -177,7 +203,7 @@ static void expire_current_and_prior_buckets(uint32_t now_ms)
 
     for (uint32_t step = 0; step < bucket_span; step++) {
         uint32_t wheel_index = last_expiry_bucket % DEDUP_EXPIRY_BUCKET_COUNT;
-        int16_t index = expiry_wheel[last_expiry_bucket % DEDUP_EXPIRY_BUCKET_COUNT];
+        int16_t index = expiry_wheel[wheel_index];
         while (index != -1) {
             int16_t next = seen_packets[index].next_expiry;
             if (seen_packets[index].active &&
@@ -226,12 +252,117 @@ static void insert_entry(int16_t index, const char *source, uint32_t id, TickTyp
     expiry_wheel[expiry_bucket] = index;
 }
 
+static uint8_t type_to_u8(const char *type)
+{
+    if (type == NULL) return BEMS_PACKET_TYPE_FLOOD;
+    if (strcmp(type, "ACK") == 0) return BEMS_PACKET_TYPE_ACK;
+    if (strcmp(type, "TIME_SYNC") == 0) return BEMS_PACKET_TYPE_TIME_SYNC;
+    if (strcmp(type, "SYNC_REQ") == 0) return BEMS_PACKET_TYPE_SYNC_REQ;
+    if (strcmp(type, "SYNC_RESP") == 0) return BEMS_PACKET_TYPE_SYNC_RESP;
+    if (strcmp(type, "EMERGENCY") == 0) return BEMS_PACKET_TYPE_EMERGENCY;
+    return BEMS_PACKET_TYPE_FLOOD;
+}
+
+static const char *type_from_u8(uint8_t type)
+{
+    switch (type) {
+    case BEMS_PACKET_TYPE_ACK: return "ACK";
+    case BEMS_PACKET_TYPE_TIME_SYNC: return "TIME_SYNC";
+    case BEMS_PACKET_TYPE_SYNC_REQ: return "SYNC_REQ";
+    case BEMS_PACKET_TYPE_SYNC_RESP: return "SYNC_RESP";
+    case BEMS_PACKET_TYPE_EMERGENCY: return "EMERGENCY";
+    default: return "FLOOD";
+    }
+}
+
+static uint8_t priority_to_u8(const char *priority)
+{
+    if (priority == NULL) return BEMS_PRIORITY_NORMAL;
+    if (strcmp(priority, "HIGH") == 0) return BEMS_PRIORITY_HIGH;
+    if (strcmp(priority, "LOW") == 0) return BEMS_PRIORITY_LOW;
+    return BEMS_PRIORITY_NORMAL;
+}
+
+static const char *priority_from_u8(uint8_t priority)
+{
+    switch (priority) {
+    case BEMS_PRIORITY_LOW: return "LOW";
+    case BEMS_PRIORITY_HIGH: return "HIGH";
+    default: return "NORMAL";
+    }
+}
+
+static bool write_u8(uint8_t *packet, size_t packet_size, size_t *offset, uint8_t value)
+{
+    if (*offset >= packet_size) {
+        return false;
+    }
+    packet[(*offset)++] = value;
+    return true;
+}
+
+static bool write_u32(uint8_t *packet, size_t packet_size, size_t *offset, uint32_t value)
+{
+    if (*offset + 4 > packet_size) {
+        return false;
+    }
+    packet[(*offset)++] = (uint8_t)(value & 0xFF);
+    packet[(*offset)++] = (uint8_t)((value >> 8) & 0xFF);
+    packet[(*offset)++] = (uint8_t)((value >> 16) & 0xFF);
+    packet[(*offset)++] = (uint8_t)((value >> 24) & 0xFF);
+    return true;
+}
+
+static bool write_bytes(uint8_t *packet, size_t packet_size, size_t *offset, const uint8_t *data, size_t len)
+{
+    if (*offset + len > packet_size) {
+        return false;
+    }
+    if (len > 0) {
+        memcpy(&packet[*offset], data, len);
+        *offset += len;
+    }
+    return true;
+}
+
+static bool read_u8(const uint8_t *packet, size_t packet_len, size_t *offset, uint8_t *value)
+{
+    if (*offset >= packet_len) return false;
+    *value = packet[(*offset)++];
+    return true;
+}
+
+static bool read_u32(const uint8_t *packet, size_t packet_len, size_t *offset, uint32_t *value)
+{
+    if (*offset + 4 > packet_len) return false;
+    *value = (uint32_t)packet[*offset] |
+             ((uint32_t)packet[*offset + 1] << 8) |
+             ((uint32_t)packet[*offset + 2] << 16) |
+             ((uint32_t)packet[*offset + 3] << 24);
+    *offset += 4;
+    return true;
+}
+
+static bool read_bytes(const uint8_t *packet, size_t packet_len, size_t *offset, uint8_t *out, size_t out_size, size_t len)
+{
+    if (*offset + len > packet_len || len >= out_size) {
+        return false;
+    }
+    if (len > 0) {
+        memcpy(out, &packet[*offset], len);
+        out[len] = '\0';
+        *offset += len;
+    } else if (out_size > 0) {
+        out[0] = '\0';
+    }
+    return true;
+}
+
 void location_encode(const location_info_t *loc, char *out, size_t out_size)
 {
-    if (out_size == 0) {
+    if (out_size == 0 || out == NULL || loc == NULL) {
         return;
     }
-
     snprintf(out, out_size, "%.*s~%.*s~%.*s",
              SITIO_LEN - 1, loc->sitio,
              BARANGAY_LEN - 1, loc->barangay,
@@ -243,6 +374,10 @@ void location_decode(const char *encoded, location_info_t *loc)
     char buffer[SITIO_LEN + BARANGAY_LEN + MUNICIPALITY_LEN + 2];
     char *first_sep;
     char *second_sep;
+
+    if (loc == NULL) {
+        return;
+    }
 
     memset(loc, 0, sizeof(*loc));
     if (encoded == NULL) {
@@ -272,9 +407,13 @@ void location_decode(const char *encoded, location_info_t *loc)
 bool parse_mesh_packet(const char *packet, mesh_packet_t *parsed)
 {
     char packet_copy[PACKET_LEN];
-    char *fields[10] = {0};
+    char *fields[11] = {0};
     char *cursor = packet_copy;
     size_t field_count = 0;
+
+    if (packet == NULL || parsed == NULL) {
+        return false;
+    }
 
     memset(parsed, 0, sizeof(*parsed));
     copy_field(packet_copy, sizeof(packet_copy), packet);
@@ -284,7 +423,6 @@ bool parse_mesh_packet(const char *packet, mesh_packet_t *parsed)
         if (field_count == sizeof(fields) / sizeof(fields[0])) {
             break;
         }
-
         cursor = strchr(cursor, '|');
         if (cursor != NULL) {
             *cursor = '\0';
@@ -292,7 +430,7 @@ bool parse_mesh_packet(const char *packet, mesh_packet_t *parsed)
         }
     }
 
-    if (field_count < 10 || strcmp(fields[0], "BEMS") != 0) {
+    if ((field_count < 10 || field_count > 11) || strcmp(fields[0], "BEMS") != 0) {
         return false;
     }
 
@@ -304,34 +442,222 @@ bool parse_mesh_packet(const char *packet, mesh_packet_t *parsed)
     copy_field(parsed->type, sizeof(parsed->type), fields[4]);
     copy_field(parsed->priority, sizeof(parsed->priority), fields[5]);
     copy_field(parsed->relay, sizeof(parsed->relay), fields[7]);
-    copy_field(parsed->location_raw, sizeof(parsed->location_raw), fields[8]);
-    location_decode(fields[8], &parsed->location);
-    copy_field(parsed->payload, sizeof(parsed->payload), fields[9]);
+    if (field_count == 11) {
+        copy_field(parsed->next_hop, sizeof(parsed->next_hop), fields[8]);
+        copy_field(parsed->location_raw, sizeof(parsed->location_raw), fields[9]);
+        location_decode(fields[9], &parsed->location);
+        copy_field(parsed->payload, sizeof(parsed->payload), fields[10]);
+    } else {
+        parsed->next_hop[0] = '\0';
+        copy_field(parsed->location_raw, sizeof(parsed->location_raw), fields[8]);
+        location_decode(fields[8], &parsed->location);
+        copy_field(parsed->payload, sizeof(parsed->payload), fields[9]);
+    }
+    parsed->broadcast_destination = strcmp(parsed->destination, "ALL") == 0;
+    parsed->payload_len = strnlen(parsed->payload, sizeof(parsed->payload));
+    update_thread_key(parsed);
     return true;
 }
 
-void build_forward_packet(const mesh_packet_t *parsed, char *packet, size_t packet_size)
+bool mesh_packet_is_v2(const uint8_t *packet, size_t packet_len)
 {
-    int next_hops = MAX(parsed->hops - 1, 0);
+    return packet != NULL && packet_len >= 2 && packet[0] == V2_MAGIC && packet[1] == BEMS_PACKET_FORMAT_V2;
+}
+
+size_t mesh_packet_v2_max_plaintext(void)
+{
+    return BEMS_MAX_PLAINTEXT;
+}
+
+bool parse_mesh_packet_v2(const uint8_t *packet, size_t packet_len, mesh_packet_t *parsed)
+{
+    size_t offset = 0;
+    uint8_t flags = 0;
+    uint8_t type = 0;
+    uint8_t priority = 0;
+    uint8_t source_len = 0;
+    uint8_t destination_len = 0;
+    uint8_t relay_len = 0;
+    uint8_t next_hop_len = 0;
+    uint8_t hops = 0;
+    uint8_t location_len = 0;
+    uint8_t payload_len = 0;
+
+    if (packet == NULL || parsed == NULL || !mesh_packet_is_v2(packet, packet_len)) {
+        return false;
+    }
+
+    memset(parsed, 0, sizeof(*parsed));
+    offset = 2;
+
+    if (!read_u8(packet, packet_len, &offset, &flags) ||
+        !read_u8(packet, packet_len, &offset, &type) ||
+        !read_u8(packet, packet_len, &offset, &priority) ||
+        !read_u8(packet, packet_len, &offset, &source_len) ||
+        source_len == 0 ||
+        !read_bytes(packet, packet_len, &offset, (uint8_t *)parsed->source, sizeof(parsed->source), source_len) ||
+        !read_u8(packet, packet_len, &offset, &destination_len)) {
+        return false;
+    }
+
+    if (destination_len == V2_BROADCAST_ID) {
+        parsed->broadcast_destination = true;
+        copy_field(parsed->destination, sizeof(parsed->destination), "ALL");
+    } else {
+        if (destination_len == 0 ||
+            !read_bytes(packet, packet_len, &offset, (uint8_t *)parsed->destination, sizeof(parsed->destination), destination_len)) {
+            return false;
+        }
+    }
+
+    if (!read_u32(packet, packet_len, &offset, &parsed->id) ||
+        !read_u8(packet, packet_len, &offset, &relay_len) ||
+        relay_len == 0 ||
+        !read_bytes(packet, packet_len, &offset, (uint8_t *)parsed->relay, sizeof(parsed->relay), relay_len) ||
+        !read_u8(packet, packet_len, &offset, &hops)) {
+        return false;
+    }
+
+    parsed->hops = (int)hops;
+    if ((flags & V2_FLAG_NEXT_HOP) != 0u) {
+        if (!read_u8(packet, packet_len, &offset, &next_hop_len) ||
+            next_hop_len == 0 ||
+            !read_bytes(packet, packet_len, &offset, (uint8_t *)parsed->next_hop, sizeof(parsed->next_hop), next_hop_len)) {
+            return false;
+        }
+    }
+
+    if ((flags & V2_FLAG_LOCATION) != 0u) {
+        if (!read_u8(packet, packet_len, &offset, &location_len) ||
+            (location_len > 0 && offset + location_len > packet_len)) {
+            return false;
+        }
+        if (location_len > 0) {
+            memcpy(parsed->location_raw, &packet[offset], location_len);
+            parsed->location_raw[location_len] = '\0';
+            location_decode(parsed->location_raw, &parsed->location);
+            offset += location_len;
+        }
+    }
+
+    if (!read_u8(packet, packet_len, &offset, &payload_len) ||
+        offset + payload_len > packet_len ||
+        payload_len >= sizeof(parsed->payload)) {
+        return false;
+    }
+
+    if (payload_len > 0) {
+        memcpy(parsed->payload, &packet[offset], payload_len);
+        parsed->payload[payload_len] = '\0';
+        offset += payload_len;
+    }
+
+    parsed->valid = true;
+    parsed->type[0] = '\0';
+    copy_field(parsed->type, sizeof(parsed->type), type_from_u8(type));
+    copy_field(parsed->priority, sizeof(parsed->priority), priority_from_u8(priority));
+    parsed->payload_len = payload_len;
+    if (parsed->destination[0] == '\0') {
+        copy_field(parsed->destination, sizeof(parsed->destination), "ALL");
+        parsed->broadcast_destination = true;
+    }
+    update_thread_key(parsed);
+    return true;
+}
+
+bool build_forward_packet_v2(const mesh_packet_t *parsed, uint8_t *packet, size_t packet_size, size_t *packet_len)
+{
     char encoded_location[SITIO_LEN + BARANGAY_LEN + MUNICIPALITY_LEN + 2];
+    size_t offset = 0;
+    uint8_t flags = 0;
+    uint8_t type;
+    uint8_t priority;
+    uint8_t source_len;
+    uint8_t destination_len;
+    uint8_t relay_len;
+    uint8_t next_hop_len = 0;
+    uint8_t location_len = 0;
+    uint8_t payload_len;
+    size_t required;
+
+    if (parsed == NULL || packet == NULL || packet_len == NULL) {
+        return false;
+    }
 
     location_encode(&parsed->location, encoded_location, sizeof(encoded_location));
-    snprintf(packet, packet_size, "BEMS|%lu|%.*s|%.*s|%.*s|%.*s|HOPS=%d|%.*s|%s|%.*s",
-             (unsigned long)parsed->id,
-             31,
-             parsed->source,
-             31,
-             parsed->destination,
-             31,
-             parsed->type,
-             31,
-             parsed->priority,
-             next_hops,
-             31,
-             parsed->relay,
-              encoded_location,
-              48,
-              parsed->payload);
+    type = type_to_u8(parsed->type);
+    priority = priority_to_u8(parsed->priority);
+    source_len = (uint8_t)strnlen(parsed->source, sizeof(parsed->source));
+    destination_len = parsed->broadcast_destination || strcmp(parsed->destination, "ALL") == 0 ? V2_BROADCAST_ID : (uint8_t)strnlen(parsed->destination, sizeof(parsed->destination));
+    relay_len = (uint8_t)strnlen(parsed->relay, sizeof(parsed->relay));
+    payload_len = (uint8_t)strnlen(parsed->payload, sizeof(parsed->payload));
+    if (parsed->payload_len > 0) {
+        if (parsed->payload_len > sizeof(parsed->payload) || parsed->payload_len >= 255) {
+            return false;
+        }
+        payload_len = (uint8_t)parsed->payload_len;
+    }
+
+    if (source_len == 0 || relay_len == 0 || payload_len >= sizeof(parsed->payload)) {
+        return false;
+    }
+    if (parsed->next_hop[0] != '\0') {
+        next_hop_len = (uint8_t)strnlen(parsed->next_hop, sizeof(parsed->next_hop));
+        if (next_hop_len == 0) {
+            return false;
+        }
+        flags |= V2_FLAG_NEXT_HOP;
+    }
+    if (parsed->location_raw[0] != '\0' || parsed->location.sitio[0] != '\0' || parsed->location.barangay[0] != '\0' || parsed->location.municipality[0] != '\0') {
+        size_t encoded_len = strnlen(encoded_location, sizeof(encoded_location));
+        if (encoded_len > 0 && encoded_len < 255) {
+            flags |= V2_FLAG_LOCATION;
+            location_len = (uint8_t)encoded_len;
+        }
+    }
+
+    required = 2 + 1 + 1 + 1 + 1 + source_len + 1 + (destination_len == V2_BROADCAST_ID ? 0 : destination_len) + 4 + 1 + relay_len + 1 + (flags & V2_FLAG_NEXT_HOP ? 1 + next_hop_len : 0) + (flags & V2_FLAG_LOCATION ? 1 + location_len : 0) + 1 + payload_len;
+    if (required > BEMS_MAX_PLAINTEXT || packet_size < required) {
+        return false;
+    }
+
+    if (!write_u8(packet, packet_size, &offset, V2_MAGIC) ||
+        !write_u8(packet, packet_size, &offset, BEMS_PACKET_FORMAT_V2) ||
+        !write_u8(packet, packet_size, &offset, flags) ||
+        !write_u8(packet, packet_size, &offset, type) ||
+        !write_u8(packet, packet_size, &offset, priority) ||
+        !write_u8(packet, packet_size, &offset, source_len) ||
+        !write_bytes(packet, packet_size, &offset, (const uint8_t *)parsed->source, source_len) ||
+        !write_u8(packet, packet_size, &offset, destination_len) ||
+        (destination_len != V2_BROADCAST_ID && !write_bytes(packet, packet_size, &offset, (const uint8_t *)parsed->destination, destination_len)) ||
+        !write_u32(packet, packet_size, &offset, parsed->id) ||
+        !write_u8(packet, packet_size, &offset, relay_len) ||
+        !write_bytes(packet, packet_size, &offset, (const uint8_t *)parsed->relay, relay_len) ||
+        !write_u8(packet, packet_size, &offset, parsed->hops < 0 ? 0 : (uint8_t)parsed->hops)) {
+        return false;
+    }
+
+    if ((flags & V2_FLAG_NEXT_HOP) != 0u) {
+        if (!write_u8(packet, packet_size, &offset, next_hop_len) ||
+            !write_bytes(packet, packet_size, &offset, (const uint8_t *)parsed->next_hop, next_hop_len)) {
+            return false;
+        }
+    }
+
+    if ((flags & V2_FLAG_LOCATION) != 0u) {
+        if (!write_u8(packet, packet_size, &offset, location_len) ||
+            !write_bytes(packet, packet_size, &offset, (const uint8_t *)encoded_location, location_len)) {
+            return false;
+        }
+    }
+
+    if (!write_u8(packet, packet_size, &offset, payload_len) ||
+        !write_bytes(packet, packet_size, &offset, (const uint8_t *)parsed->payload, payload_len)) {
+        return false;
+    }
+
+    *packet_len = offset;
+    return offset <= BEMS_MAX_PLAINTEXT;
 }
 
 bool packet_seen(const char *source, uint32_t id)

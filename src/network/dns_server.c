@@ -22,6 +22,12 @@ static uint16_t read_u16_be(const uint8_t *data)
     return (uint16_t)((uint16_t)data[0] << 8 | data[1]);
 }
 
+static void write_u16_be(uint8_t *data, uint16_t value)
+{
+    data[0] = (uint8_t)(value >> 8);
+    data[1] = (uint8_t)value;
+}
+
 static bool skip_dns_name(const uint8_t *packet, size_t length, size_t *offset)
 {
     size_t pos = *offset;
@@ -95,6 +101,61 @@ bool dns_server_parse_request(const uint8_t *packet, size_t length, dns_request_
     return true;
 }
 
+bool dns_server_build_response(uint8_t *buffer, size_t buffer_size, const dns_request_info_t *request, uint32_t ap_ip, size_t *response_length)
+{
+    size_t answer = 0;
+
+    if (buffer == NULL || request == NULL || response_length == NULL || !request->valid || request->question_end > buffer_size) {
+        return false;
+    }
+
+    if (request->qclass != DNS_CLASS_IN) {
+        return false;
+    }
+
+    if (request->qtype != DNS_TYPE_A && request->qtype != DNS_TYPE_AAAA) {
+        return false;
+    }
+
+    buffer[2] = 0x81;
+    buffer[3] = 0x80;
+    buffer[6] = 0x00;
+    buffer[7] = 0x01;
+    buffer[8] = 0x00;
+    buffer[9] = 0x00;
+    buffer[10] = 0x00;
+    buffer[11] = 0x00;
+
+    answer = request->question_end;
+    if (request->qtype == DNS_TYPE_A) {
+        if (answer + 16 > buffer_size) {
+            return false;
+        }
+
+        buffer[8] = 0x00;
+        buffer[9] = 0x01;
+        buffer[answer++] = 0xC0;
+        buffer[answer++] = 0x0C;
+        buffer[answer++] = 0x00;
+        buffer[answer++] = 0x01;
+        buffer[answer++] = 0x00;
+        buffer[answer++] = 0x01;
+        buffer[answer++] = 0x00;
+        buffer[answer++] = 0x00;
+        buffer[answer++] = 0x00;
+        buffer[answer++] = 0x3C;
+        buffer[answer++] = 0x00;
+        buffer[answer++] = 0x04;
+        memcpy(&buffer[answer], &ap_ip, 4);
+        answer += 4;
+    }
+
+    write_u16_be(&buffer[4], 0x0001);
+    write_u16_be(&buffer[6], request->qtype == DNS_TYPE_A ? 0x0001 : 0x0000);
+    *response_length = answer;
+    return true;
+}
+
 static void dns_task(void *parameter)
 {
     const uint32_t ap_ip = inet_addr("192.168.4.1");
@@ -117,46 +178,18 @@ static void dns_task(void *parameter)
         socklen_t client_len = sizeof(client_addr);
         int len = recvfrom(sock, buffer, sizeof(buffer), 0, (struct sockaddr *)&client_addr, &client_len);
         dns_request_info_t request = {0};
-        int answer;
 
         if (len <= 0 || !dns_server_parse_request(buffer, (size_t)len, &request)) {
             continue;
         }
 
-        if (request.qclass != DNS_CLASS_IN) {
+        size_t response_length = 0;
+
+        if (!dns_server_build_response(buffer, sizeof(buffer), &request, ap_ip, &response_length)) {
             continue;
         }
 
-        buffer[2] = 0x81;
-        buffer[3] = 0x80;
-        buffer[6] = 0x00;
-        buffer[7] = 0x01;
-        buffer[8] = 0x00;
-        buffer[9] = 0x00;
-        buffer[10] = 0x00;
-        buffer[11] = 0x00;
-
-        answer = (int)request.question_end;
-        if (answer + 16 > (int)sizeof(buffer)) {
-            continue;
-        }
-
-        buffer[answer++] = 0xC0;
-        buffer[answer++] = 0x0C;
-        buffer[answer++] = 0x00;
-        buffer[answer++] = 0x01;
-        buffer[answer++] = 0x00;
-        buffer[answer++] = 0x01;
-        buffer[answer++] = 0x00;
-        buffer[answer++] = 0x00;
-        buffer[answer++] = 0x00;
-        buffer[answer++] = 0x3C;
-        buffer[answer++] = 0x00;
-        buffer[answer++] = 0x04;
-        memcpy(&buffer[answer], &ap_ip, 4);
-        answer += 4;
-
-        sendto(sock, buffer, answer, 0, (struct sockaddr *)&client_addr, client_len);
+        sendto(sock, buffer, (int)response_length, 0, (struct sockaddr *)&client_addr, client_len);
     }
 }
 

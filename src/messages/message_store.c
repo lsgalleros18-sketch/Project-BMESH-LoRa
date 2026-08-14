@@ -1,19 +1,13 @@
 #include "messages/message_store.h"
 
 #include <stdbool.h>
-#include <stdio.h>
 #include <string.h>
 
-#include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
-#include "nvs.h"
 
+#include "storage/storage.h"
 #include "utils/string_utils.h"
-
-#define CONFIG_NAMESPACE "bems_config"
-
-static const char *TAG = "message_store";
 static SemaphoreHandle_t message_mutex;
 static emergency_message_t messages[MAX_MESSAGES];
 static emergency_message_t message_snapshot_buffer[MAX_MESSAGES];
@@ -78,17 +72,6 @@ static bool message_matches(const emergency_message_t *message, uint32_t id, con
     return message != NULL && message->id == id && strcmp(message->source, source) == 0;
 }
 
-static bool message_is_restorable(const emergency_message_t *message)
-{
-    if (message == NULL) {
-        return false;
-    }
-    if (message->id == 0) {
-        return false;
-    }
-    return strcmp(message->direction, "TX") == 0 || strcmp(message->direction, "RX") == 0;
-}
-
 static size_t find_message_index(uint32_t id, const char *source)
 {
     for (size_t i = 0; i < message_count; i++) {
@@ -112,81 +95,12 @@ static void compact_remove_index(size_t index)
     message_count--;
 }
 
-void message_store_save_message_to_nvs(const emergency_message_t *message, int slot)
-{
-    nvs_handle_t handle;
-    char key[16];
-    esp_err_t result;
-
-    if (slot < 0 || slot >= MAX_MESSAGES) {
-        return;
-    }
-
-    result = nvs_open(CONFIG_NAMESPACE, NVS_READWRITE, &handle);
-    if (result != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to open NVS for message save: %s", esp_err_to_name(result));
-        return;
-    }
-
-    snprintf(key, sizeof(key), "msg_%d", slot);
-    result = nvs_set_blob(handle, key, (const void *)message, sizeof(*message));
-    if (result == ESP_OK) {
-        result = nvs_commit(handle);
-    }
-
-    if (result != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to save message %d to NVS: %s", slot, esp_err_to_name(result));
-    }
-
-    nvs_close(handle);
-}
-
 void message_store_load_messages_from_nvs(const char *node_id)
 {
-    nvs_handle_t handle;
-    char key[16];
-    esp_err_t result;
-    size_t blob_size;
-    emergency_message_t loaded_message;
-
-    result = nvs_open(CONFIG_NAMESPACE, NVS_READONLY, &handle);
-    if (result != ESP_OK) {
-        ESP_LOGI(TAG, "No saved messages in NVS");
-        return;
-    }
-
     lock();
     message_count = 0;
-    for (int i = 0; i < MAX_MESSAGES; i++) {
-        snprintf(key, sizeof(key), "msg_%d", i);
-        blob_size = sizeof(loaded_message);
-        result = nvs_get_blob(handle, key, &loaded_message, &blob_size);
-
-        if (result == ESP_OK && blob_size == sizeof(loaded_message)) {
-            if (!message_is_restorable(&loaded_message)) {
-                continue;
-            }
-            if (loaded_message.direction[0] == '\0' || loaded_message.source[0] == '\0' || loaded_message.destination[0] == '\0') {
-                continue;
-            }
-            if ((strcmp(loaded_message.source, node_id) != 0) &&
-                (strcmp(loaded_message.destination, node_id) != 0)) {
-                continue;
-            }
-            if (find_message_index(loaded_message.id, loaded_message.source) != SIZE_MAX) {
-                continue;
-            }
-            memcpy(&messages[message_count], &loaded_message, sizeof(loaded_message));
-            message_count++;
-            if (message_count >= MAX_MESSAGES) {
-                break;
-            }
-        }
-    }
+    storage_message_load_messages(node_id, messages, &message_count, MAX_MESSAGES);
     unlock();
-
-    ESP_LOGI(TAG, "Loaded %zu messages from NVS", message_count);
-    nvs_close(handle);
 }
 
 bool message_store_add(const emergency_message_t *message, int *nvs_slot)

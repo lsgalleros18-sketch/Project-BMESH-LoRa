@@ -242,6 +242,53 @@ bool lora_transmit(const char *packet)
     return false;
 }
 
+bool lora_transmit_bytes(const uint8_t *packet, size_t packet_len)
+{
+    uint8_t frame[LORA_MAX_PAYLOAD];
+    size_t length = 0;
+
+    if (!lora_ready) {
+        ESP_LOGW(TAG, "SX1278 is not ready; packet kept in local log only");
+        return false;
+    }
+
+    if (!bems_encrypt_frame(packet, packet_len, frame, sizeof(frame), &length)) {
+        ESP_LOGW(TAG, "Failed to encrypt LoRa packet bytes");
+        return false;
+    }
+
+    if (lora_tx_done_semaphore == NULL) {
+        ESP_LOGW(TAG, "LoRa TX done semaphore is not ready");
+        return false;
+    }
+
+    if (!lora_channel_clear()) {
+        ESP_LOGW(TAG, "Channel busy; TX skipped");
+        return false;
+    }
+
+    xSemaphoreTake(lora_tx_done_semaphore, 0);
+    radio_in_tx = true;
+    if (lora_transmit_raw_frame(frame, length)) {
+        lora_write_reg(REG_IRQ_FLAGS, 0xFF);
+        lora_set_mode(MODE_TX);
+
+        if (xSemaphoreTake(lora_tx_done_semaphore, pdMS_TO_TICKS(5000)) == pdTRUE) {
+            radio_in_tx = false;
+            lora_write_reg(REG_IRQ_FLAGS, 0xFF);
+            lora_receive_mode();
+            ESP_LOGI(TAG, "SX1278 encrypted TX done: %u bytes", (unsigned int)length);
+            return true;
+        }
+    }
+
+    radio_in_tx = false;
+    lora_write_reg(REG_IRQ_FLAGS, 0xFF);
+    lora_receive_mode();
+    ESP_LOGW(TAG, "SX1278 TX timeout");
+    return false;
+}
+
 bool lora_radio_is_ready(void)
 {
     return lora_ready;

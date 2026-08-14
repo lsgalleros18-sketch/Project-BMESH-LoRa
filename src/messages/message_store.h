@@ -35,7 +35,6 @@ bool message_store_remove(uint32_t id, const char *source);
 emergency_message_t *message_store_begin_write(int *nvs_slot);
 emergency_message_t *message_store_begin_update(uint32_t id, const char *source);
 void message_store_end_update(void);
-void message_store_save_message_to_nvs(const emergency_message_t *message, int slot);
 void message_store_update_status(uint32_t id, const char *source, const char *status);
 size_t message_store_copy_all(emergency_message_t *snapshot, size_t max_messages);
 const emergency_message_t *message_store_snapshot(size_t *snapshot_count);

@@ -29,8 +29,14 @@ bool bems_hmac_sha256(const uint8_t *data, size_t data_len, uint8_t tag[32]);
 // Encrypts a plaintext mesh packet into a BEMS frame
 bool bems_encrypt_packet(const char *plain_packet, uint8_t *frame, size_t frame_size, size_t *frame_len);
 
+// Encrypts a length-delimited plaintext packet into a BEMS frame
+bool bems_encrypt_frame(const uint8_t *plain_packet, size_t plain_len, uint8_t *frame, size_t frame_size, size_t *frame_len);
+
 // Decrypts a BEMS frame into plaintext mesh packet
 bool bems_decrypt_frame(const uint8_t *frame, size_t frame_len, char *plain_packet, size_t plain_packet_size);
+
+// Decrypts a BEMS frame into a length-delimited plaintext packet
+bool bems_decrypt_frame_bytes(const uint8_t *frame, size_t frame_len, uint8_t *plain_packet, size_t plain_packet_size, size_t *plain_len);
 
 // Constant-time memory comparison
 bool constant_time_equal(const uint8_t *left, const uint8_t *right, size_t length);

@@ -4,6 +4,7 @@
 #include <stdint.h>
 
 #include "mesh_protocol.h"
+#include "messages/message_store.h"
 
 #define MESH_CONTROL_HIGHEST_SEEN_ID_KEY "highest_seen"
 
@@ -25,3 +26,5 @@ bool mesh_control_is_control_packet_type(const char *type);
 bool mesh_control_handle_time_sync_packet(const char *payload);
 void mesh_control_send_ack_packet(const mesh_packet_t *parsed);
 void mesh_control_send_sync_responses(const mesh_packet_t *request);
+size_t mesh_control_decode_sync_response_records(const uint8_t *payload, size_t payload_len, mesh_packet_t *records, size_t max_records);
+bool mesh_control_encode_sync_response_batch(const emergency_message_t *records, size_t record_count, uint8_t *payload, size_t payload_size, size_t *payload_len);

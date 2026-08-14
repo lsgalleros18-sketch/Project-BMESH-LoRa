@@ -15,4 +15,5 @@ typedef struct {
 } dns_request_info_t;
 
 bool dns_server_parse_request(const uint8_t *packet, size_t length, dns_request_info_t *info);
+bool dns_server_build_response(uint8_t *buffer, size_t buffer_size, const dns_request_info_t *request, uint32_t ap_ip, size_t *response_length);
 esp_err_t dns_server_init(void);

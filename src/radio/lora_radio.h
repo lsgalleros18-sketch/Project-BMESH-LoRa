@@ -69,6 +69,7 @@
 #define LORA_MODEM_CONFIG_3 (LORA_LOW_DATA_RATE_OPTIMIZE_OFF | LORA_AGC_AUTO_ON)
 
 bool lora_transmit(const char *packet);
+bool lora_transmit_bytes(const uint8_t *packet, size_t packet_len);
 typedef void (*lora_rx_callback_t)(void *parameter);
 void lora_handle_rx_packet(const uint8_t *payload, size_t length, int rssi, int snr);
 

@@ -185,10 +185,9 @@ bool bems_hmac_sha256(const uint8_t *data, size_t data_len, uint8_t tag[32])
     return status == PSA_SUCCESS && tag_length == 32;
 }
 
-bool bems_encrypt_packet(const char *plain_packet, uint8_t *frame, size_t frame_size, size_t *frame_len)
+bool bems_encrypt_frame(const uint8_t *plain_packet, size_t plain_len, uint8_t *frame, size_t frame_size, size_t *frame_len)
 {
     uint8_t full_tag[32];
-    size_t plain_len = strlen(plain_packet);
 
     if (plain_len > BEMS_MAX_PLAINTEXT) {
         return false;
@@ -224,14 +223,28 @@ bool bems_encrypt_packet(const char *plain_packet, uint8_t *frame, size_t frame_
     return true;
 }
 
+bool bems_encrypt_packet(const char *plain_packet, uint8_t *frame, size_t frame_size, size_t *frame_len)
+{
+    if (plain_packet == NULL) {
+        return false;
+    }
+    return bems_encrypt_frame((const uint8_t *)plain_packet, strlen(plain_packet), frame, frame_size, frame_len);
+}
+
 bool bems_decrypt_frame(const uint8_t *frame, size_t frame_len, char *plain_packet, size_t plain_packet_size)
+{
+    size_t plain_len = 0;
+    return bems_decrypt_frame_bytes(frame, frame_len, (uint8_t *)plain_packet, plain_packet_size, &plain_len) && (plain_packet[plain_len] = '\0', true);
+}
+
+bool bems_decrypt_frame_bytes(const uint8_t *frame, size_t frame_len, uint8_t *plain_packet, size_t plain_packet_size, size_t *plain_len)
 {
     uint8_t full_tag[32];
     uint8_t calculated_tag[BEMS_HMAC_TAG_LEN];
     size_t cipher_len;
     bool valid;
 
-    if (frame_len < BEMS_FRAME_HEADER_LEN + BEMS_HMAC_TAG_LEN || plain_packet_size == 0) {
+    if (frame_len < BEMS_FRAME_HEADER_LEN + BEMS_HMAC_TAG_LEN || plain_packet_size == 0 || plain_len == NULL) {
         return false;
     }
     if (frame[0] != BEMS_FRAME_PREFIX_0 || frame[1] != BEMS_FRAME_PREFIX_1 || frame[2] != BEMS_FRAME_PREFIX_2 || frame[3] != BEMS_CRYPTO_VERSION) {
@@ -253,8 +266,8 @@ bool bems_decrypt_frame(const uint8_t *frame, size_t frame_len, char *plain_pack
 
     if (valid) {
         memcpy(plain_packet, &frame[BEMS_FRAME_HEADER_LEN], cipher_len);
-        valid = aes_ctr_crypt((uint8_t *)plain_packet, cipher_len, &frame[4]);
-        plain_packet[cipher_len] = '\0';
+        valid = aes_ctr_crypt(plain_packet, cipher_len, &frame[4]);
+        *plain_len = cipher_len;
     }
 
     secure_zero(full_tag, sizeof(full_tag));

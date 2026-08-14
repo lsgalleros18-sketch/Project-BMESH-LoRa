@@ -16,21 +16,54 @@ typedef struct {
     bool valid;
     uint32_t id;
     int hops;
+    bool broadcast_destination;
     char source[FIELD_LEN];
     char destination[FIELD_LEN];
     char type[FIELD_LEN];
     char priority[FIELD_LEN];
     char relay[FIELD_LEN];
+    char next_hop[FIELD_LEN];
     char location_raw[PACKET_LEN];
     location_info_t location;
+    char thread_key[FIELD_LEN];
     char payload[PAYLOAD_LEN];
+    size_t payload_len;
 } mesh_packet_t;
+
+typedef enum {
+    BEMS_PACKET_FORMAT_V1 = 1,
+    BEMS_PACKET_FORMAT_V2 = 2,
+} bems_packet_format_t;
+
+typedef enum {
+    BEMS_PACKET_TYPE_FLOOD = 1,
+    BEMS_PACKET_TYPE_ACK = 2,
+    BEMS_PACKET_TYPE_TIME_SYNC = 3,
+    BEMS_PACKET_TYPE_SYNC_REQ = 4,
+    BEMS_PACKET_TYPE_SYNC_RESP = 5,
+    BEMS_PACKET_TYPE_EMERGENCY = 6,
+} bems_packet_type_t;
+
+typedef enum {
+    BEMS_PRIORITY_LOW = 0,
+    BEMS_PRIORITY_NORMAL = 1,
+    BEMS_PRIORITY_HIGH = 2,
+} bems_priority_t;
 
 // Parses a mesh packet string into structured data
 bool parse_mesh_packet(const char *packet, mesh_packet_t *parsed);
 
-// Builds packet string from message data
-void build_forward_packet(const mesh_packet_t *parsed, char *packet, size_t packet_size);
+// Parses a compact V2 packet buffer into structured data
+bool parse_mesh_packet_v2(const uint8_t *packet, size_t packet_len, mesh_packet_t *parsed);
+
+// Builds a compact V2 packet buffer from message data
+bool build_forward_packet_v2(const mesh_packet_t *parsed, uint8_t *packet, size_t packet_size, size_t *packet_len);
+
+// Returns true when the packet uses the compact V2 prefix
+bool mesh_packet_is_v2(const uint8_t *packet, size_t packet_len);
+
+// Returns the maximum plaintext bytes allowed for V2 packets.
+size_t mesh_packet_v2_max_plaintext(void);
 
 // Encodes location into tilde-separated string
 void location_encode(const location_info_t *loc, char *out, size_t out_size);
