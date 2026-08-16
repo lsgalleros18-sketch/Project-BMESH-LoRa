@@ -27,6 +27,7 @@ This is the single source of truth for the ProjectLoRa codebase docs.
 - Reserved broadcast destination `ALL` is preserved as a special destination value.
 - `build_forward_packet_v2()` is the canonical V2 serializer.
 - `parse_mesh_packet_v2()` is the canonical V2 parser.
+- In V2, `hops` is treated as forwarding TTL only.
 - The established maximum plaintext limit remains `227` bytes.
 
 ## SYNC_RESP
@@ -82,6 +83,8 @@ This is the single source of truth for the ProjectLoRa codebase docs.
 - `packet_counter` is restored from NVS at boot and saved whenever a new local packet ID is assigned.
 - Time sync is handled by `mesh_control_handle_time_sync_packet()`, not by duplicate parsing in `main.c`.
 - Control-packet classification is shared through `mesh_control_is_control_packet_type()`.
+- Route learning treats observed `hops` as TTL metadata, not as a route-distance metric.
+- Route selection prefers RSSI, freshness, and next-hop viability rather than packet TTL.
 - Production transmit paths use `lora_transmit_bytes()`.
 
 ## Verified build state

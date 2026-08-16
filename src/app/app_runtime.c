@@ -10,11 +10,9 @@
 #include "esp_mac.h"
 #include "esp_random.h"
 #include "esp_system.h"
-#include "esp_timer.h"
 #include "mesh_protocol.h"
 #include "mesh/replay_protection.h"
 #include "freertos/FreeRTOS.h"
-#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "nvs.h"
 
@@ -33,6 +31,8 @@
 #include "mesh_control.h"
 #include "mesh/mesh_sequence.h"
 #include "mesh/mesh_retry.h"
+#include "mesh/forward_queue.h"
+#include "mesh/forward_worker.h"
 #include "mesh/tx_scheduler.h"
 #include "messages/message_store.h"
 #include "network/dns_server.h"
@@ -55,27 +55,13 @@ static char node_id[FIELD_LEN];
 static char ap_ssid[FIELD_LEN];
 static bool duplicate_node_id_warning;
 static bool littlefs_mounted;
-static SemaphoreHandle_t data_mutex;
 
 static void time_sync_task(void *parameter);
 static void boot_sync_task(void *parameter);
-static void data_lock(void);
-static void data_unlock(void);
-static uint32_t ack_id_from_payload(const char *payload);
-static int hops_for_priority(const char *priority);
-static bool build_packet_v2(emergency_message_t *message, const char *next_hop, uint8_t *packet_buf, size_t packet_buf_size, size_t *packet_len);
+static tx_priority_t forward_priority_for_packet(const mesh_packet_t *packet);
 static void store_received_packet(const char *packet, const mesh_packet_t *parsed, int rssi, int snr);
-static void delayed_forward_task(void *parameter);
 static void queue_message(const char *destination, const char *type, const char *priority, const char *payload);
 static void start_http_server(void);
-
-typedef struct {
-    mesh_packet_t packet;
-    int rssi;
-    int snr;
-    bool route_known;
-    route_entry_t route;
-} forward_packet_task_args_t;
 
 bool app_runtime_should_forward_packet(const mesh_packet_t *packet, const route_entry_t *route, const char *local_node_id)
 {
@@ -97,100 +83,18 @@ bool app_runtime_should_forward_packet(const mesh_packet_t *packet, const route_
     return strcmp(packet->next_hop, local_node_id) == 0;
 }
 
-static void data_lock(void)
+static tx_priority_t forward_priority_for_packet(const mesh_packet_t *packet)
 {
-    if (data_mutex != NULL) {
-        xSemaphoreTake(data_mutex, portMAX_DELAY);
+    if (packet == NULL) {
+        return TX_PRIORITY_NORMAL;
     }
-}
-
-static void data_unlock(void)
-{
-    if (data_mutex != NULL) {
-        xSemaphoreGive(data_mutex);
+    if (strcmp(packet->priority, "HIGH") == 0) {
+        return TX_PRIORITY_HIGH;
     }
-}
-
-static uint32_t ack_id_from_payload(const char *payload)
-{
-    const char *marker;
-    char *end_ptr = NULL;
-    uint32_t ack_id;
-
-    if (payload == NULL) {
-        return 0;
+    if (strcmp(packet->priority, "LOW") == 0) {
+        return TX_PRIORITY_LOW;
     }
-
-    if (strncmp(payload, "ACK for ", 8) != 0) {
-        return 0;
-    }
-
-    marker = payload + 8;
-    if (*marker == '\0') {
-        return 0;
-    }
-
-    ack_id = (uint32_t)strtoul(marker, &end_ptr, 10);
-    if (end_ptr == marker || *end_ptr != '\0') {
-        return 0;
-    }
-
-    return ack_id;
-}
-
-static void delayed_forward_task(void *parameter)
-{
-    forward_packet_task_args_t *args = (forward_packet_task_args_t *)parameter;
-    uint8_t forward_packet[PACKET_LEN];
-    size_t forward_packet_len = 0;
-    uint32_t delay_ms = 100 + (esp_random() % 500);
-
-    vTaskDelay(pdMS_TO_TICKS(delay_ms));
-
-    if (packet_seen(args->packet.source, args->packet.id)) {
-        ESP_LOGI(TAG, "Suppressed duplicate forward for %s/%lu after %u ms", args->packet.source, (unsigned long)args->packet.id, (unsigned int)delay_ms);
-        vPortFree(args);
-        vTaskDelete(NULL);
-        return;
-    }
-
-    if (app_runtime_should_forward_packet(&args->packet, args->route_known ? &args->route : NULL, node_id)) {
-        if (args->route_known) {
-            ESP_LOGI(TAG, "Route-selected forward for %s -> %s via %s (hop=%d rssi=%d age=%lu ms)",
-                     args->packet.source,
-                     args->packet.destination,
-                     args->route.next_hop,
-                     args->route.hop_count,
-                     args->route.best_rssi,
-                     (unsigned long)(esp_timer_get_time() / 1000ULL - args->route.last_seen_tick_ms));
-        } else {
-            ESP_LOGI(TAG, "Flood fallback forward for %s -> %s", args->packet.source, args->packet.destination);
-        }
-        copy_field(args->packet.relay, sizeof(args->packet.relay), node_id);
-        if (args->route_known) {
-            copy_field(args->packet.next_hop, sizeof(args->packet.next_hop), args->route.next_hop);
-        } else {
-            args->packet.next_hop[0] = '\0';
-        }
-        if (!build_forward_packet_v2(&args->packet, forward_packet, sizeof(forward_packet), &forward_packet_len)) {
-            ESP_LOGW(TAG, "Failed to build V2 forward packet for %s/%lu", args->packet.source, (unsigned long)args->packet.id);
-            vPortFree(args);
-            vTaskDelete(NULL);
-            return;
-        }
-        ESP_LOGI(TAG, "Forwarding packet %s/%lu after %u ms delay", args->packet.source, (unsigned long)args->packet.id, (unsigned int)delay_ms);
-        lora_transmit_bytes(forward_packet, forward_packet_len);
-    } else if (args->route_known) {
-        ESP_LOGI(TAG, "Suppressed route-forward for %s -> %s via %s (relay=%s, local=%s)",
-                 args->packet.source,
-                 args->packet.destination,
-                 args->route.next_hop,
-                 args->packet.relay,
-                 node_id);
-    }
-
-    vPortFree(args);
-    vTaskDelete(NULL);
+    return TX_PRIORITY_NORMAL;
 }
 
 static void boot_sync_task(void *parameter)
@@ -207,11 +111,8 @@ static void boot_sync_task(void *parameter)
 static void store_received_packet(const char *packet, const mesh_packet_t *parsed, int rssi, int snr)
 {
     emergency_message_t message = {0};
-    int nvs_slot = -1;
-    data_lock();
-
-    if (!message_store_add(&message, &nvs_slot)) {
-        data_unlock();
+    int storage_slot = -1;
+    if (!message_store_allocate(&storage_slot)) {
         ESP_LOGW(TAG, "Dropping received packet because message table is full of active entries");
         return;
     }
@@ -251,10 +152,9 @@ static void store_received_packet(const char *packet, const mesh_packet_t *parse
         bool is_relevant = (strcmp(parsed->source, node_id) == 0) ||
                           (strcmp(parsed->destination, node_id) == 0);
         if (is_relevant) {
-            storage_message_save(&message, nvs_slot);
+            (void)message_store_write(storage_slot, &message);
         }
     }
-    data_unlock();
 }
 
 void lora_handle_rx_packet(const uint8_t *payload, size_t length, int rssi, int snr)
@@ -316,29 +216,29 @@ void lora_handle_rx_packet(const uint8_t *payload, size_t length, int rssi, int 
                 if (strcmp(parsed.source, node_id) != 0) {
                     duplicate_node_id_warning = true;
                 }
-                uint32_t ack_id = ack_id_from_payload(parsed.payload);
-                if (ack_id != 0) {
-                    (void)tx_scheduler_acknowledge(ack_id, parsed.source);
+                ack_info_t ack_info = {0};
+
+                if (mesh_control_parse_ack((const uint8_t *)parsed.payload, parsed.payload_len, &ack_info) &&
+                    ack_info.acknowledged_id != 0 &&
+                    strcmp(ack_info.acknowledged_source, parsed.source) == 0 &&
+                    strcmp(parsed.destination, node_id) == 0) {
+                    (void)tx_scheduler_acknowledge(ack_info.acknowledged_id, parsed.source);
                 }
             }
             if (!is_broadcast && !is_for_me && !mesh_control_is_control_packet_type(parsed.type)) {
                 route_known = route_table_get_best(parsed.destination, &route);
             }
             if (parsed.hops > 0 && !is_for_me && !mesh_control_is_control_packet_type(parsed.type)) {
-                forward_packet_task_args_t *forward_args = (forward_packet_task_args_t *)pvPortMalloc(sizeof(*forward_args));
-                if (forward_args != NULL) {
-                    forward_args->packet = parsed;
-                    forward_args->rssi = rssi;
-                    forward_args->snr = snr;
-                    forward_args->route_known = route_known;
-                    if (route_known) {
-                        forward_args->route = route;
-                    } else {
-                        memset(&forward_args->route, 0, sizeof(forward_args->route));
-                    }
-                    xTaskCreate(delayed_forward_task, "fwd_pkt", 4096, forward_args, 5, NULL);
-                } else {
-                    ESP_LOGW(TAG, "Failed to allocate delayed forward args for %s/%lu", parsed.source, (unsigned long)parsed.id);
+                forward_job_t job = {
+                    .packet = parsed,
+                    .rssi = rssi,
+                    .snr = snr,
+                    .route = route,
+                    .route_known = route_known,
+                };
+                copy_field(job.local_node_id, sizeof(job.local_node_id), node_id);
+                if (!forward_queue_enqueue(&job, forward_priority_for_packet(&parsed))) {
+                    ESP_LOGW(TAG, "Forward queue full; dropping %s/%lu", parsed.source, (unsigned long)parsed.id);
                 }
             }
         } else if (from_self) {
@@ -356,49 +256,10 @@ static void time_sync_task(void *parameter)
     }
 }
 
-static int hops_for_priority(const char *priority)
-{
-    if (strcmp(priority, "HIGH") == 0) {
-        return 5;
-    }
-    if (strcmp(priority, "LOW") == 0) {
-        return 1;
-    }
-
-    return 3;
-}
-
-static bool build_packet_v2(emergency_message_t *message, const char *next_hop, uint8_t *packet_buf, size_t packet_buf_size, size_t *packet_len)
-{
-    mesh_packet_t packet = {0};
-
-    packet.valid = true;
-    packet.id = message->id;
-    packet.hops = hops_for_priority(message->priority);
-    copy_field(packet.source, sizeof(packet.source), node_id);
-    copy_field(packet.destination, sizeof(packet.destination), message->destination);
-    copy_field(packet.type, sizeof(packet.type), message->type);
-    copy_field(packet.priority, sizeof(packet.priority), message->priority);
-    copy_field(packet.relay, sizeof(packet.relay), node_id);
-    copy_field(packet.next_hop, sizeof(packet.next_hop), next_hop == NULL ? "" : next_hop);
-    packet.location = node_config_get()->location;
-
-    if (!build_forward_packet_v2(&packet, packet_buf, packet_buf_size, packet_len)) {
-        return false;
-    }
-    snprintf(message->packet, sizeof(message->packet), "V2 %s -> %s type=%s hops=%d", packet.source, packet.destination, packet.type, packet.hops);
-    ESP_LOGI(TAG, "Built V2 packet for %s -> %s", packet.source, packet.destination);
-    return true;
-}
-
 static void queue_message(const char *destination, const char *type, const char *priority, const char *payload)
 {
-    char next_hop[FIELD_LEN] = {0};
-    uint8_t packet_buf[PACKET_LEN] = {0};
-    size_t packet_len = 0;
     emergency_message_t message = {0};
-    int nvs_slot = -1;
-    route_entry_t route = {0};
+    int storage_slot = -1;
 
     message.id = mesh_sequence_next();
     copy_field(message.direction, sizeof(message.direction), "TX");
@@ -409,28 +270,27 @@ static void queue_message(const char *destination, const char *type, const char 
     copy_field(message.payload, sizeof(message.payload), payload);
     copy_field(message.status, sizeof(message.status), "PENDING");
     message.stored_epoch = mesh_control_is_time_synced() ? mesh_control_current_epoch_seconds() : 0;
-    if (route_table_get_best(destination, &route)) {
-        copy_field(next_hop, sizeof(next_hop), route.next_hop);
-    }
-    if (!build_packet_v2(&message, next_hop, packet_buf, sizeof(packet_buf), &packet_len)) {
-        return;
-    }
     compute_thread_key(message.thread_key, sizeof(message.thread_key), message.source, message.destination);
     message.origin_location = node_config_get()->location;
+    snprintf(message.packet, sizeof(message.packet), "TX %s -> %s type=%s priority=%s",
+             message.source, message.destination, message.type, message.priority);
     mesh_sequence_save();
 
-    data_lock();
-    if (!message_store_add(&message, &nvs_slot)) {
-        data_unlock();
+    if (!message_store_allocate(&storage_slot)) {
         ESP_LOGW(TAG, "Message queue full; unable to enqueue %s -> %s", node_id, destination);
         return;
     }
-    storage_message_save(&message, nvs_slot);
-    data_unlock();
+    (void)message_store_write(storage_slot, &message);
+
+    if (!tx_scheduler_submit(&message, storage_slot)) {
+        copy_field(message.status, sizeof(message.status), "FAILED");
+        (void)message_store_update(storage_slot, &message);
+        message_store_update_status(message.id, message.source, "FAILED");
+        ESP_LOGW(TAG, "TX queue full; unable to enqueue %s -> %s", node_id, destination);
+        return;
+    }
 
     ESP_LOGI(TAG, "Queued LoRa TX: %s", message.packet);
-    (void)lora_transmit_bytes(packet_buf, packet_len);
-    (void)tx_scheduler_enqueue(&message, nvs_slot);
 }
 
 static void start_http_server(void)
@@ -490,9 +350,6 @@ static void start_http_server(void)
 
 void app_runtime_start(void)
 {
-    data_mutex = xSemaphoreCreateMutex();
-    ESP_ERROR_CHECK(data_mutex == NULL ? ESP_ERR_NO_MEM : ESP_OK);
-
     {
         uint8_t mac[6];
         ESP_ERROR_CHECK(esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP));
@@ -516,6 +373,8 @@ void app_runtime_start(void)
     factory_reset_init();
     node_config_load();
     message_store_load_messages_from_nvs(node_id);
+    (void)message_store_init();
+    forward_worker_init();
     lora_radio_init();
     storage_init(&littlefs_mounted);
     tx_scheduler_init();

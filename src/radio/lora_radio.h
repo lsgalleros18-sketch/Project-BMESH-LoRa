@@ -5,6 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "esp_err.h"
 #include "driver/spi_master.h"
 
 #define LORA_MISO_GPIO 5
@@ -40,7 +41,6 @@
 #define REG_MODEM_CONFIG_3 0x26
 #define REG_SYNC_WORD 0x39
 #define REG_DIO_MAPPING_1 0x40
-#define REG_IRQ_FLAGS_1 0x3E
 #define REG_VERSION 0x42
 
 #define MODE_LONG_RANGE_MODE 0x80
@@ -50,11 +50,26 @@
 #define MODE_RX_CONTINUOUS 0x05
 
 #define IRQ_TX_DONE_MASK 0x08
+#define IRQ_CAD_DONE_MASK 0x04
+#define IRQ_CAD_DETECTED_MASK 0x01
 #define IRQ_PAYLOAD_CRC_ERROR_MASK 0x20
 #define IRQ_RX_DONE_MASK 0x40
 
-#define IRQ1_CAD_DONE_MASK 0x04
-#define IRQ1_CAD_DETECTED_MASK 0x01
+typedef enum {
+    LORA_TX_PRIORITY_LOW = 0,
+    LORA_TX_PRIORITY_NORMAL = 1,
+    LORA_TX_PRIORITY_HIGH = 2,
+} lora_tx_priority_t;
+
+typedef enum {
+    RADIO_STATE_UNINITIALIZED = 0,
+    RADIO_STATE_INITIALIZING,
+    RADIO_STATE_RX,
+    RADIO_STATE_TX,
+    RADIO_STATE_CAD,
+    RADIO_STATE_FAULT,
+    RADIO_STATE_RECOVERING,
+} radio_state_t;
 
 #define LORA_BW_125_KHZ 0x70
 #define LORA_CR_4_5 0x02
@@ -70,11 +85,17 @@
 
 bool lora_transmit(const char *packet);
 bool lora_transmit_bytes(const uint8_t *packet, size_t packet_len);
+bool lora_radio_submit(const uint8_t *packet, size_t length, lora_tx_priority_t priority);
 typedef void (*lora_rx_callback_t)(void *parameter);
 void lora_handle_rx_packet(const uint8_t *payload, size_t length, int rssi, int snr);
 
 void lora_radio_init(void);
+radio_state_t lora_radio_get_state(void);
 bool lora_radio_is_ready(void);
+bool lora_radio_recover(void);
+esp_err_t lora_radio_reset(void);
+bool lora_radio_health_check(void);
+void lora_radio_enter_fault(void);
 bool lora_channel_clear(void);
 
 #endif

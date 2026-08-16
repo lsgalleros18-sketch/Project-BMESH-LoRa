@@ -1,7 +1,7 @@
 #include "roster.h"
 
-// Never call roster_* while holding main.c's data_mutex, and never call data_lock()
-// from inside roster_*; keep the lock domains strictly non-nested.
+// Never call roster_* while holding unrelated module locks; keep the lock
+// domains strictly non-nested.
 
 #include <string.h>
 

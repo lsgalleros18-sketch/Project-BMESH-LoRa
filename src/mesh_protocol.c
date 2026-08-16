@@ -660,6 +660,20 @@ bool build_forward_packet_v2(const mesh_packet_t *parsed, uint8_t *packet, size_
     return offset <= BEMS_MAX_PLAINTEXT;
 }
 
+bool mesh_packet_consume_hop(mesh_packet_t *packet)
+{
+    if (packet == NULL) {
+        return false;
+    }
+
+    if (packet->hops <= 0) {
+        return false;
+    }
+
+    packet->hops--;
+    return packet->hops > 0;
+}
+
 bool packet_seen(const char *source, uint32_t id)
 {
     bool seen = false;

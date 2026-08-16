@@ -1,7 +1,7 @@
 #include "route_table.h"
 
-// Never call route_table_* while holding main.c's data_mutex, and never call data_lock()
-// from inside route_table_*; keep the lock domains strictly non-nested.
+// Never call route_table_* while holding unrelated module locks; keep the lock
+// domains strictly non-nested.
 
 #include <string.h>
 
@@ -53,11 +53,10 @@ static uint32_t now_ms(void)
 static uint32_t route_cost_ms(const route_entry_t *entry, uint32_t now)
 {
     uint32_t age_ms = now - entry->last_seen_tick_ms;
-    uint32_t hop_cost = (entry->hop_count < 0 ? 0u : (uint32_t)entry->hop_count) * 1000u;
     uint32_t rssi_penalty = entry->best_rssi < 0 ? (uint32_t)(-entry->best_rssi) : 0u;
     uint32_t age_penalty = age_ms / 1000u;
 
-    return hop_cost + rssi_penalty + age_penalty;
+    return rssi_penalty + age_penalty;
 }
 
 static size_t find_route_index(const char *destination, const char *next_hop)
@@ -111,7 +110,7 @@ void route_table_learn(const char *destination, const char *next_hop, int hop_co
     route_lock();
 
     index = find_route_index(destination, next_hop);
-    new_cost = (uint32_t)hop_count * 1000u + (rssi < 0 ? (uint32_t)(-rssi) : 0u);
+    new_cost = (rssi < 0 ? (uint32_t)(-rssi) : 0u);
     if (index == SIZE_MAX) {
         if (route_count < MAX_ROUTE_ENTRIES) {
             index = route_count++;
@@ -131,8 +130,7 @@ void route_table_learn(const char *destination, const char *next_hop, int hop_co
 
     refresh_stale_state(&route_table[index], now);
     if (route_table[index].stale ||
-        hop_count < route_table[index].hop_count ||
-        (hop_count == route_table[index].hop_count && rssi > route_table[index].best_rssi) ||
+        rssi > route_table[index].best_rssi ||
         new_cost < route_cost_ms(&route_table[index], now) ||
         route_table[index].hop_count == 0) {
         route_table[index].hop_count = hop_count;

@@ -74,6 +74,9 @@ void location_decode(const char *encoded, location_info_t *loc);
 // Checks if packet has been seen before (duplicate detection)
 bool packet_seen(const char *source, uint32_t id);
 
+// Consumes one hop from the packet and returns true if more forwarding is allowed.
+bool mesh_packet_consume_hop(mesh_packet_t *packet);
+
 // Remembers a packet as seen
 void remember_packet(const char *source, uint32_t id);
 void deduplication_debug_reset_for_test(void);

@@ -24,6 +24,13 @@ void mesh_control_send_boot_sync_request(void);
 void mesh_control_send_manual_sync_request(void);
 bool mesh_control_is_control_packet_type(const char *type);
 bool mesh_control_handle_time_sync_packet(const char *payload);
+typedef struct {
+    uint32_t acknowledged_id;
+    char acknowledged_source[FIELD_LEN];
+} ack_info_t;
+
+bool mesh_control_build_ack(const mesh_packet_t *parsed, ack_info_t *ack_info);
+bool mesh_control_parse_ack(const uint8_t *payload, size_t payload_len, ack_info_t *ack_info);
 void mesh_control_send_ack_packet(const mesh_packet_t *parsed);
 void mesh_control_send_sync_responses(const mesh_packet_t *request);
 size_t mesh_control_decode_sync_response_records(const uint8_t *payload, size_t payload_len, mesh_packet_t *records, size_t max_records);

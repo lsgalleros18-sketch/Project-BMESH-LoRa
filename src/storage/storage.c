@@ -121,6 +121,33 @@ void storage_message_save(const emergency_message_t *message, int slot)
     nvs_close(handle);
 }
 
+void storage_message_delete(int slot)
+{
+    nvs_handle_t handle;
+    char key[16];
+    esp_err_t result;
+
+    if (slot < 0 || slot >= MAX_MESSAGES) {
+        return;
+    }
+
+    result = nvs_open(MESSAGE_NAMESPACE, NVS_READWRITE, &handle);
+    if (result != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to open NVS for message delete: %s", esp_err_to_name(result));
+        return;
+    }
+
+    snprintf(key, sizeof(key), "msg_%d", slot);
+    result = nvs_erase_key(handle, key);
+    if (result == ESP_OK) {
+        result = nvs_commit(handle);
+    }
+    if (result != ESP_OK && result != ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGW(TAG, "Failed to delete message %d from NVS: %s", slot, esp_err_to_name(result));
+    }
+    nvs_close(handle);
+}
+
 static bool message_is_restorable(const emergency_message_t *message)
 {
     if (message == NULL || message->id == 0) {

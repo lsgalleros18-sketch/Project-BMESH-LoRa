@@ -30,6 +30,8 @@ static uint8_t time_sync_dist_from_payload(const char *payload);
 bool mesh_control_is_control_packet_type(const char *type);
 bool mesh_control_handle_time_sync_packet(const char *payload);
 static bool is_private_destination_for_other_node(const char *destination, const char *requester);
+bool mesh_control_build_ack(const mesh_packet_t *parsed, ack_info_t *ack_info);
+bool mesh_control_parse_ack(const uint8_t *payload, size_t payload_len, ack_info_t *ack_info);
 void mesh_control_send_ack_packet(const mesh_packet_t *parsed);
 void mesh_control_send_sync_responses(const mesh_packet_t *request);
 
@@ -315,17 +317,42 @@ static bool is_private_destination_for_other_node(const char *destination, const
     return strcmp(destination, "ALL") != 0 && strcmp(destination, requester) != 0;
 }
 
+bool mesh_control_build_ack(const mesh_packet_t *parsed, ack_info_t *ack_info)
+{
+    if (parsed == NULL || ack_info == NULL) {
+        return false;
+    }
+
+    ack_info->acknowledged_id = parsed->id;
+    copy_field(ack_info->acknowledged_source, sizeof(ack_info->acknowledged_source), parsed->source);
+    return true;
+}
+
+bool mesh_control_parse_ack(const uint8_t *payload, size_t payload_len, ack_info_t *ack_info)
+{
+    if (payload == NULL || ack_info == NULL || payload_len < sizeof(uint32_t) + FIELD_LEN) {
+        return false;
+    }
+
+    memcpy(&ack_info->acknowledged_id, payload, sizeof(uint32_t));
+    memcpy(ack_info->acknowledged_source, payload + sizeof(uint32_t), FIELD_LEN);
+    ack_info->acknowledged_source[FIELD_LEN - 1] = '\0';
+    return true;
+}
+
 void mesh_control_send_ack_packet(const mesh_packet_t *parsed)
 {
     uint32_t ack_id;
     uint8_t packet_buf[PACKET_LEN] = {0};
     size_t packet_len = 0;
     mesh_packet_t packet = {0};
-    char payload[64];
+    ack_info_t ack_info = {0};
 
     ack_id = mesh_sequence_next();
     mesh_sequence_save();
-    snprintf(payload, sizeof(payload), "ACK for %lu", (unsigned long)parsed->id);
+    if (!mesh_control_build_ack(parsed, &ack_info)) {
+        return;
+    }
     packet.valid = true;
     packet.id = ack_id;
     packet.hops = 0;
@@ -334,7 +361,9 @@ void mesh_control_send_ack_packet(const mesh_packet_t *parsed)
     copy_field(packet.type, sizeof(packet.type), "ACK");
     copy_field(packet.priority, sizeof(packet.priority), "NORMAL");
     copy_field(packet.relay, sizeof(packet.relay), node_config_get_node_id());
-    copy_field(packet.payload, sizeof(packet.payload), payload);
+    memcpy(packet.payload, &ack_info.acknowledged_id, sizeof(ack_info.acknowledged_id));
+    memcpy(packet.payload + sizeof(ack_info.acknowledged_id), ack_info.acknowledged_source, FIELD_LEN);
+    packet.payload_len = sizeof(ack_info.acknowledged_id) + FIELD_LEN;
 
     ESP_LOGI(TAG, "Sending ACK to %s for packet %lu", parsed->source, (unsigned long)parsed->id);
     if (build_forward_packet_v2(&packet, packet_buf, sizeof(packet_buf), &packet_len)) {

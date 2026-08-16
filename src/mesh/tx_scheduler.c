@@ -20,18 +20,35 @@
 
 typedef enum {
     TX_STATE_EMPTY = 0,
+    TX_STATE_CREATED,
     TX_STATE_QUEUED,
-    TX_STATE_SENDING,
+    TX_STATE_WAITING_RADIO,
+    TX_STATE_TRANSMITTING,
     TX_STATE_WAITING_ACK,
-    TX_STATE_RETRY_PENDING,
+    TX_STATE_RETRY_BACKOFF,
     TX_STATE_DELIVERED,
+    TX_STATE_EXPIRED,
+    TX_STATE_FAILED_RADIO,
+    TX_STATE_FAILED_QUEUE,
+    TX_STATE_FAILED_TIMEOUT,
     TX_STATE_FAILED,
 } tx_state_t;
+
+typedef enum {
+    TX_ERROR_NONE = 0,
+    TX_ERROR_RADIO_BUSY,
+    TX_ERROR_RADIO_TIMEOUT,
+    TX_ERROR_QUEUE_FULL,
+    TX_ERROR_PACKET_BUILD,
+    TX_ERROR_ACK_TIMEOUT,
+    TX_ERROR_INVALID_ROUTE,
+} tx_error_t;
 
 typedef struct {
     emergency_message_t message;
     int nvs_slot;
     tx_state_t state;
+    tx_error_t error;
     uint8_t attempts;
     TickType_t next_action_tick;
     bool active;
@@ -59,6 +76,34 @@ static void unlock(void)
     }
 }
 
+static const char *state_label(tx_state_t state, tx_error_t error)
+{
+    switch (state) {
+    case TX_STATE_CREATED: return "CREATED";
+    case TX_STATE_QUEUED: return "QUEUED";
+    case TX_STATE_WAITING_RADIO: return "WAITING_RADIO";
+    case TX_STATE_TRANSMITTING: return "TRANSMITTING";
+    case TX_STATE_WAITING_ACK: return "WAITING_ACK";
+    case TX_STATE_RETRY_BACKOFF: return "RETRY_BACKOFF";
+    case TX_STATE_DELIVERED: return "DELIVERED";
+    case TX_STATE_EXPIRED: return "EXPIRED";
+    case TX_STATE_FAILED_RADIO: return "FAILED_RADIO";
+    case TX_STATE_FAILED_QUEUE: return "FAILED_QUEUE";
+    case TX_STATE_FAILED_TIMEOUT: return "FAILED_TIMEOUT";
+    case TX_STATE_FAILED:
+        switch (error) {
+        case TX_ERROR_RADIO_BUSY: return "FAILED_RADIO";
+        case TX_ERROR_PACKET_BUILD: return "FAILED_QUEUE";
+        case TX_ERROR_ACK_TIMEOUT: return "FAILED_TIMEOUT";
+        case TX_ERROR_RADIO_TIMEOUT: return "FAILED_RADIO";
+        case TX_ERROR_INVALID_ROUTE: return "FAILED_RADIO";
+        default: return "FAILED";
+        }
+    default:
+        return "CREATED";
+    }
+}
+
 static tx_entry_t *find_entry(uint32_t id, const char *ack_sender)
 {
     for (size_t i = 0; i < MAX_MESSAGES; i++) {
@@ -68,6 +113,7 @@ static tx_entry_t *find_entry(uint32_t id, const char *ack_sender)
          * original queued message destination rather than the sender field.
          */
         if (entry->active &&
+            entry->state == TX_STATE_WAITING_ACK &&
             entry->message.id == id &&
             strcmp(entry->message.destination, ack_sender) == 0) {
             return entry;
@@ -90,16 +136,14 @@ static void set_status(tx_entry_t *entry, const char *status)
 {
     copy_field(entry->message.status, sizeof(entry->message.status), status);
     if (entry->nvs_slot >= 0) {
-        storage_message_save(&entry->message, entry->nvs_slot);
+        (void)message_store_update(entry->nvs_slot, &entry->message);
     }
     message_store_update_status(entry->message.id, entry->message.source, status);
 }
 
-static void send_current_packet(tx_entry_t *entry)
+static bool prepare_current_packet(tx_entry_t *entry, uint8_t *route_packet, size_t route_packet_size, size_t *route_packet_len)
 {
     mesh_packet_t packet = {0};
-    uint8_t route_packet[PACKET_LEN];
-    size_t route_packet_len = 0;
     route_entry_t route = {0};
 
     if (route_table_get_best(entry->message.destination, &route)) {
@@ -120,26 +164,57 @@ static void send_current_packet(tx_entry_t *entry)
     copy_field(packet.priority, sizeof(packet.priority), entry->message.priority);
     copy_field(packet.relay, sizeof(packet.relay), entry->message.source);
     copy_field(packet.payload, sizeof(packet.payload), entry->message.payload);
-    if (!build_forward_packet_v2(&packet, route_packet, sizeof(route_packet), &route_packet_len)) {
-        entry->state = TX_STATE_RETRY_PENDING;
+    if (!build_forward_packet_v2(&packet, route_packet, route_packet_size, route_packet_len)) {
+        return false;
+    }
+    return true;
+}
+
+static void send_current_packet(tx_entry_t *entry)
+{
+    uint8_t route_packet[PACKET_LEN];
+    size_t route_packet_len = 0;
+
+    entry->state = TX_STATE_TRANSMITTING;
+    if (!prepare_current_packet(entry, route_packet, sizeof(route_packet), &route_packet_len)) {
+        entry->state = TX_STATE_FAILED_QUEUE;
+        entry->error = TX_ERROR_PACKET_BUILD;
+        set_status(entry, state_label(entry->state, entry->error));
+        entry->active = false;
         entry->next_action_tick = xTaskGetTickCount() + pdMS_TO_TICKS(TX_ACK_TIMEOUT_MS);
         return;
     }
+    entry->state = TX_STATE_WAITING_RADIO;
+    unlock();
     if (lora_transmit_bytes(route_packet, route_packet_len)) {
+        lock();
         entry->attempts++;
         entry->state = TX_STATE_WAITING_ACK;
         entry->next_action_tick = xTaskGetTickCount() + pdMS_TO_TICKS(TX_ACK_TIMEOUT_MS);
         set_status(entry, "SENT");
-    } else {
-        entry->state = TX_STATE_RETRY_PENDING;
-        entry->next_action_tick = xTaskGetTickCount() + pdMS_TO_TICKS(TX_ACK_TIMEOUT_MS);
+        unlock();
+        return;
     }
+
+    lock();
+    entry->state = TX_STATE_FAILED_RADIO;
+    entry->error = TX_ERROR_RADIO_BUSY;
+    set_status(entry, state_label(entry->state, entry->error));
+    entry->state = TX_STATE_RETRY_BACKOFF;
+    entry->next_action_tick = xTaskGetTickCount() + pdMS_TO_TICKS(TX_ACK_TIMEOUT_MS);
+    unlock();
 }
 
 static void finalize_failure(tx_entry_t *entry)
 {
-    entry->state = TX_STATE_FAILED;
-    set_status(entry, "FAILED");
+    if (entry->error == TX_ERROR_ACK_TIMEOUT) {
+        entry->state = TX_STATE_FAILED_TIMEOUT;
+    } else if (entry->error == TX_ERROR_QUEUE_FULL || entry->error == TX_ERROR_PACKET_BUILD) {
+        entry->state = TX_STATE_FAILED_QUEUE;
+    } else {
+        entry->state = TX_STATE_FAILED_RADIO;
+    }
+    set_status(entry, state_label(entry->state, entry->error));
     entry->active = false;
 }
 
@@ -157,22 +232,21 @@ static void scheduler_task(void *parameter)
                 continue;
             }
 
-            if (entry->state == TX_STATE_QUEUED || entry->state == TX_STATE_RETRY_PENDING) {
+            if (entry->state == TX_STATE_QUEUED || entry->state == TX_STATE_RETRY_BACKOFF || entry->state == TX_STATE_CREATED) {
                 if (now >= entry->next_action_tick) {
-                    entry->state = TX_STATE_SENDING;
                     send_current_packet(entry);
                 }
             } else if (entry->state == TX_STATE_WAITING_ACK && now >= entry->next_action_tick) {
                 if (entry->attempts >= TX_RETRY_MAX_ATTEMPTS) {
+                    entry->error = TX_ERROR_ACK_TIMEOUT;
                     finalize_failure(entry);
                 } else {
-                    entry->state = TX_STATE_RETRY_PENDING;
+                    entry->state = TX_STATE_RETRY_BACKOFF;
                     entry->next_action_tick = now + pdMS_TO_TICKS(5000 * entry->attempts);
                 }
             }
         }
         unlock();
-
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
@@ -187,7 +261,7 @@ void tx_scheduler_init(void)
     }
 }
 
-bool tx_scheduler_enqueue(const emergency_message_t *message, int nvs_slot)
+bool tx_scheduler_submit(const emergency_message_t *message, int nvs_slot)
 {
     tx_entry_t *entry;
 
@@ -206,13 +280,20 @@ bool tx_scheduler_enqueue(const emergency_message_t *message, int nvs_slot)
     memset(entry, 0, sizeof(*entry));
     entry->message = *message;
     entry->nvs_slot = nvs_slot;
-    entry->state = TX_STATE_QUEUED;
+    entry->state = TX_STATE_CREATED;
+    entry->error = TX_ERROR_NONE;
     entry->attempts = 0;
     entry->next_action_tick = xTaskGetTickCount();
     entry->active = true;
+    entry->state = TX_STATE_QUEUED;
     set_status(entry, "QUEUED");
     unlock();
     return true;
+}
+
+bool tx_scheduler_enqueue(const emergency_message_t *message, int nvs_slot)
+{
+    return tx_scheduler_submit(message, nvs_slot);
 }
 
 bool tx_scheduler_acknowledge(uint32_t acknowledged_id, const char *ack_source)
@@ -230,6 +311,7 @@ bool tx_scheduler_acknowledge(uint32_t acknowledged_id, const char *ack_source)
         return false;
     }
     entry->state = TX_STATE_DELIVERED;
+    entry->error = TX_ERROR_NONE;
     set_status(entry, "ACKED");
     entry->active = false;
     unlock();

@@ -19,4 +19,5 @@ void storage_init(bool *mounted);
 storage_state_t storage_get_state(void);
 const char *storage_get_state_name(void);
 void storage_message_save(const emergency_message_t *message, int slot);
+void storage_message_delete(int slot);
 void storage_message_load_messages(const char *node_id, emergency_message_t *messages, size_t *count, size_t max_messages);
