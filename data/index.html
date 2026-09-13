@@ -102,6 +102,15 @@ tr:hover td{background:#fcfbf8}
   .gridcards{grid-template-columns:1fr}
   th,td{padding:10px 12px}
 }
+/* Application-shell refinements */
+body{background:#f5f7f6;color:#16231e}
+.shell{max-width:1360px;padding:0 20px 88px}
+.topbar{height:64px;padding:0;position:sticky;top:0;z-index:10;background:#fff;border-bottom:1px solid #dfe6e2;margin:0 calc(50% - 50vw);padding-left:max(20px,calc((100vw - 1320px)/2));padding-right:max(20px,calc((100vw - 1320px)/2));color:#16231e}
+.titleblock h1{font-size:18px}.titleblock .sub{color:#66736d}.mark{width:34px;height:34px;background:#21735b;box-shadow:none}.mark.off{background:var(--bad);box-shadow:none}.pill{color:#40524a;background:#f5f7f6;border-color:#dfe6e2;padding:6px 9px}
+.dashintro{padding-top:20px}.dashintro h2{margin:0;font-size:23px}.dashintro p{margin:4px 0 0;color:#66736d;font-size:13px}.app-layout{display:grid;grid-template-columns:228px minmax(0,1fr);gap:20px;padding-top:20px}.sidebar{position:sticky;top:84px;align-self:start}.nav-label{padding:0 12px 8px;color:#7b8781;font-size:11px;font-weight:750;letter-spacing:.08em;text-transform:uppercase}.nav-item{height:44px;display:flex;align-items:center;gap:12px;padding:0 12px;border-radius:10px;color:#52635b;text-decoration:none;font-size:14px;font-weight:650}.nav-item:hover,.nav-item.active{color:#185743;background:#e9f3ee}.nav-icon{width:20px;text-align:center;font-size:17px}.layout{grid-template-columns:minmax(0,1.15fr) minmax(300px,.85fr);gap:16px}.section,.panel{border-color:#dfe6e2;border-radius:14px;box-shadow:0 3px 10px rgba(22,35,30,.035)}.sectionhead,.panelhead{padding:16px 18px;border-color:#dfe6e2}.sectionhead h2,.panelhead h3{font-size:16px;letter-spacing:0;text-transform:none}.gridcards{grid-template-columns:repeat(4,minmax(0,1fr));padding:14px 18px;gap:10px}.card{border-color:#e4eae6;border-radius:12px;padding:12px}.card .k,.tiny .k{font-size:11px;letter-spacing:.04em}.card .v{font-size:20px}.smallgrid{padding:14px 18px;grid-template-columns:repeat(3,minmax(0,1fr))}.tiny{border-color:#e4eae6;background:#fff;border-radius:12px}.tag{font-weight:650}.tablewrap{overflow-x:auto}.feed{padding:12px}.event{max-width:78%;border-color:#e4eae6;border-radius:14px;padding:13px;background:#fafcfb}.event.outgoing{background:#eaf5ef;margin-left:auto}.eventbody{font-size:14px}.settings{padding:16px 18px}.settings a{border-radius:9px;border-color:#dfe6e2;min-height:42px}.settings a.primary{background:#21735b;border-color:#21735b}.footerline{color:#66736d;padding-top:14px}.mobile-nav{display:none}
+@media(max-width:1100px){.app-layout{grid-template-columns:1fr}.sidebar{display:none}.layout{grid-template-columns:1fr}.gridcards{grid-template-columns:repeat(4,minmax(0,1fr))}}
+@media(max-width:767px){.shell{padding:0 12px 82px}.topbar{height:60px;padding-left:12px;padding-right:12px}.titleblock h1{font-size:16px}.titleblock .sub{max-width:180px}.topmeta{gap:5px}.pill{padding:5px 7px;font-size:11px}.topmeta .pill:nth-child(n+3){display:none}.app-layout{padding-top:12px}.gridcards{grid-template-columns:repeat(2,minmax(0,1fr));padding:12px}.smallgrid{grid-template-columns:1fr 1fr;padding:12px}.smallgrid .tiny:last-child{grid-column:1/-1}.sectionhead,.panelhead{padding:14px}.sectionhead span{display:none}.card .v{font-size:19px}.layout{gap:12px}.stack{gap:12px}.panelhead h3{font-size:15px}.tablewrap{overflow:visible}table,thead,tbody,tr,th,td{display:block}thead{display:none}tbody{padding:0 12px 8px}tr{position:relative;padding:12px 0;border-bottom:1px solid #e4eae6;min-height:80px}tr:last-child{border:0}td{border:0;padding:2px 0;font-size:13px}td:nth-child(n+3){display:inline-block;margin-right:12px;color:#66736d;font-size:12px}.empty{padding:14px 0}.feed{padding:10px}.event{min-height:72px}.mobile-nav{display:flex;position:fixed;bottom:0;left:0;right:0;height:66px;background:#fff;border-top:1px solid #dfe6e2;z-index:20;justify-content:space-around}.mobile-nav a{flex:1;display:grid;place-content:center;text-align:center;gap:2px;color:#66736d;text-decoration:none;font-size:11px}.mobile-nav a b{font-size:18px;font-weight:500}.mobile-nav a.active{color:#21735b}.footerline{font-size:11px}}
+@media(max-width:767px){td:nth-child(n+3):before{content:attr(data-label) ': ';font-weight:650}.event{max-width:85%}}
 </style>
 </head>
 <body>
@@ -122,7 +131,19 @@ tr:hover td{background:#fcfbf8}
     </div>
   </div>
 
-  <div class="layout">
+  <div class="dashintro"><h2>Dashboard</h2><p>Barangay Mesh Emergency Communication</p></div>
+  <div class="app-layout">
+    <aside class="sidebar" aria-label="Primary navigation">
+      <div class="nav-label">Workspace</div>
+      <a class="nav-item active" href="#dashboard"><span class="nav-icon">⌂</span>Dashboard</a>
+      <a class="nav-item" href="#messages"><span class="nav-icon">◌</span>Messages</a>
+      <a class="nav-item" href="#nodes"><span class="nav-icon">◎</span>Nodes</a>
+      <a class="nav-item" href="#routes"><span class="nav-icon">↗</span>Routes</a>
+      <a class="nav-item" href="#messages"><span class="nav-icon">!</span>Events</a>
+      <div class="nav-label" style="margin-top:20px">Portal</div>
+      <a class="nav-item" href="/setup"><span class="nav-icon">⚙</span>Settings</a>
+    </aside>
+  <div class="layout" id="dashboard">
     <div class="stack">
       <section class="section">
         <div class="sectionhead">
@@ -141,7 +162,7 @@ tr:hover td{background:#fcfbf8}
         <div class="smallgrid" id="meshOverview"></div>
       </section>
 
-      <section class="panel">
+      <section class="panel" id="nodes">
         <div class="panelhead">
           <h3>Node Table</h3>
           <div class="meta" id="nodeMeta">Waiting for roster...</div>
@@ -165,7 +186,7 @@ tr:hover td{background:#fcfbf8}
         </div>
       </section>
 
-      <section class="panel">
+      <section class="panel" id="routes">
         <div class="panelhead">
           <h3>Route Table</h3>
           <div class="meta" id="routeMeta">Waiting for route snapshot...</div>
@@ -191,7 +212,7 @@ tr:hover td{background:#fcfbf8}
     </div>
 
     <div class="stack">
-      <section class="panel">
+      <section class="panel" id="messages">
         <div class="panelhead">
           <h3>Message / Event Feed</h3>
           <div class="meta" id="messageMeta">Waiting for message snapshot...</div>
@@ -218,8 +239,10 @@ tr:hover td{background:#fcfbf8}
       </section>
     </div>
   </div>
+  </div>
 
   <div class="footerline" id="footerLine">Refreshing every 4 seconds.</div>
+  <nav class="mobile-nav" aria-label="Mobile navigation"><a class="active" href="#dashboard"><b>⌂</b>Home</a><a href="#messages"><b>◌</b>Messages</a><a href="#nodes"><b>◎</b>Nodes</a><a href="#messages"><b>!</b>Events</a><a href="/setup"><b>⚙</b>More</a></nav>
 </div>
 
 <script>
@@ -303,12 +326,12 @@ function renderNodes(status){
     const hop=Number.isFinite(n.hop_count)?n.hop_count:(Number.isFinite(n.hops)?n.hops:'--');
     const routeState=n.online===true ? 'Reachable' : (n.online===false ? 'Stale' : 'Unknown');
     return '<tr>'+
-      '<td><b>'+esc(asText(n.node_id))+'</b><div class="meta">'+esc(asText((n.location&&n.location.barangay)||'',''))+'</div></td>'+
-      '<td><span class="badge '+levelClass(state)+'">'+esc(state)+'</span></td>'+
-      '<td class="mono">'+esc(fmtAgo(n.last_seen_epoch))+'</td>'+
-      '<td class="mono">'+esc(fmtNum(n.last_rssi))+'</td>'+
-      '<td class="mono">'+esc(fmtNum(hop))+'</td>'+
-      '<td>'+esc(routeState)+'</td>'+
+      '<td data-label="Node"><b>'+esc(asText(n.node_id))+'</b><div class="meta">'+esc(asText((n.location&&n.location.barangay)||'',''))+'</div></td>'+
+      '<td data-label="Status"><span class="badge '+levelClass(state)+'">'+esc(state)+'</span></td>'+
+      '<td data-label="Last seen" class="mono">'+esc(fmtAgo(n.last_seen_epoch))+'</td>'+
+      '<td data-label="RSSI" class="mono">'+esc(fmtNum(n.last_rssi))+'</td>'+
+      '<td data-label="Hops" class="mono">'+esc(fmtNum(hop))+'</td>'+
+      '<td data-label="Route">'+esc(routeState)+'</td>'+
     '</tr>';
   }).join('');
   document.getElementById('nodeMeta').textContent=roster.length+' roster entries';
@@ -320,12 +343,12 @@ function renderRoutes(status){
     const selected = !r.stale && String(r.next_hop||'').length ? 'Selected' : 'Unselected';
     const nextHop = String(r.next_hop||'');
     return '<tr>'+
-      '<td><b>'+esc(asText(r.destination))+'</b></td>'+
-      '<td>'+esc(nextHop || '--')+'</td>'+
-      '<td class="mono">'+esc(fmtNum(r.hop_count))+'</td>'+
-      '<td class="mono">'+esc(fmtNum(r.best_rssi))+'</td>'+
-      '<td><span class="badge '+(r.stale?'stale':'healthy')+'">'+esc(freshnessLabel(r))+'</span></td>'+
-      '<td>'+esc(selected)+'</td>'+
+      '<td data-label="Destination"><b>'+esc(asText(r.destination))+'</b></td>'+
+      '<td data-label="Next hop">'+esc(nextHop || '--')+'</td>'+
+      '<td data-label="Hops" class="mono">'+esc(fmtNum(r.hop_count))+'</td>'+
+      '<td data-label="RSSI" class="mono">'+esc(fmtNum(r.best_rssi))+'</td>'+
+      '<td data-label="Freshness"><span class="badge '+(r.stale?'stale':'healthy')+'">'+esc(freshnessLabel(r))+'</span></td>'+
+      '<td data-label="Route">'+esc(selected)+'</td>'+
     '</tr>';
   }).join('');
   document.getElementById('routeMeta').textContent=routes.length+' routes reported';
@@ -360,7 +383,7 @@ function renderMessages(status,messages){
       'Hops: '+asText(m.hops),
       'Time: '+time
     ];
-    return '<div class="event">'+
+    return '<div class="event '+(String(m.direction||'').toUpperCase().indexOf('OUT')>=0?'outgoing':'incoming')+'">'+
       '<div class="eventhead">'+
         '<b>'+esc(asText(m.thread_key||'Message'))+'</b>'+
         '<span class="badge '+level.cls+'">'+esc(level.text)+'</span>'+

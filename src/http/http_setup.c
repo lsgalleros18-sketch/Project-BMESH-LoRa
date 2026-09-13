@@ -5,6 +5,7 @@
 #include "freertos/task.h"
 
 #include "http/http_portal.h"
+#include "network/http_request.h"
 #include "utils/string_utils.h"
 
 esp_err_t http_setup_handler(httpd_req_t *request)
@@ -13,14 +14,8 @@ esp_err_t http_setup_handler(httpd_req_t *request)
     char body[384] = {0};
     char raw_node_id[FIELD_LEN] = {0};
     node_config_t new_config = {0};
-    int received = 0;
-
-    while (received < request->content_len && received < (int)sizeof(body) - 1) {
-        int ret = httpd_req_recv(request, body + received, MIN(request->content_len - received, (int)sizeof(body) - 1 - received));
-        if (ret <= 0) {
-            return ESP_FAIL;
-        }
-        received += ret;
+    if (http_read_body_checked(request, body, sizeof(body)) != ESP_OK) {
+        return ESP_FAIL;
     }
 
     form_value(body, "node_id", raw_node_id, sizeof(raw_node_id));

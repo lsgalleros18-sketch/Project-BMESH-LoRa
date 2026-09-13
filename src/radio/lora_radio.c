@@ -6,6 +6,7 @@
 #include "driver/spi_master.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_random.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
@@ -19,15 +20,11 @@ static radio_state_t lora_state = RADIO_STATE_UNINITIALIZED;
 static SemaphoreHandle_t lora_dio0_semaphore;
 static SemaphoreHandle_t lora_tx_done_semaphore;
 static SemaphoreHandle_t lora_tx_mutex;
-static QueueHandle_t lora_tx_queue;
+static QueueHandle_t lora_tx_request_queue;
+static QueueHandle_t lora_tx_result_queue;
 static TaskHandle_t lora_tx_task_handle;
 static bool (*lora_read_frame_callback)(uint8_t *payload, size_t *length, int *rssi, int *snr);
-
-typedef struct {
-    size_t length;
-    lora_tx_priority_t priority;
-    uint8_t packet[LORA_MAX_PAYLOAD];
-} lora_tx_item_t;
+static uint8_t lora_recovery_attempts;
 
 static bool lora_read_raw_frame(uint8_t *payload, size_t *length, int *rssi, int *snr);
 static esp_err_t lora_read_reg(uint8_t address, uint8_t *value);
@@ -41,10 +38,11 @@ static void lora_enter_fault_internal(const char *reason);
 static esp_err_t lora_radio_apply_defaults(void);
 static bool lora_radio_bring_up(void);
 static void lora_set_state(radio_state_t state);
+static lora_tx_result_code_t lora_execute_tx(const lora_tx_request_t *request, lora_tx_result_t *result);
 
-static void lora_set_mode(uint8_t mode)
+static esp_err_t lora_set_mode(uint8_t mode)
 {
-    (void)lora_write_reg(REG_OP_MODE, MODE_LONG_RANGE_MODE | mode);
+    return lora_write_reg(REG_OP_MODE, MODE_LONG_RANGE_MODE | mode);
 }
 
 static void lora_set_state(radio_state_t state)
@@ -59,13 +57,19 @@ bool lora_channel_clear(void)
     }
     lora_set_state(RADIO_STATE_CAD);
     for (int attempt = 0; attempt < 3; attempt++) {
-        lora_set_mode(MODE_STDBY);
+        if (lora_set_mode(MODE_STDBY) != ESP_OK) {
+            lora_enter_fault_internal("CAD standby failed");
+            return false;
+        }
         if (lora_write_reg(REG_DIO_MAPPING_1, 0x80) != ESP_OK ||
             lora_write_reg(REG_IRQ_FLAGS, 0xFF) != ESP_OK) {
             lora_enter_fault_internal("CAD setup SPI failure");
             return false;
         }
-        lora_set_mode(0x07); // CAD mode
+        if (lora_set_mode(0x07) != ESP_OK) { // CAD mode
+            lora_enter_fault_internal("CAD mode failed");
+            return false;
+        }
         vTaskDelay(pdMS_TO_TICKS(10));
 
         uint8_t irq_flags = 0;
@@ -74,7 +78,10 @@ bool lora_channel_clear(void)
             lora_enter_fault_internal("CAD read SPI failure");
             return false;
         }
-        lora_set_mode(MODE_STDBY);
+        if (lora_set_mode(MODE_STDBY) != ESP_OK) {
+            lora_enter_fault_internal("CAD exit standby failed");
+            return false;
+        }
 
         if ((irq_flags & IRQ_CAD_DONE_MASK) != 0 && (irq_flags & IRQ_CAD_DETECTED_MASK) == 0) {
             lora_set_state(RADIO_STATE_RX);
@@ -100,7 +107,7 @@ static void lora_receive_mode(void)
 {
     (void)lora_write_reg(REG_DIO_MAPPING_1, 0x00);
     (void)lora_write_reg(REG_IRQ_FLAGS, 0xFF);
-    lora_set_mode(MODE_RX_CONTINUOUS);
+    (void)lora_set_mode(MODE_RX_CONTINUOUS);
     lora_set_state(RADIO_STATE_RX);
 }
 
@@ -112,7 +119,9 @@ static esp_err_t lora_radio_apply_defaults(void)
         return ESP_FAIL;
     }
 
-    lora_set_mode(MODE_SLEEP);
+    if (lora_set_mode(MODE_SLEEP) != ESP_OK) {
+        return ESP_FAIL;
+    }
     vTaskDelay(pdMS_TO_TICKS(10));
     lora_set_frequency(LORA_FREQUENCY_HZ);
     if (lora_write_reg(REG_FIFO_TX_BASE_ADDR, 0x00) != ESP_OK ||
@@ -245,8 +254,9 @@ void lora_radio_init(void)
     lora_read_frame_callback = lora_read_raw_frame;
     xTaskCreate(lora_rx_task, "lora_rx_task", 4096, NULL, 6, NULL);
     lora_tx_mutex = xSemaphoreCreateMutex();
-    lora_tx_queue = xQueueCreate(8, sizeof(lora_tx_item_t));
-    if (lora_tx_mutex != NULL && lora_tx_queue != NULL) {
+    lora_tx_request_queue = xQueueCreate(16, sizeof(lora_tx_request_t));
+    lora_tx_result_queue = xQueueCreate(16, sizeof(lora_tx_result_t));
+    if (lora_tx_mutex != NULL && lora_tx_request_queue != NULL && lora_tx_result_queue != NULL) {
         xTaskCreate(lora_tx_task, "lora_tx_task", 4096, NULL, 7, &lora_tx_task_handle);
     }
 
@@ -318,6 +328,12 @@ esp_err_t lora_radio_reset(void)
 
 bool lora_radio_recover(void)
 {
+    if (lora_recovery_attempts >= 3) {
+        lora_set_state(RADIO_STATE_FAULT);
+        ESP_LOGE(TAG, "LoRa recovery limit reached");
+        return false;
+    }
+    lora_recovery_attempts++;
     lora_enter_fault_internal("recovering");
     if (lora_radio_reset() != ESP_OK) {
         lora_set_state(RADIO_STATE_FAULT);
@@ -327,35 +343,46 @@ bool lora_radio_recover(void)
         lora_set_state(RADIO_STATE_FAULT);
         return false;
     }
+    lora_recovery_attempts = 0;
     lora_set_state(RADIO_STATE_RX);
     return true;
 }
 
 bool lora_radio_submit(const uint8_t *packet, size_t length, lora_tx_priority_t priority)
 {
-    lora_tx_item_t item = {0};
+    lora_tx_request_t request = {0};
 
     if (lora_state != RADIO_STATE_RX) {
         ESP_LOGW(TAG, "SX1278 is not ready; packet kept in local log only");
         return false;
     }
-    if (packet == NULL || length == 0 || length > sizeof(item.packet)) {
+    if (packet == NULL || length == 0 || length > sizeof(request.packet)) {
         return false;
     }
 
-    item.length = length;
-    item.priority = priority;
-    memcpy(item.packet, packet, length);
+    request.request_id = esp_random();
+    request.packet_len = length;
+    request.priority = priority;
+    request.submitted_at_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+    request.require_result = true;
+    memcpy(request.packet, packet, length);
 
-    if (lora_tx_queue == NULL) {
-        return lora_do_transmit_bytes(item.packet, item.length);
+    return lora_tx_submit(&request) == ESP_OK;
+}
+
+esp_err_t lora_tx_submit(const lora_tx_request_t *request)
+{
+    if (request == NULL || request->packet_len == 0 || request->packet_len > sizeof(((lora_tx_request_t *)0)->packet)) {
+        return ESP_ERR_INVALID_ARG;
     }
-
-    if (xQueueSend(lora_tx_queue, &item, 0) != pdTRUE) {
+    if (lora_tx_request_queue == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (xQueueSend(lora_tx_request_queue, request, 0) != pdTRUE) {
         ESP_LOGW(TAG, "LoRa TX queue full");
-        return false;
+        return ESP_ERR_TIMEOUT;
     }
-    return true;
+    return ESP_OK;
 }
 
 static esp_err_t lora_transfer(uint8_t address, const uint8_t *tx_data, uint8_t *rx_data, size_t length)
@@ -491,7 +518,11 @@ static bool lora_do_transmit_bytes(const uint8_t *packet, size_t packet_len)
         return false;
     }
 
-    lora_set_mode(MODE_TX);
+    if (lora_set_mode(MODE_TX) != ESP_OK) {
+        lora_enter_fault_internal("TX mode set failed");
+        (void)lora_radio_recover();
+        return LORA_TX_RESULT_SPI_ERROR;
+    }
     if (xSemaphoreTake(lora_tx_done_semaphore, pdMS_TO_TICKS(5000)) == pdTRUE) {
         lora_receive_mode();
         if (lora_tx_mutex != NULL) {
@@ -513,19 +544,69 @@ static bool lora_do_transmit_bytes(const uint8_t *packet, size_t packet_len)
 
 static void lora_tx_task(void *parameter)
 {
-    lora_tx_item_t item;
+    lora_tx_request_t request;
+    lora_tx_result_t result;
 
     (void)parameter;
     while (true) {
-        if (lora_tx_queue == NULL || xQueueReceive(lora_tx_queue, &item, portMAX_DELAY) != pdTRUE) {
+        if (lora_tx_request_queue == NULL || xQueueReceive(lora_tx_request_queue, &request, portMAX_DELAY) != pdTRUE) {
             continue;
         }
-        if (item.priority == LORA_TX_PRIORITY_HIGH) {
-            (void)lora_do_transmit_bytes(item.packet, item.length);
-        } else {
-            (void)lora_do_transmit_bytes(item.packet, item.length);
+        memset(&result, 0, sizeof(result));
+        result.request_id = request.request_id;
+        result.message_id = request.message_id;
+        result.started_at_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+        result.result = lora_execute_tx(&request, &result);
+        result.completed_at_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+        if (lora_tx_result_queue != NULL && xQueueSend(lora_tx_result_queue, &result, pdMS_TO_TICKS(100)) != pdTRUE) {
+            ESP_LOGW(TAG, "Dropped TX result request_id=%lu", (unsigned long)result.request_id);
         }
     }
+}
+
+bool lora_tx_result_receive(lora_tx_result_t *result, TickType_t timeout_ticks)
+{
+    if (result == NULL || lora_tx_result_queue == NULL) {
+        return false;
+    }
+    return xQueueReceive(lora_tx_result_queue, result, timeout_ticks) == pdTRUE;
+}
+
+static lora_tx_result_code_t lora_execute_tx(const lora_tx_request_t *request, lora_tx_result_t *result)
+{
+    if (request == NULL || result == NULL) {
+        return LORA_TX_RESULT_UNKNOWN;
+    }
+    if (!lora_radio_is_ready()) {
+        return LORA_TX_RESULT_RADIO_FAULT;
+    }
+    if (!lora_channel_clear()) {
+        return LORA_TX_RESULT_CHANNEL_BUSY;
+    }
+    xSemaphoreTake(lora_tx_done_semaphore, 0);
+    lora_set_state(RADIO_STATE_TX);
+    if (!lora_transmit_raw_frame(request->packet, request->packet_len)) {
+        lora_receive_mode();
+        lora_enter_fault_internal("TX frame write failed");
+        (void)lora_radio_recover();
+        return LORA_TX_RESULT_SPI_ERROR;
+    }
+    if (lora_set_mode(MODE_TX) != ESP_OK) {
+        lora_enter_fault_internal("TX mode set failed");
+        (void)lora_radio_recover();
+        return LORA_TX_RESULT_SPI_ERROR;
+    }
+    if (xSemaphoreTake(lora_tx_done_semaphore, pdMS_TO_TICKS(5000)) == pdTRUE) {
+        lora_receive_mode();
+        result->airtime_ms = 0;
+        result->rssi = 0;
+        result->snr = 0;
+        return LORA_TX_RESULT_SUCCESS;
+    }
+    lora_enter_fault_internal("TX timeout");
+    (void)lora_radio_recover();
+    lora_receive_mode();
+    return LORA_TX_RESULT_TIMEOUT;
 }
 
 static void lora_enter_fault_internal(const char *reason)

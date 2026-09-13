@@ -3,6 +3,7 @@
 #include <string.h>
 
 #include "esp_log.h"
+#include "esp_random.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -50,6 +51,7 @@ typedef struct {
     tx_state_t state;
     tx_error_t error;
     uint8_t attempts;
+    uint32_t radio_request_id;
     TickType_t next_action_tick;
     bool active;
 } tx_entry_t;
@@ -141,6 +143,55 @@ static void set_status(tx_entry_t *entry, const char *status)
     message_store_update_status(entry->message.id, entry->message.source, status);
 }
 
+static void handle_radio_result(const lora_tx_result_t *result)
+{
+    tx_entry_t *entry = NULL;
+
+    if (result == NULL) {
+        return;
+    }
+
+    lock();
+    for (size_t i = 0; i < MAX_MESSAGES; i++) {
+        if (tx_entries[i].active &&
+            tx_entries[i].radio_request_id == result->request_id &&
+            tx_entries[i].state != TX_STATE_DELIVERED &&
+            tx_entries[i].state != TX_STATE_FAILED &&
+            tx_entries[i].state != TX_STATE_EXPIRED) {
+            entry = &tx_entries[i];
+            break;
+        }
+    }
+
+    if (entry == NULL) {
+        unlock();
+        return;
+    }
+
+    switch (result->result) {
+    case LORA_TX_RESULT_SUCCESS:
+        entry->state = TX_STATE_WAITING_ACK;
+        entry->next_action_tick = xTaskGetTickCount() + pdMS_TO_TICKS(TX_ACK_TIMEOUT_MS);
+        set_status(entry, "SENT");
+        break;
+    case LORA_TX_RESULT_CHANNEL_BUSY:
+        entry->state = TX_STATE_RETRY_BACKOFF;
+        entry->next_action_tick = xTaskGetTickCount() + pdMS_TO_TICKS(2000);
+        break;
+    case LORA_TX_RESULT_TIMEOUT:
+    case LORA_TX_RESULT_SPI_ERROR:
+    case LORA_TX_RESULT_RADIO_FAULT:
+        entry->state = TX_STATE_RETRY_BACKOFF;
+        entry->next_action_tick = xTaskGetTickCount() + pdMS_TO_TICKS(5000);
+        break;
+    default:
+        entry->state = TX_STATE_RETRY_BACKOFF;
+        entry->next_action_tick = xTaskGetTickCount() + pdMS_TO_TICKS(5000);
+        break;
+    }
+    unlock();
+}
+
 static bool prepare_current_packet(tx_entry_t *entry, uint8_t *route_packet, size_t route_packet_size, size_t *route_packet_len)
 {
     mesh_packet_t packet = {0};
@@ -172,6 +223,7 @@ static bool prepare_current_packet(tx_entry_t *entry, uint8_t *route_packet, siz
 
 static void send_current_packet(tx_entry_t *entry)
 {
+    lora_tx_request_t request = {0};
     uint8_t route_packet[PACKET_LEN];
     size_t route_packet_len = 0;
 
@@ -185,23 +237,26 @@ static void send_current_packet(tx_entry_t *entry)
         return;
     }
     entry->state = TX_STATE_WAITING_RADIO;
+    request.request_id = (uint32_t)esp_random();
+    request.message_id = entry->message.id;
+    request.packet_len = route_packet_len;
+    request.priority = LORA_TX_PRIORITY_NORMAL;
+    request.submitted_at_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+    request.require_result = true;
+    memcpy(request.packet, route_packet, route_packet_len);
+    entry->radio_request_id = request.request_id;
     unlock();
-    if (lora_transmit_bytes(route_packet, route_packet_len)) {
+    if (lora_tx_submit(&request) != ESP_OK) {
         lock();
-        entry->attempts++;
-        entry->state = TX_STATE_WAITING_ACK;
-        entry->next_action_tick = xTaskGetTickCount() + pdMS_TO_TICKS(TX_ACK_TIMEOUT_MS);
-        set_status(entry, "SENT");
+        entry->state = TX_STATE_RETRY_BACKOFF;
+        entry->error = TX_ERROR_QUEUE_FULL;
+        entry->next_action_tick = xTaskGetTickCount() + pdMS_TO_TICKS(2000);
         unlock();
         return;
     }
-
     lock();
-    entry->state = TX_STATE_FAILED_RADIO;
-    entry->error = TX_ERROR_RADIO_BUSY;
-    set_status(entry, state_label(entry->state, entry->error));
-    entry->state = TX_STATE_RETRY_BACKOFF;
-    entry->next_action_tick = xTaskGetTickCount() + pdMS_TO_TICKS(TX_ACK_TIMEOUT_MS);
+    entry->attempts++;
+    entry->state = TX_STATE_WAITING_RADIO;
     unlock();
 }
 
@@ -224,6 +279,11 @@ static void scheduler_task(void *parameter)
     while (true) {
         TickType_t now = xTaskGetTickCount();
 
+        lora_tx_result_t radio_result;
+        while (lora_tx_result_receive(&radio_result, 0)) {
+            handle_radio_result(&radio_result);
+        }
+
         lock();
         for (size_t i = 0; i < MAX_MESSAGES; i++) {
             tx_entry_t *entry = &tx_entries[i];
@@ -241,6 +301,7 @@ static void scheduler_task(void *parameter)
                     entry->error = TX_ERROR_ACK_TIMEOUT;
                     finalize_failure(entry);
                 } else {
+                    entry->attempts++;
                     entry->state = TX_STATE_RETRY_BACKOFF;
                     entry->next_action_tick = now + pdMS_TO_TICKS(5000 * entry->attempts);
                 }

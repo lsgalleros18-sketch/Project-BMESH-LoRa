@@ -373,7 +373,6 @@ void app_runtime_start(void)
     factory_reset_init();
     node_config_load();
     message_store_load_messages_from_nvs(node_id);
-    (void)message_store_init();
     forward_worker_init();
     lora_radio_init();
     storage_init(&littlefs_mounted);

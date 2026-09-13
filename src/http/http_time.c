@@ -4,6 +4,7 @@
 
 #include "bems_common.h"
 #include "http/http_auth.h"
+#include "network/http_request.h"
 #include "utils/string_utils.h"
 
 esp_err_t http_time_handler(httpd_req_t *request)
@@ -12,19 +13,14 @@ esp_err_t http_time_handler(httpd_req_t *request)
     char body[128] = {0};
     char epoch_value[FIELD_LEN] = {0};
     uint32_t epoch = 0;
-    int received = 0;
     esp_err_t session_result = http_auth_require_session(request);
 
     if (session_result != ESP_OK) {
         return session_result;
     }
 
-    while (received < request->content_len && received < (int)sizeof(body) - 1) {
-        int ret = httpd_req_recv(request, body + received, MIN(request->content_len - received, (int)sizeof(body) - 1 - received));
-        if (ret <= 0) {
-            return ESP_FAIL;
-        }
-        received += ret;
+    if (http_read_body_checked(request, body, sizeof(body)) != ESP_OK) {
+        return ESP_FAIL;
     }
 
     form_value(body, "epoch", epoch_value, sizeof(epoch_value));

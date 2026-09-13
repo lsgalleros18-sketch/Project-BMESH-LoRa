@@ -10,6 +10,7 @@
 
 #include "bems_common.h"
 #include "bems_crypto.h"
+#include "network/http_request.h"
 #include "utils/string_utils.h"
 
 #define SESSION_COOKIE_NAME "BMESH_SESSION"
@@ -95,7 +96,6 @@ esp_err_t http_auth_login_handler(httpd_req_t *request)
     char body[96] = {0};
     char pin[FIELD_LEN] = {0};
     char cookie[64];
-    int received = 0;
     TickType_t now = xTaskGetTickCount();
     uint8_t backoff_seconds;
 
@@ -110,12 +110,8 @@ esp_err_t http_auth_login_handler(httpd_req_t *request)
     }
     last_login_attempt_tick = now;
 
-    while (received < request->content_len && received < (int)sizeof(body) - 1) {
-        int ret = httpd_req_recv(request, body + received, MIN(request->content_len - received, (int)sizeof(body) - 1 - received));
-        if (ret <= 0) {
-            return ESP_FAIL;
-        }
-        received += ret;
+    if (http_read_body_checked(request, body, sizeof(body)) != ESP_OK) {
+        return ESP_FAIL;
     }
 
     form_value(body, "pin", pin, sizeof(pin));

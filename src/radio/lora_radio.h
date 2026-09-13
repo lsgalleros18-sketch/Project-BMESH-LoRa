@@ -7,6 +7,7 @@
 
 #include "esp_err.h"
 #include "driver/spi_master.h"
+#include "freertos/FreeRTOS.h"
 
 #define LORA_MISO_GPIO 5
 #define LORA_DIO0_GPIO 16
@@ -61,6 +62,38 @@ typedef enum {
     LORA_TX_PRIORITY_HIGH = 2,
 } lora_tx_priority_t;
 
+typedef struct {
+    uint32_t request_id;
+    uint32_t message_id;
+    uint8_t packet[LORA_MAX_PAYLOAD];
+    size_t packet_len;
+    lora_tx_priority_t priority;
+    uint32_t submitted_at_ms;
+    bool require_result;
+} lora_tx_request_t;
+
+typedef enum {
+    LORA_TX_RESULT_SUCCESS = 0,
+    LORA_TX_RESULT_QUEUE_FULL,
+    LORA_TX_RESULT_CHANNEL_BUSY,
+    LORA_TX_RESULT_TIMEOUT,
+    LORA_TX_RESULT_SPI_ERROR,
+    LORA_TX_RESULT_RADIO_FAULT,
+    LORA_TX_RESULT_ABORTED,
+    LORA_TX_RESULT_UNKNOWN,
+} lora_tx_result_code_t;
+
+typedef struct {
+    uint32_t request_id;
+    uint32_t message_id;
+    lora_tx_result_code_t result;
+    uint32_t started_at_ms;
+    uint32_t completed_at_ms;
+    uint32_t airtime_ms;
+    int16_t rssi;
+    int8_t snr;
+} lora_tx_result_t;
+
 typedef enum {
     RADIO_STATE_UNINITIALIZED = 0,
     RADIO_STATE_INITIALIZING,
@@ -86,6 +119,8 @@ typedef enum {
 bool lora_transmit(const char *packet);
 bool lora_transmit_bytes(const uint8_t *packet, size_t packet_len);
 bool lora_radio_submit(const uint8_t *packet, size_t length, lora_tx_priority_t priority);
+esp_err_t lora_tx_submit(const lora_tx_request_t *request);
+bool lora_tx_result_receive(lora_tx_result_t *result, TickType_t timeout_ticks);
 typedef void (*lora_rx_callback_t)(void *parameter);
 void lora_handle_rx_packet(const uint8_t *payload, size_t length, int rssi, int snr);
 
