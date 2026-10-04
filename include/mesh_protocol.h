@@ -16,6 +16,7 @@ typedef struct {
     bool valid;
     uint32_t id;
     int hops;
+    int path_hops;
     bool broadcast_destination;
     char source[FIELD_LEN];
     char destination[FIELD_LEN];
@@ -80,4 +81,4 @@ bool mesh_packet_consume_hop(mesh_packet_t *packet);
 // Remembers a packet as seen
 void remember_packet(const char *source, uint32_t id);
 void deduplication_debug_reset_for_test(void);
-void deduplication_debug_set_seen_tick_for_test(const char *source, uint32_t id, TickType_t seen_tick);
+void deduplication_debug_set_seen_tick_for_test(const char *source, uint32_t id, uint32_t seen_ms);

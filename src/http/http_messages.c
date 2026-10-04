@@ -15,7 +15,7 @@ esp_err_t http_messages_handler(httpd_req_t *request)
     const http_messages_context_t *context = request->user_ctx;
     esp_err_t session_result = context->require_session(request);
     esp_err_t chunk_result;
-    const emergency_message_t *snapshot;
+    emergency_message_t snapshot[MAX_MESSAGES];
 
     if (session_result != ESP_OK) {
         ESP_LOGW(TAG, "/api/messages rejected: %s", esp_err_to_name(session_result));
@@ -29,7 +29,7 @@ esp_err_t http_messages_handler(httpd_req_t *request)
     if (chunk_result != ESP_OK) {
         return chunk_result;
     }
-    snapshot = message_store_snapshot(&snapshot_count);
+    snapshot_count = message_store_copy_all(snapshot, MAX_MESSAGES);
     ESP_LOGI(TAG, "messages_handler: message_count=%u", (unsigned int)snapshot_count);
     ESP_LOGI(TAG, "messages_handler: snapshot_count=%u after copy", (unsigned int)snapshot_count);
     for (size_t i = 0; i < snapshot_count; i++) {

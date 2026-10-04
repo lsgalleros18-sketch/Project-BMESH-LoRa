@@ -85,22 +85,18 @@ static int find_source_index(const char *source)
 
 static int allocate_source_index(uint32_t now_ticks)
 {
-    int free_index = -1;
     int oldest_index = -1;
 
     for (size_t i = 0; i < REPLAY_SOURCE_TABLE_SIZE; i++) {
         if (!replay_sources[i].active) {
             return (int)i;
         }
-        if (free_index < 0) {
-            free_index = (int)i;
-        }
         if (oldest_index < 0 || (uint32_t)(now_ticks - replay_sources[i].last_activity_ticks) > (uint32_t)(now_ticks - replay_sources[oldest_index].last_activity_ticks)) {
             oldest_index = (int)i;
         }
     }
 
-    return oldest_index >= 0 ? oldest_index : free_index;
+    return oldest_index;
 }
 
 static bool accept_new_sequence(replay_source_state_t *state, uint32_t sequence, uint32_t now_ticks)
@@ -156,6 +152,7 @@ bool replay_protection_accept(const char *source, uint32_t sequence, uint32_t no
     }
 
     ensure_mutex();
+    if (replay_mutex == NULL) return false;
     lock();
 
     index = find_source_index(source);
@@ -193,6 +190,7 @@ bool replay_protection_accept(const char *source, uint32_t sequence, uint32_t no
 void replay_protection_reset(void)
 {
     ensure_mutex();
+    if (replay_mutex == NULL) return;
     lock();
     for (size_t i = 0; i < REPLAY_SOURCE_TABLE_SIZE; i++) {
         reset_entry(&replay_sources[i]);

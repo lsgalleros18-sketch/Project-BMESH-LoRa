@@ -14,12 +14,13 @@ enum {
     V2_MAGIC = 0xB2,
     V2_FLAG_NEXT_HOP = 0x01u,
     V2_FLAG_LOCATION = 0x02u,
+    V2_FLAG_PATH_HOPS = 0x04u,
     V2_BROADCAST_ID = 0xFFu,
 };
 
 typedef struct {
     uint32_t id;
-    TickType_t seen_tick;
+    uint32_t seen_ms;
     char source[FIELD_LEN];
     int16_t next_hash;
     int16_t next_expiry;
@@ -146,26 +147,6 @@ static void remove_from_hash(int16_t index)
     }
 }
 
-static void remove_from_expiry(int16_t index)
-{
-    int16_t *cursor;
-    uint8_t bucket;
-
-    if (index < 0 || index >= MAX_SEEN_PACKETS) {
-        return;
-    }
-
-    bucket = seen_packets[index].expiry_bucket;
-    cursor = &expiry_wheel[bucket];
-    while (*cursor != -1) {
-        if (*cursor == index) {
-            *cursor = seen_packets[index].next_expiry;
-            break;
-        }
-        cursor = &seen_packets[*cursor].next_expiry;
-    }
-}
-
 static void dedup_init_storage(void)
 {
     if (dedup_initialized) {
@@ -188,35 +169,56 @@ static void dedup_init_storage(void)
         seen_packets[i].next_hash = i + 1;
     }
     seen_packets[MAX_SEEN_PACKETS - 1].next_hash = -1;
-    last_expiry_bucket = 0;
+    uint32_t now_ms = dedup_now_ms();
+    last_expiry_bucket = now_ms < SEEN_PACKET_TTL_MS ? 0 : (now_ms - SEEN_PACKET_TTL_MS) / DEDUP_EXPIRY_BUCKET_MS;
     dedup_initialized = true;
 }
 
 static void expire_current_and_prior_buckets(uint32_t now_ms)
 {
-    uint32_t current_bucket = now_ms / DEDUP_EXPIRY_BUCKET_MS;
-    uint32_t bucket_span = current_bucket - last_expiry_bucket;
+    uint32_t expiration_bucket;
 
-    if (bucket_span > DEDUP_EXPIRY_BUCKET_COUNT) {
-        bucket_span = DEDUP_EXPIRY_BUCKET_COUNT;
+    if (now_ms < SEEN_PACKET_TTL_MS) {
+        return;
     }
+    expiration_bucket = (now_ms - SEEN_PACKET_TTL_MS) / DEDUP_EXPIRY_BUCKET_MS;
 
-    for (uint32_t step = 0; step < bucket_span; step++) {
+    uint32_t bucket_span = expiration_bucket - last_expiry_bucket;
+    if ((int32_t)bucket_span < 0) return;
+    uint32_t steps = bucket_span >= DEDUP_EXPIRY_BUCKET_COUNT ? DEDUP_EXPIRY_BUCKET_COUNT : bucket_span + 1u;
+    if (bucket_span >= DEDUP_EXPIRY_BUCKET_COUNT) last_expiry_bucket = expiration_bucket - DEDUP_EXPIRY_BUCKET_COUNT + 1u;
+    for (uint32_t step = 0; step < steps; step++) {
+        int16_t retained_head = -1;
+        int16_t retained_tail = -1;
+        bool current_bucket_has_unexpired_entry = false;
         uint32_t wheel_index = last_expiry_bucket % DEDUP_EXPIRY_BUCKET_COUNT;
         int16_t index = expiry_wheel[wheel_index];
+        if ((int32_t)(expiration_bucket - last_expiry_bucket) < 0) break;
+        expiry_wheel[wheel_index] = -1;
         while (index != -1) {
             int16_t next = seen_packets[index].next_expiry;
             if (seen_packets[index].active &&
-                (now_ms - (uint32_t)seen_packets[index].seen_tick) >= SEEN_PACKET_TTL_MS) {
+                (now_ms - seen_packets[index].seen_ms) >= SEEN_PACKET_TTL_MS) {
                 remove_from_hash(index);
-                remove_from_expiry(index);
                 seen_packets[index].active = false;
                 seen_packets[index].next_hash = free_list_head;
                 free_list_head = index;
+            } else if (seen_packets[index].active) {
+                uint32_t entry_bucket = seen_packets[index].seen_ms / DEDUP_EXPIRY_BUCKET_MS;
+                if (retained_head == -1) retained_head = index;
+                else seen_packets[retained_tail].next_expiry = index;
+                retained_tail = index;
+                if (entry_bucket <= expiration_bucket) {
+                    current_bucket_has_unexpired_entry = true;
+                }
             }
             index = next;
         }
-        expiry_wheel[wheel_index] = -1;
+        if (retained_tail != -1) seen_packets[retained_tail].next_expiry = -1;
+        expiry_wheel[wheel_index] = retained_head;
+        if (current_bucket_has_unexpired_entry) {
+            break;
+        }
         last_expiry_bucket++;
     }
 }
@@ -233,14 +235,14 @@ static int16_t alloc_entry(void)
     return index;
 }
 
-static void insert_entry(int16_t index, const char *source, uint32_t id, TickType_t now_ticks)
+static void insert_entry(int16_t index, const char *source, uint32_t id, uint32_t now_ms)
 {
     int bucket = seen_bucket_index(source, id);
-    uint32_t bucket_id = (uint32_t)now_ticks / DEDUP_EXPIRY_BUCKET_MS;
+    uint32_t bucket_id = now_ms / DEDUP_EXPIRY_BUCKET_MS;
     uint8_t expiry_bucket = (uint8_t)(bucket_id % DEDUP_EXPIRY_BUCKET_COUNT);
 
     seen_packets[index].id = id;
-    seen_packets[index].seen_tick = now_ticks;
+    seen_packets[index].seen_ms = now_ms;
     copy_field(seen_packets[index].source, sizeof(seen_packets[index].source), source);
     seen_packets[index].expiry_bucket = expiry_bucket;
     seen_packets[index].active = true;
@@ -480,6 +482,7 @@ bool parse_mesh_packet_v2(const uint8_t *packet, size_t packet_len, mesh_packet_
     uint8_t relay_len = 0;
     uint8_t next_hop_len = 0;
     uint8_t hops = 0;
+    uint8_t path_hops = 0;
     uint8_t location_len = 0;
     uint8_t payload_len = 0;
 
@@ -514,11 +517,16 @@ bool parse_mesh_packet_v2(const uint8_t *packet, size_t packet_len, mesh_packet_
         !read_u8(packet, packet_len, &offset, &relay_len) ||
         relay_len == 0 ||
         !read_bytes(packet, packet_len, &offset, (uint8_t *)parsed->relay, sizeof(parsed->relay), relay_len) ||
-        !read_u8(packet, packet_len, &offset, &hops)) {
+        !read_u8(packet, packet_len, &offset, &hops) ||
+        ((flags & V2_FLAG_PATH_HOPS) != 0u && !read_u8(packet, packet_len, &offset, &path_hops))) {
         return false;
     }
 
     parsed->hops = (int)hops;
+    parsed->path_hops = 1;
+    if ((flags & V2_FLAG_PATH_HOPS) != 0u) {
+        parsed->path_hops = (int)path_hops;
+    }
     if ((flags & V2_FLAG_NEXT_HOP) != 0u) {
         if (!read_u8(packet, packet_len, &offset, &next_hop_len) ||
             next_hop_len == 0 ||
@@ -608,6 +616,7 @@ bool build_forward_packet_v2(const mesh_packet_t *parsed, uint8_t *packet, size_
         }
         flags |= V2_FLAG_NEXT_HOP;
     }
+    flags |= V2_FLAG_PATH_HOPS;
     if (parsed->location_raw[0] != '\0' || parsed->location.sitio[0] != '\0' || parsed->location.barangay[0] != '\0' || parsed->location.municipality[0] != '\0') {
         size_t encoded_len = strnlen(encoded_location, sizeof(encoded_location));
         if (encoded_len > 0 && encoded_len < 255) {
@@ -616,7 +625,7 @@ bool build_forward_packet_v2(const mesh_packet_t *parsed, uint8_t *packet, size_
         }
     }
 
-    required = 2 + 1 + 1 + 1 + 1 + source_len + 1 + (destination_len == V2_BROADCAST_ID ? 0 : destination_len) + 4 + 1 + relay_len + 1 + (flags & V2_FLAG_NEXT_HOP ? 1 + next_hop_len : 0) + (flags & V2_FLAG_LOCATION ? 1 + location_len : 0) + 1 + payload_len;
+    required = 2 + 1 + 1 + 1 + 1 + source_len + 1 + (destination_len == V2_BROADCAST_ID ? 0 : destination_len) + 4 + 1 + relay_len + 1 + ((flags & V2_FLAG_PATH_HOPS) ? 1 : 0) + (flags & V2_FLAG_NEXT_HOP ? 1 + next_hop_len : 0) + (flags & V2_FLAG_LOCATION ? 1 + location_len : 0) + 1 + payload_len;
     if (required > BEMS_MAX_PLAINTEXT || packet_size < required) {
         return false;
     }
@@ -633,7 +642,8 @@ bool build_forward_packet_v2(const mesh_packet_t *parsed, uint8_t *packet, size_
         !write_u32(packet, packet_size, &offset, parsed->id) ||
         !write_u8(packet, packet_size, &offset, relay_len) ||
         !write_bytes(packet, packet_size, &offset, (const uint8_t *)parsed->relay, relay_len) ||
-        !write_u8(packet, packet_size, &offset, parsed->hops < 0 ? 0 : (uint8_t)parsed->hops)) {
+        !write_u8(packet, packet_size, &offset, parsed->hops < 0 ? 0 : (uint8_t)parsed->hops) ||
+        !write_u8(packet, packet_size, &offset, parsed->path_hops < 0 ? 0 : (uint8_t)parsed->path_hops)) {
         return false;
     }
 
@@ -671,7 +681,7 @@ bool mesh_packet_consume_hop(mesh_packet_t *packet)
     }
 
     packet->hops--;
-    return packet->hops > 0;
+    return true;
 }
 
 bool packet_seen(const char *source, uint32_t id)
@@ -701,7 +711,6 @@ bool packet_seen(const char *source, uint32_t id)
 void remember_packet(const char *source, uint32_t id)
 {
     uint32_t now_ms = dedup_now_ms();
-    TickType_t now_ticks = xTaskGetTickCount();
     int bucket_index;
     int16_t index;
     int16_t slot_index;
@@ -726,7 +735,7 @@ void remember_packet(const char *source, uint32_t id)
         return;
     }
 
-    insert_entry(slot_index, source, id, now_ticks);
+    insert_entry(slot_index, source, id, now_ms);
     mesh_unlock();
 }
 
@@ -747,11 +756,12 @@ void deduplication_debug_reset_for_test(void)
         seen_packets[i].next_hash = i + 1;
     }
     seen_packets[MAX_SEEN_PACKETS - 1].next_hash = -1;
-    last_expiry_bucket = 0;
+    uint32_t now_ms = dedup_now_ms();
+    last_expiry_bucket = now_ms < SEEN_PACKET_TTL_MS ? 0 : (now_ms - SEEN_PACKET_TTL_MS) / DEDUP_EXPIRY_BUCKET_MS;
     mesh_unlock();
 }
 
-void deduplication_debug_set_seen_tick_for_test(const char *source, uint32_t id, TickType_t seen_tick)
+void deduplication_debug_set_seen_tick_for_test(const char *source, uint32_t id, uint32_t seen_ms)
 {
     int bucket_index;
     int16_t index;
@@ -763,7 +773,7 @@ void deduplication_debug_set_seen_tick_for_test(const char *source, uint32_t id,
     index = hash_buckets[bucket_index];
     while (index != -1) {
         if (seen_packets[index].active && seen_entry_matches(&seen_packets[index], source, id)) {
-            seen_packets[index].seen_tick = seen_tick;
+            seen_packets[index].seen_ms = seen_ms;
             break;
         }
         index = seen_packets[index].next_hash;

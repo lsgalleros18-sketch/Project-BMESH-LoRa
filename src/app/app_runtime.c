@@ -49,6 +49,7 @@
 #define SITIO_LEN 24
 #define BARANGAY_LEN 24
 #define MUNICIPALITY_LEN 24
+#define DEFAULT_HOPS 3
 
 static const char *TAG = "barangay_mesh";
 static char node_id[FIELD_LEN];
@@ -71,7 +72,7 @@ bool app_runtime_should_forward_packet(const mesh_packet_t *packet, const route_
     if (packet->hops <= 0) {
         return false;
     }
-    if (mesh_control_is_control_packet_type(packet->type)) {
+    if (mesh_control_is_control_packet_type(packet->type) && strcmp(packet->type, "ACK") != 0) {
         return false;
     }
     if (strcmp(packet->destination, local_node_id) == 0) {
@@ -112,10 +113,6 @@ static void store_received_packet(const char *packet, const mesh_packet_t *parse
 {
     emergency_message_t message = {0};
     int storage_slot = -1;
-    if (!message_store_allocate(&storage_slot)) {
-        ESP_LOGW(TAG, "Dropping received packet because message table is full of active entries");
-        return;
-    }
 
     if (parsed->valid) {
         message.id = parsed->id;
@@ -146,13 +143,18 @@ static void store_received_packet(const char *packet, const mesh_packet_t *parse
     snprintf(message.packet, sizeof(message.packet), "RSSI=%d SNR=%d | %.*s", rssi, snr, 250, packet);
     if (parsed->valid) {
         roster_touch(parsed->source, &parsed->location, message.stored_epoch, rssi, snr);
-        route_table_learn(parsed->source, parsed->relay, parsed->hops, rssi);
     }
     if (parsed->valid) {
         bool is_relevant = (strcmp(parsed->source, node_id) == 0) ||
                           (strcmp(parsed->destination, node_id) == 0);
         if (is_relevant) {
-            (void)message_store_write(storage_slot, &message);
+            if (!message_store_allocate(&storage_slot)) {
+                ESP_LOGW(TAG, "Dropping received packet because message table is full of required entries");
+                return;
+            }
+            if (message_store_write(storage_slot, &message) != ESP_OK) {
+                ESP_LOGW(TAG, "Failed to persist received message %s/%lu", parsed->source, (unsigned long)parsed->id);
+            }
         }
     }
 }
@@ -185,8 +187,9 @@ void lora_handle_rx_packet(const uint8_t *payload, size_t length, int rssi, int 
 
         if (!from_self && replay_allowed) {
             remember_packet(parsed.source, parsed.id);
+            route_table_learn(parsed.source, parsed.relay, parsed.path_hops, rssi);
             if (is_sync_req) {
-                mesh_control_send_sync_responses(&parsed);
+                mesh_control_enqueue_sync_response(&parsed);
                 return;
             }
             if (is_sync_resp) {
@@ -228,7 +231,11 @@ void lora_handle_rx_packet(const uint8_t *payload, size_t length, int rssi, int 
             if (!is_broadcast && !is_for_me && !mesh_control_is_control_packet_type(parsed.type)) {
                 route_known = route_table_get_best(parsed.destination, &route);
             }
-            if (parsed.hops > 0 && !is_for_me && !mesh_control_is_control_packet_type(parsed.type)) {
+            if (parsed.hops > 0 && !is_for_me &&
+                (!mesh_control_is_control_packet_type(parsed.type) || is_ack)) {
+                if (route_known && parsed.next_hop[0] == '\0') {
+                    copy_field(parsed.next_hop, sizeof(parsed.next_hop), route.next_hop);
+                }
                 forward_job_t job = {
                     .packet = parsed,
                     .rssi = rssi,
@@ -268,6 +275,7 @@ static void queue_message(const char *destination, const char *type, const char 
     copy_field(message.type, sizeof(message.type), type);
     copy_field(message.priority, sizeof(message.priority), priority);
     copy_field(message.payload, sizeof(message.payload), payload);
+    message.hops = DEFAULT_HOPS;
     copy_field(message.status, sizeof(message.status), "PENDING");
     message.stored_epoch = mesh_control_is_time_synced() ? mesh_control_current_epoch_seconds() : 0;
     compute_thread_key(message.thread_key, sizeof(message.thread_key), message.source, message.destination);
@@ -280,12 +288,14 @@ static void queue_message(const char *destination, const char *type, const char 
         ESP_LOGW(TAG, "Message queue full; unable to enqueue %s -> %s", node_id, destination);
         return;
     }
-    (void)message_store_write(storage_slot, &message);
+    if (message_store_write(storage_slot, &message) != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to persist outgoing message %s/%lu", message.source, (unsigned long)message.id);
+        return;
+    }
 
     if (!tx_scheduler_submit(&message, storage_slot)) {
         copy_field(message.status, sizeof(message.status), "FAILED");
         (void)message_store_update(storage_slot, &message);
-        message_store_update_status(message.id, message.source, "FAILED");
         ESP_LOGW(TAG, "TX queue full; unable to enqueue %s -> %s", node_id, destination);
         return;
     }
@@ -312,6 +322,11 @@ static void start_http_server(void)
         .node_role = node_config_get()->node_role,
         .location = node_config_get()->location.barangay,
         .ssid = ap_ssid,
+        .storage_status = storage_get_state_name(),
+        .radio_state = lora_radio_get_state() == RADIO_STATE_RX ? "RX" :
+                       lora_radio_get_state() == RADIO_STATE_TX ? "TX" :
+                       lora_radio_get_state() == RADIO_STATE_FAULT ? "FAULT" :
+                       lora_radio_get_state() == RADIO_STATE_RECOVERING ? "RECOVERING" : "INITIALIZING",
         .configured = &node_config_get()->configured,
         .duplicate_node_id_warning = &duplicate_node_id_warning,
         .time_synced = mesh_control_time_synced_ref(),
@@ -331,12 +346,10 @@ static void start_http_server(void)
         .queue_message = queue_message,
     };
     setup_context = (http_setup_context_t){
-        .node_id = node_id,
-        .ap_password = node_config_get_ap_password(),
-        .default_web_pin = node_config_get_web_pin(),
-        .default_network_key = node_config_get_network_key(),
         .copy_node_id = node_config_copy_node_id,
         .save_node_config = node_config_save,
+        .require_session = http_auth_require_session,
+        .configured = &node_config_get()->configured,
     };
 
     http_server_start(&messages_context,
@@ -372,7 +385,14 @@ void app_runtime_start(void)
     status_led_init();
     factory_reset_init();
     node_config_load();
+    if (node_config_get_node_id()[0] != '\0') {
+        copy_field(node_id, sizeof(node_id), node_config_get_node_id());
+    }
+    node_config_set_identity(node_id);
+    snprintf(ap_ssid, sizeof(ap_ssid), "BarangayMesh-%.*s", (int)(sizeof(ap_ssid) - sizeof("BarangayMesh-")), node_id);
+    ESP_ERROR_CHECK(message_store_init());
     message_store_load_messages_from_nvs(node_id);
+    (void)tx_scheduler_restore_pending();
     forward_worker_init();
     lora_radio_init();
     storage_init(&littlefs_mounted);
@@ -381,6 +401,9 @@ void app_runtime_start(void)
     mesh_retry_init();
     xTaskCreate(time_sync_task, "time_sync_task", 3072, NULL, 2, NULL);
     wifi_ap_init(ap_ssid, node_config_get()->ap_password);
+    if (!node_config_get()->configured) {
+        ESP_LOGW(TAG, "First-boot provisioning AP password: %s", node_config_get_ap_password());
+    }
     start_http_server();
     dns_server_init();
 

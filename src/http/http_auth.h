@@ -18,3 +18,4 @@ bool http_auth_request_has_session(httpd_req_t *request);
 esp_err_t http_auth_require_session(httpd_req_t *request);
 esp_err_t http_auth_send_redirect(httpd_req_t *request, const char *location);
 esp_err_t http_auth_login_handler(httpd_req_t *request);
+esp_err_t http_auth_logout_handler(httpd_req_t *request);

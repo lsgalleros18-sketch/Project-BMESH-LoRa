@@ -7,7 +7,6 @@
 #include "freertos/semphr.h"
 #include "nvs.h"
 
-#include "storage/storage.h"
 #include "utils/string_utils.h"
 
 static const char *MESSAGE_NAMESPACE = "bems_config";
@@ -15,8 +14,18 @@ static const uint32_t MESSAGE_STORE_MAGIC_VALUE = MESSAGE_STORE_MAGIC;
 static StaticSemaphore_t message_mutex_buffer;
 static SemaphoreHandle_t message_mutex;
 static persisted_message_t persisted_slots[MAX_MESSAGES];
-static emergency_message_t message_snapshot_buffer[MAX_MESSAGES];
+static bool reserved_slots[MAX_MESSAGES];
 static size_t active_count;
+
+static message_slot_state_t state_for_message(const emergency_message_t *message)
+{
+    if (message == NULL) return MESSAGE_SLOT_EMPTY;
+    if (strcmp(message->direction, "RX") == 0) return MESSAGE_SLOT_RECEIVED;
+    if (strcmp(message->status, "ACKED") == 0) return MESSAGE_SLOT_ACKED;
+    if (strcmp(message->status, "FAILED") == 0 || strncmp(message->status, "FAILED_", 7) == 0) return MESSAGE_SLOT_FAILED;
+    if (strcmp(message->status, "SENT") == 0) return MESSAGE_SLOT_SENT;
+    return MESSAGE_SLOT_QUEUED;
+}
 
 static void lock(void)
 {
@@ -52,7 +61,7 @@ static bool persisted_record_valid(const persisted_message_t *record)
     if (record->magic != MESSAGE_STORE_MAGIC_VALUE || record->version != MESSAGE_STORE_VERSION) {
         return false;
     }
-    if (record->state > MESSAGE_SLOT_FAILED) {
+    if (record->state > MESSAGE_SLOT_RECEIVED) {
         return false;
     }
     if (record->length != sizeof(record->message)) {
@@ -77,13 +86,6 @@ static void clear_slot(size_t slot)
 {
     if (slot < MAX_MESSAGES) {
         memset(&persisted_slots[slot], 0, sizeof(persisted_slots[slot]));
-    }
-}
-
-static void sync_snapshot_from_slot(size_t slot)
-{
-    if (slot < MAX_MESSAGES && persisted_slots[slot].state != MESSAGE_SLOT_EMPTY) {
-        message_snapshot_buffer[slot] = persisted_slots[slot].message;
     }
 }
 
@@ -190,7 +192,7 @@ void message_store_load_messages_from_nvs(const char *node_id)
 
     lock();
     memset(persisted_slots, 0, sizeof(persisted_slots));
-    memset(message_snapshot_buffer, 0, sizeof(message_snapshot_buffer));
+    memset(reserved_slots, 0, sizeof(reserved_slots));
     active_count = 0;
 
     result = nvs_open(MESSAGE_NAMESPACE, NVS_READONLY, &handle);
@@ -215,7 +217,6 @@ void message_store_load_messages_from_nvs(const char *node_id)
             clear_slot(slot);
             continue;
         }
-        sync_snapshot_from_slot(slot);
     }
 
     recalculate_active_count();
@@ -230,7 +231,6 @@ esp_err_t message_store_init(void)
             return ESP_FAIL;
         }
     }
-    message_store_load_messages_from_nvs(NULL);
     return ESP_OK;
 }
 
@@ -242,11 +242,31 @@ bool message_store_allocate(int *slot)
 
     lock();
     for (int i = 0; i < MAX_MESSAGES; i++) {
-        if (persisted_slots[i].state == MESSAGE_SLOT_EMPTY) {
+        if (persisted_slots[i].state == MESSAGE_SLOT_EMPTY && !reserved_slots[i]) {
             *slot = i;
+            reserved_slots[i] = true;
             unlock();
             return true;
         }
+    }
+    int oldest_slot = -1;
+    uint32_t oldest_epoch = UINT32_MAX;
+    for (int i = 0; i < MAX_MESSAGES; i++) {
+        message_slot_state_t state = state_for_message(&persisted_slots[i].message);
+        if (reserved_slots[i] || (state != MESSAGE_SLOT_ACKED && state != MESSAGE_SLOT_FAILED && state != MESSAGE_SLOT_RECEIVED)) {
+            continue;
+        }
+        uint32_t epoch = persisted_slots[i].message.stored_epoch;
+        if (oldest_slot < 0 || (epoch != 0 && (oldest_epoch == 0 || epoch < oldest_epoch))) {
+            oldest_slot = i;
+            oldest_epoch = epoch;
+        }
+    }
+    if (oldest_slot >= 0 && delete_record_locked(oldest_slot) == ESP_OK) {
+        reserved_slots[oldest_slot] = true;
+        *slot = oldest_slot;
+        unlock();
+        return true;
     }
     unlock();
     return false;
@@ -285,32 +305,29 @@ static esp_err_t write_record_locked(int slot, const emergency_message_t *messag
     }
     if (result == ESP_OK) {
         persisted_slots[slot] = record;
-        sync_snapshot_from_slot((size_t)slot);
         recalculate_active_count();
     }
     nvs_close(handle);
     return result;
 }
 
-static esp_err_t write_record(int slot, const emergency_message_t *message, message_slot_state_t state)
-{
-    esp_err_t result;
-
-    lock();
-    result = write_record_locked(slot, message, state);
-    unlock();
-
-    return result;
-}
-
 esp_err_t message_store_write(int slot, const emergency_message_t *message)
 {
-    return write_record(slot, message, MESSAGE_SLOT_QUEUED);
+    esp_err_t result;
+    if (message == NULL || slot < 0 || slot >= MAX_MESSAGES) return ESP_ERR_INVALID_ARG;
+    lock();
+    if (!reserved_slots[slot]) {
+        unlock();
+        return ESP_ERR_INVALID_STATE;
+    }
+    result = write_record_locked(slot, message, state_for_message(message));
+    reserved_slots[slot] = false;
+    unlock();
+    return result;
 }
 
 esp_err_t message_store_update(int slot, const emergency_message_t *message)
 {
-    message_slot_state_t state = MESSAGE_SLOT_QUEUED;
     esp_err_t result;
 
     if (message == NULL || slot < 0 || slot >= MAX_MESSAGES) {
@@ -318,10 +335,14 @@ esp_err_t message_store_update(int slot, const emergency_message_t *message)
     }
 
     lock();
-    if (persisted_slots[slot].state != MESSAGE_SLOT_EMPTY) {
-        state = (message_slot_state_t)persisted_slots[slot].state;
+    if (reserved_slots[slot] && persisted_slots[slot].state == MESSAGE_SLOT_EMPTY) {
+        result = write_record_locked(slot, message, state_for_message(message));
+        reserved_slots[slot] = false;
+    } else if (persisted_slots[slot].state != MESSAGE_SLOT_EMPTY) {
+        result = write_record_locked(slot, message, state_for_message(message));
+    } else {
+        result = ESP_ERR_INVALID_STATE;
     }
-    result = write_record_locked(slot, message, state);
     unlock();
     return result;
 }
@@ -335,7 +356,12 @@ esp_err_t message_store_delete(int slot)
     }
 
     lock();
-    result = delete_record_locked(slot);
+    if (reserved_slots[slot] && persisted_slots[slot].state == MESSAGE_SLOT_EMPTY) {
+        reserved_slots[slot] = false;
+        result = ESP_OK;
+    } else {
+        result = delete_record_locked(slot);
+    }
     unlock();
     return result;
 }
@@ -416,49 +442,6 @@ bool message_store_remove(uint32_t id, const char *source)
     return result == ESP_OK;
 }
 
-emergency_message_t *message_store_begin_write(int *nvs_slot)
-{
-    static emergency_message_t staging;
-    int slot = -1;
-
-    if (!message_store_allocate(&slot)) {
-        if (nvs_slot != NULL) {
-            *nvs_slot = -1;
-        }
-        return NULL;
-    }
-
-    memset(&staging, 0, sizeof(staging));
-    if (nvs_slot != NULL) {
-        *nvs_slot = slot;
-    }
-    return &staging;
-}
-
-emergency_message_t *message_store_begin_update(uint32_t id, const char *source)
-{
-    static emergency_message_t staging;
-    int slot;
-
-    if (source == NULL || source[0] == '\0') {
-        return NULL;
-    }
-
-    lock();
-    slot = find_message_slot(id, source);
-    if (slot < 0) {
-        unlock();
-        return NULL;
-    }
-    staging = persisted_slots[slot].message;
-    unlock();
-    return &staging;
-}
-
-void message_store_end_update(void)
-{
-}
-
 void message_store_update_status(uint32_t id, const char *source, const char *status)
 {
     int slot;
@@ -478,7 +461,7 @@ void message_store_update_status(uint32_t id, const char *source, const char *st
     copy_field(message.status, sizeof(message.status), status);
     // Keep the lock held across the whole read-modify-write so a concurrent
     // caller cannot modify the same slot between our read and our write.
-    (void)write_record_locked(slot, &message, (message_slot_state_t)persisted_slots[slot].state);
+    (void)write_record_locked(slot, &message, state_for_message(&message));
     unlock();
 }
 
@@ -501,31 +484,32 @@ size_t message_store_copy_all(emergency_message_t *snapshot, size_t max_messages
     return snapshot_count;
 }
 
-const emergency_message_t *message_store_snapshot(size_t *snapshot_count)
-{
-    size_t count = 0;
-
-    lock();
-    for (size_t slot = 0; slot < MAX_MESSAGES && count < MAX_MESSAGES; slot++) {
-        if (persisted_slots[slot].state == MESSAGE_SLOT_EMPTY) {
-            continue;
-        }
-        message_snapshot_buffer[count++] = persisted_slots[slot].message;
-    }
-    unlock();
-
-    if (snapshot_count != NULL) {
-        *snapshot_count = count;
-    }
-    return message_snapshot_buffer;
-}
-
 size_t message_store_count(void)
 {
     size_t count;
 
     lock();
     count = active_count;
+    unlock();
+    return count;
+}
+
+size_t message_store_copy_pending_tx(emergency_message_t *messages, int *slots, size_t capacity)
+{
+    size_t count = 0;
+    if (messages == NULL || slots == NULL || capacity == 0) return 0;
+    lock();
+    for (int slot = 0; slot < MAX_MESSAGES && count < capacity; slot++) {
+        message_slot_state_t state = state_for_message(&persisted_slots[slot].message);
+        if ((state == MESSAGE_SLOT_QUEUED || state == MESSAGE_SLOT_SENT) &&
+            strcmp(persisted_slots[slot].message.direction, "TX") == 0 &&
+            strcmp(persisted_slots[slot].message.status, "ACKED") != 0 &&
+            strncmp(persisted_slots[slot].message.status, "FAILED", 6) != 0) {
+            messages[count] = persisted_slots[slot].message;
+            slots[count] = slot;
+            count++;
+        }
+    }
     unlock();
     return count;
 }

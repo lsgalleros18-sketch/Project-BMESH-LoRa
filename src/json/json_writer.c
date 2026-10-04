@@ -11,18 +11,18 @@ static const char *TAG = "json_writer";
 
 void write_message_json_chunk(httpd_req_t *request, const emergency_message_t *message, bool first)
 {
-    char escaped_direction[FIELD_LEN * 2];
-    char escaped_source[FIELD_LEN * 2];
-    char escaped_destination[FIELD_LEN * 2];
-    char escaped_type[FIELD_LEN * 2];
-    char escaped_priority[FIELD_LEN * 2];
-    char escaped_payload[PAYLOAD_LEN * 2];
-    char escaped_packet[PACKET_LEN * 2];
-    char escaped_thread_key[FIELD_LEN * 2];
-    char escaped_status[FIELD_LEN * 2];
-    char escaped_sitio[SITIO_LEN * 2];
-    char escaped_barangay[BARANGAY_LEN * 2];
-    char escaped_municipality[MUNICIPALITY_LEN * 2];
+    char escaped_direction[FIELD_LEN * 6 + 1];
+    char escaped_source[FIELD_LEN * 6 + 1];
+    char escaped_destination[FIELD_LEN * 6 + 1];
+    char escaped_type[FIELD_LEN * 6 + 1];
+    char escaped_priority[FIELD_LEN * 6 + 1];
+    char escaped_payload[PAYLOAD_LEN * 6 + 1];
+    char escaped_packet[PACKET_LEN * 6 + 1];
+    char escaped_thread_key[FIELD_LEN * 6 + 1];
+    char escaped_status[FIELD_LEN * 6 + 1];
+    char escaped_sitio[SITIO_LEN * 6 + 1];
+    char escaped_barangay[BARANGAY_LEN * 6 + 1];
+    char escaped_municipality[MUNICIPALITY_LEN * 6 + 1];
 
     json_escape_string(escaped_direction, sizeof(escaped_direction), message->direction);
     json_escape_string(escaped_source, sizeof(escaped_source), message->source);

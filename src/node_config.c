@@ -14,8 +14,8 @@
 static node_config_t node_config;
 static char node_id[FIELD_LEN];
 static SemaphoreHandle_t config_mutex;
-static const char *DEFAULT_WEB_PIN = "123456789";
-static const char *DEFAULT_NETWORK_KEY = "CHANGEME1234567";
+static const char *DEFAULT_WEB_PIN = "";
+static const char *DEFAULT_NETWORK_KEY = "";
 
 static void config_lock(void)
 {
@@ -189,7 +189,12 @@ void node_config_load(void)
     ensure_mutex();
     node_config_set_defaults();
 
+    /* Retain the MAC-derived identity if no provisioned value exists. */
+    node_config.node_id[0] = '\0';
+
     if (nvs_open(CONFIG_NAMESPACE, NVS_READWRITE, &handle) != ESP_OK) {
+        /* Give first-boot provisioning a private WPA2 AP without a compiled default. */
+        random_hex_string(node_config.ap_password, sizeof(node_config.ap_password), 8);
         return;
     }
 
@@ -221,6 +226,12 @@ void node_config_load(void)
     nvs_close(handle);
     node_config.configured = configured == 1;
 
+    if (node_config.node_id[0] != '\0') {
+        copy_field(node_id, sizeof(node_id), node_config.node_id);
+    } else {
+        copy_field(node_config.node_id, sizeof(node_config.node_id), node_id);
+    }
+
     if (node_config.web_pin[0] == '\0') {
         copy_field(node_config.web_pin, sizeof(node_config.web_pin), DEFAULT_WEB_PIN);
     }
@@ -229,6 +240,9 @@ void node_config_load(void)
     }
     if (node_config.network_key[0] == '\0') {
         copy_field(node_config.network_key, sizeof(node_config.network_key), DEFAULT_NETWORK_KEY);
+    }
+    if (!node_config.configured && strlen(node_config.ap_password) < 8) {
+        random_hex_string(node_config.ap_password, sizeof(node_config.ap_password), 8);
     }
     if (node_config.duress_pin[0] == '\0') {
         random_hex_string(node_config.duress_pin, sizeof(node_config.duress_pin), 4);
@@ -240,6 +254,11 @@ void node_config_load(void)
         copy_field(node_config.default_priority, sizeof(node_config.default_priority), "NORMAL");
     }
 
+    if (node_config.configured && (strlen(node_config.ap_password) < 8 || strlen(node_config.web_pin) < 8 || strlen(node_config.network_key) < 16 || strcmp(node_config.web_pin, "123456789") == 0 || strcmp(node_config.ap_password, "123456789") == 0 || strcmp(node_config.network_key, "CHANGEME1234567") == 0 || strcmp(node_config.network_key, "CHANGEME12345678") == 0)) {
+        ESP_LOGW("node_config", "Stored credentials are no longer accepted; setup is required");
+        node_config.configured = false;
+    }
+
     if (migrated_location) {
         (void)node_config_save(&node_config);
     }
@@ -248,6 +267,8 @@ void node_config_load(void)
 int node_config_save(const node_config_t *config)
 {
     nvs_handle_t handle;
+    if (config == NULL) return ESP_ERR_INVALID_ARG;
+    if (config->configured && (config->node_id[0] == '\0' || config->web_pin[0] == '\0' || config->network_key[0] == '\0' || config->ap_password[0] == '\0')) return ESP_ERR_INVALID_ARG;
     esp_err_t result = nvs_open(CONFIG_NAMESPACE, NVS_READWRITE, &handle);
 
     if (result != ESP_OK) {
@@ -271,6 +292,13 @@ int node_config_save(const node_config_t *config)
     if (result == ESP_OK) result = nvs_commit(handle);
 
     nvs_close(handle);
+    if (result == ESP_OK) {
+        ensure_mutex();
+        config_lock();
+        node_config = *config;
+        if (config->node_id[0] != '\0') copy_field(node_id, sizeof(node_id), config->node_id);
+        config_unlock();
+    }
     return result;
 }
 

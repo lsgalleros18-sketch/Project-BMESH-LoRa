@@ -65,7 +65,7 @@ typedef enum {
 typedef struct {
     uint32_t request_id;
     uint32_t message_id;
-    uint8_t packet[LORA_MAX_PAYLOAD];
+    uint8_t packet[LORA_MAX_PAYLOAD]; /* plaintext mesh packet; encrypted in the TX task */
     size_t packet_len;
     lora_tx_priority_t priority;
     uint32_t submitted_at_ms;
@@ -118,8 +118,9 @@ typedef enum {
 
 bool lora_transmit(const char *packet);
 bool lora_transmit_bytes(const uint8_t *packet, size_t packet_len);
+bool lora_transmit_bytes_priority(const uint8_t *packet, size_t packet_len, lora_tx_priority_t priority);
 bool lora_radio_submit(const uint8_t *packet, size_t length, lora_tx_priority_t priority);
-esp_err_t lora_tx_submit(const lora_tx_request_t *request);
+esp_err_t lora_tx_submit(const lora_tx_request_t *request); /* queues plaintext; TX task encrypts + HMACs */
 bool lora_tx_result_receive(lora_tx_result_t *result, TickType_t timeout_ticks);
 typedef void (*lora_rx_callback_t)(void *parameter);
 void lora_handle_rx_packet(const uint8_t *payload, size_t length, int rssi, int snr);

@@ -18,9 +18,8 @@ static spi_device_handle_t lora_spi;
 static const char *TAG = "barangay_mesh";
 static radio_state_t lora_state = RADIO_STATE_UNINITIALIZED;
 static SemaphoreHandle_t lora_dio0_semaphore;
-static SemaphoreHandle_t lora_tx_done_semaphore;
 static SemaphoreHandle_t lora_tx_mutex;
-static QueueHandle_t lora_tx_request_queue;
+static QueueHandle_t lora_tx_request_queues[3];
 static QueueHandle_t lora_tx_result_queue;
 static TaskHandle_t lora_tx_task_handle;
 static bool (*lora_read_frame_callback)(uint8_t *payload, size_t *length, int *rssi, int *snr);
@@ -32,7 +31,7 @@ static esp_err_t lora_write_reg(uint8_t address, uint8_t value);
 static esp_err_t lora_write_fifo(const uint8_t *data, size_t length);
 static esp_err_t lora_read_fifo(uint8_t *data, size_t length);
 static bool lora_transmit_raw_frame(const uint8_t *frame, size_t length);
-static bool lora_do_transmit_bytes(const uint8_t *packet, size_t packet_len);
+static bool lora_encrypt_air_frame(const uint8_t *plain_packet, size_t plain_len, uint8_t *air_frame, size_t air_frame_size, size_t *air_len);
 static void lora_tx_task(void *parameter);
 static void lora_enter_fault_internal(const char *reason);
 static esp_err_t lora_radio_apply_defaults(void);
@@ -154,14 +153,9 @@ static bool lora_radio_bring_up(void)
 static void IRAM_ATTR lora_dio0_isr_handler(void *arg)
 {
     BaseType_t high_priority_task_woken = pdFALSE;
-    uint8_t irq_flags = 0;
-    if (lora_read_reg(REG_IRQ_FLAGS, &irq_flags) != ESP_OK) {
-        return;
-    }
-    SemaphoreHandle_t semaphore = (irq_flags & IRQ_TX_DONE_MASK) != 0 ? lora_tx_done_semaphore : lora_dio0_semaphore;
-
-    if (semaphore != NULL) {
-        xSemaphoreGiveFromISR(semaphore, &high_priority_task_woken);
+    (void)arg;
+    if (lora_dio0_semaphore != NULL) {
+        xSemaphoreGiveFromISR(lora_dio0_semaphore, &high_priority_task_woken);
     }
 
     if (high_priority_task_woken == pdTRUE) {
@@ -178,6 +172,20 @@ static void lora_rx_task(void *parameter)
             xSemaphoreTake(lora_dio0_semaphore, portMAX_DELAY);
         }
 
+        uint8_t irq_flags = 0;
+        if (lora_read_reg(REG_IRQ_FLAGS, &irq_flags) != ESP_OK) {
+            continue;
+        }
+        if ((irq_flags & IRQ_TX_DONE_MASK) != 0 && lora_state != RADIO_STATE_RX) {
+            continue;
+        }
+        if ((irq_flags & IRQ_TX_DONE_MASK) != 0) {
+            (void)lora_write_reg(REG_IRQ_FLAGS, IRQ_TX_DONE_MASK);
+            continue;
+        }
+        if ((irq_flags & IRQ_RX_DONE_MASK) == 0) {
+            continue;
+        }
         if (lora_state == RADIO_STATE_RX && lora_read_frame_callback != NULL) {
             size_t length = 0;
             int rssi = 0;
@@ -228,9 +236,9 @@ void lora_radio_init(void)
         return;
     }
 
-    lora_tx_done_semaphore = xSemaphoreCreateBinary();
-    if (lora_tx_done_semaphore == NULL) {
-        ESP_LOGE(TAG, "Failed to create LoRa TX done semaphore");
+    lora_tx_mutex = xSemaphoreCreateMutex();
+    if (lora_tx_mutex == NULL) {
+        ESP_LOGE(TAG, "Failed to create LoRa SPI mutex");
         return;
     }
 
@@ -252,11 +260,13 @@ void lora_radio_init(void)
     }
 
     lora_read_frame_callback = lora_read_raw_frame;
-    xTaskCreate(lora_rx_task, "lora_rx_task", 4096, NULL, 6, NULL);
-    lora_tx_mutex = xSemaphoreCreateMutex();
-    lora_tx_request_queue = xQueueCreate(16, sizeof(lora_tx_request_t));
+    for (size_t i = 0; i < 3; i++) {
+        lora_tx_request_queues[i] = xQueueCreate(16, sizeof(lora_tx_request_t));
+    }
     lora_tx_result_queue = xQueueCreate(16, sizeof(lora_tx_result_t));
-    if (lora_tx_mutex != NULL && lora_tx_request_queue != NULL && lora_tx_result_queue != NULL) {
+    xTaskCreate(lora_rx_task, "lora_rx_task", 4096, NULL, 6, NULL);
+    if (lora_tx_request_queues[0] != NULL && lora_tx_request_queues[1] != NULL &&
+        lora_tx_request_queues[2] != NULL && lora_tx_result_queue != NULL) {
         xTaskCreate(lora_tx_task, "lora_tx_task", 4096, NULL, 7, &lora_tx_task_handle);
     }
 
@@ -266,25 +276,21 @@ void lora_radio_init(void)
 
 bool lora_transmit(const char *packet)
 {
-    uint8_t frame[LORA_MAX_PAYLOAD];
-    size_t length = 0;
-
-    if (!lora_radio_is_ready()) {
-        ESP_LOGW(TAG, "SX1278 is not ready; packet kept in local log only");
+    if (packet == NULL) {
         return false;
     }
 
-    if (!bems_encrypt_packet(packet, frame, sizeof(frame), &length)) {
-        ESP_LOGW(TAG, "Failed to encrypt LoRa packet");
-        return false;
-    }
-
-    return lora_radio_submit(frame, length, LORA_TX_PRIORITY_NORMAL);
+    return lora_radio_submit((const uint8_t *)packet, strlen(packet), LORA_TX_PRIORITY_NORMAL);
 }
 
 bool lora_transmit_bytes(const uint8_t *packet, size_t packet_len)
 {
-    return lora_radio_submit(packet, packet_len, LORA_TX_PRIORITY_NORMAL);
+    return lora_transmit_bytes_priority(packet, packet_len, LORA_TX_PRIORITY_NORMAL);
+}
+
+bool lora_transmit_bytes_priority(const uint8_t *packet, size_t packet_len, lora_tx_priority_t priority)
+{
+    return lora_radio_submit(packet, packet_len, priority);
 }
 
 bool lora_radio_is_ready(void)
@@ -356,7 +362,7 @@ bool lora_radio_submit(const uint8_t *packet, size_t length, lora_tx_priority_t 
         ESP_LOGW(TAG, "SX1278 is not ready; packet kept in local log only");
         return false;
     }
-    if (packet == NULL || length == 0 || length > sizeof(request.packet)) {
+    if (packet == NULL || length == 0 || length > BEMS_MAX_PLAINTEXT || length > sizeof(request.packet)) {
         return false;
     }
 
@@ -372,16 +378,21 @@ bool lora_radio_submit(const uint8_t *packet, size_t length, lora_tx_priority_t 
 
 esp_err_t lora_tx_submit(const lora_tx_request_t *request)
 {
-    if (request == NULL || request->packet_len == 0 || request->packet_len > sizeof(((lora_tx_request_t *)0)->packet)) {
+    if (request == NULL || request->packet_len == 0 ||
+        request->packet_len > BEMS_MAX_PLAINTEXT ||
+        request->packet_len > sizeof(((lora_tx_request_t *)0)->packet)) {
         return ESP_ERR_INVALID_ARG;
     }
-    if (lora_tx_request_queue == NULL) {
+    size_t queue_index = request->priority == LORA_TX_PRIORITY_HIGH ? 0 :
+                         request->priority == LORA_TX_PRIORITY_LOW ? 2 : 1;
+    if (lora_tx_request_queues[queue_index] == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
-    if (xQueueSend(lora_tx_request_queue, request, 0) != pdTRUE) {
+    if (xQueueSend(lora_tx_request_queues[queue_index], request, 0) != pdTRUE) {
         ESP_LOGW(TAG, "LoRa TX queue full");
         return ESP_ERR_TIMEOUT;
     }
+    if (lora_tx_task_handle != NULL) xTaskNotifyGive(lora_tx_task_handle);
     return ESP_OK;
 }
 
@@ -404,7 +415,13 @@ static esp_err_t lora_transfer(uint8_t address, const uint8_t *tx_data, uint8_t 
     transaction.tx_buffer = tx_buffer;
     transaction.rx_buffer = rx_buffer;
 
+    if (lora_tx_mutex != NULL) {
+        xSemaphoreTake(lora_tx_mutex, portMAX_DELAY);
+    }
     esp_err_t result = spi_device_transmit(lora_spi, &transaction);
+    if (lora_tx_mutex != NULL) {
+        xSemaphoreGive(lora_tx_mutex);
+    }
     if (result == ESP_OK && rx_data != NULL && length > 0) {
         memcpy(rx_data, &rx_buffer[1], length);
     }
@@ -487,69 +504,50 @@ static bool lora_transmit_raw_frame(const uint8_t *frame, size_t length)
            lora_write_reg(REG_PAYLOAD_LENGTH, (uint8_t)length) == ESP_OK;
 }
 
-static bool lora_do_transmit_bytes(const uint8_t *packet, size_t packet_len)
+static bool lora_encrypt_air_frame(const uint8_t *plain_packet, size_t plain_len, uint8_t *air_frame, size_t air_frame_size, size_t *air_len)
 {
-    if (lora_tx_done_semaphore == NULL) {
-        ESP_LOGW(TAG, "LoRa TX done semaphore is not ready");
+    if (plain_packet == NULL || air_frame == NULL || air_len == NULL || plain_len == 0 || plain_len > BEMS_MAX_PLAINTEXT) {
         return false;
     }
-
-    if (lora_tx_mutex != NULL) {
-        xSemaphoreTake(lora_tx_mutex, portMAX_DELAY);
-    }
-
-    if (!lora_channel_clear()) {
-        if (lora_tx_mutex != NULL) {
-            xSemaphoreGive(lora_tx_mutex);
-        }
-        ESP_LOGW(TAG, "Channel busy; TX skipped");
-        return false;
-    }
-
-    xSemaphoreTake(lora_tx_done_semaphore, 0);
-    lora_set_state(RADIO_STATE_TX);
-    if (!lora_transmit_raw_frame(packet, packet_len)) {
-        lora_receive_mode();
-        if (lora_tx_mutex != NULL) {
-            xSemaphoreGive(lora_tx_mutex);
-        }
-        lora_enter_fault_internal("TX frame write failed");
-        (void)lora_radio_recover();
-        return false;
-    }
-
-    if (lora_set_mode(MODE_TX) != ESP_OK) {
-        lora_enter_fault_internal("TX mode set failed");
-        (void)lora_radio_recover();
-        return LORA_TX_RESULT_SPI_ERROR;
-    }
-    if (xSemaphoreTake(lora_tx_done_semaphore, pdMS_TO_TICKS(5000)) == pdTRUE) {
-        lora_receive_mode();
-        if (lora_tx_mutex != NULL) {
-            xSemaphoreGive(lora_tx_mutex);
-        }
-        ESP_LOGI(TAG, "SX1278 TX done: %u bytes", (unsigned int)packet_len);
-        return true;
-    }
-
-    lora_enter_fault_internal("TX timeout");
-    (void)lora_radio_recover();
-    lora_receive_mode();
-    if (lora_tx_mutex != NULL) {
-        xSemaphoreGive(lora_tx_mutex);
-    }
-    ESP_LOGW(TAG, "SX1278 TX timeout");
-    return false;
+    return bems_encrypt_frame(plain_packet, plain_len, air_frame, air_frame_size, air_len);
 }
 
 static void lora_tx_task(void *parameter)
 {
     lora_tx_request_t request;
     lora_tx_result_t result;
+    uint8_t high_streak = 0;
+    uint8_t normal_streak = 0;
 
     (void)parameter;
     while (true) {
-        if (lora_tx_request_queue == NULL || xQueueReceive(lora_tx_request_queue, &request, portMAX_DELAY) != pdTRUE) {
+        bool high_waiting = uxQueueMessagesWaiting(lora_tx_request_queues[0]) > 0;
+        bool normal_waiting = uxQueueMessagesWaiting(lora_tx_request_queues[1]) > 0;
+        bool low_waiting = uxQueueMessagesWaiting(lora_tx_request_queues[2]) > 0;
+        QueueHandle_t selected_queue = NULL;
+        if (low_waiting && (high_streak >= 4 || normal_streak >= 3)) {
+            selected_queue = lora_tx_request_queues[2];
+            high_streak = normal_streak = 0;
+        } else if (normal_waiting && high_streak >= 4) {
+            selected_queue = lora_tx_request_queues[1];
+            high_streak = 0;
+            normal_streak++;
+        } else if (high_waiting) {
+            selected_queue = lora_tx_request_queues[0];
+            high_streak++;
+        } else if (normal_waiting) {
+            selected_queue = lora_tx_request_queues[1];
+            high_streak = 0;
+            normal_streak++;
+        } else if (low_waiting) {
+            selected_queue = lora_tx_request_queues[2];
+            high_streak = normal_streak = 0;
+        }
+        if (selected_queue == NULL) {
+            (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+            continue;
+        }
+        if (xQueueReceive(selected_queue, &request, 0) != pdTRUE) {
             continue;
         }
         memset(&result, 0, sizeof(result));
@@ -574,18 +572,25 @@ bool lora_tx_result_receive(lora_tx_result_t *result, TickType_t timeout_ticks)
 
 static lora_tx_result_code_t lora_execute_tx(const lora_tx_request_t *request, lora_tx_result_t *result)
 {
+    uint8_t air_frame[LORA_MAX_PAYLOAD];
+    size_t air_len = 0;
+
     if (request == NULL || result == NULL) {
         return LORA_TX_RESULT_UNKNOWN;
     }
     if (!lora_radio_is_ready()) {
         return LORA_TX_RESULT_RADIO_FAULT;
     }
+    if (!lora_encrypt_air_frame(request->packet, request->packet_len, air_frame, sizeof(air_frame), &air_len)) {
+        ESP_LOGW(TAG, "Failed to encrypt LoRa TX frame (%u plaintext bytes)", (unsigned int)request->packet_len);
+        return LORA_TX_RESULT_ABORTED;
+    }
     if (!lora_channel_clear()) {
         return LORA_TX_RESULT_CHANNEL_BUSY;
     }
-    xSemaphoreTake(lora_tx_done_semaphore, 0);
+    xSemaphoreTake(lora_dio0_semaphore, 0);
     lora_set_state(RADIO_STATE_TX);
-    if (!lora_transmit_raw_frame(request->packet, request->packet_len)) {
+    if (!lora_transmit_raw_frame(air_frame, air_len)) {
         lora_receive_mode();
         lora_enter_fault_internal("TX frame write failed");
         (void)lora_radio_recover();
@@ -596,7 +601,14 @@ static lora_tx_result_code_t lora_execute_tx(const lora_tx_request_t *request, l
         (void)lora_radio_recover();
         return LORA_TX_RESULT_SPI_ERROR;
     }
-    if (xSemaphoreTake(lora_tx_done_semaphore, pdMS_TO_TICKS(5000)) == pdTRUE) {
+    if (xSemaphoreTake(lora_dio0_semaphore, pdMS_TO_TICKS(5000)) == pdTRUE) {
+        uint8_t irq_flags = 0;
+        if (lora_read_reg(REG_IRQ_FLAGS, &irq_flags) != ESP_OK || (irq_flags & IRQ_TX_DONE_MASK) == 0) {
+            lora_enter_fault_internal("unexpected DIO0 event during TX");
+            (void)lora_radio_recover();
+            return LORA_TX_RESULT_SPI_ERROR;
+        }
+        (void)lora_write_reg(REG_IRQ_FLAGS, IRQ_TX_DONE_MASK);
         lora_receive_mode();
         result->airtime_ms = 0;
         result->rssi = 0;

@@ -23,6 +23,20 @@ static TickType_t session_last_activity_tick;
 static TickType_t last_login_attempt_tick;
 static uint8_t failed_login_count;
 
+static bool cookie_has_session(const char *cookie)
+{
+    const size_t name_len = sizeof(SESSION_COOKIE_NAME) - 1;
+    const char *cursor = cookie;
+    while ((cursor = strstr(cursor, SESSION_COOKIE_NAME)) != NULL) {
+        if ((cursor == cookie || cursor[-1] == ';' || cursor[-1] == ' ') &&
+            strncmp(cursor + name_len, "=", 1) == 0 &&
+            strncmp(cursor + name_len + 1, session_token, SESSION_TOKEN_LEN - 1) == 0 &&
+            (cursor[name_len + SESSION_TOKEN_LEN] == ';' || cursor[name_len + SESSION_TOKEN_LEN] == '\0' || cursor[name_len + SESSION_TOKEN_LEN] == ' ')) return true;
+        cursor += name_len;
+    }
+    return false;
+}
+
 static esp_err_t send_session_expired(httpd_req_t *request)
 {
     httpd_resp_set_status(request, "401 Unauthorized");
@@ -44,7 +58,6 @@ void http_auth_init(const http_auth_context_t *context)
 bool http_auth_request_has_session(httpd_req_t *request)
 {
     char cookie[128] = {0};
-    char expected[64];
     TickType_t now;
 
     if (!*auth_context.configured) {
@@ -54,9 +67,9 @@ bool http_auth_request_has_session(httpd_req_t *request)
     if (httpd_req_get_hdr_value_str(request, "Cookie", cookie, sizeof(cookie)) != ESP_OK) {
         return false;
     }
+    if (strlen(cookie) >= sizeof(cookie) - 1) return false;
 
-    snprintf(expected, sizeof(expected), "%s=%s", SESSION_COOKIE_NAME, session_token);
-    if (strstr(cookie, expected) == NULL) {
+    if (!cookie_has_session(cookie)) {
         return false;
     }
 
@@ -83,8 +96,7 @@ esp_err_t http_auth_require_session(httpd_req_t *request)
         return ESP_OK;
     }
 
-    if (request->method == HTTP_POST &&
-        (strcmp(request->uri, "/send") == 0 || strcmp(request->uri, "/sync") == 0)) {
+    if (strncmp(request->uri, "/api/", 5) == 0 || request->method == HTTP_POST) {
         return send_session_expired(request);
     }
 
@@ -95,9 +107,11 @@ esp_err_t http_auth_login_handler(httpd_req_t *request)
 {
     char body[96] = {0};
     char pin[FIELD_LEN] = {0};
-    char cookie[64];
+    char cookie[80];
     TickType_t now = xTaskGetTickCount();
     uint8_t backoff_seconds;
+
+    if (!*auth_context.configured) return http_auth_send_redirect(request, "/setup");
 
     // Check brute-force protection
     if (failed_login_count > 0) {
@@ -115,7 +129,8 @@ esp_err_t http_auth_login_handler(httpd_req_t *request)
     }
 
     form_value(body, "pin", pin, sizeof(pin));
-    if (!constant_time_equal((const uint8_t *)pin, (const uint8_t *)auth_context.web_pin, sizeof(pin))) {
+    if (auth_context.web_pin == NULL || auth_context.web_pin[0] == '\0' ||
+        !constant_time_equal((const uint8_t *)pin, (const uint8_t *)auth_context.web_pin, sizeof(pin))) {
         failed_login_count++;
         httpd_resp_set_status(request, "403 Forbidden");
         return auth_context.send_portal_file(request, "login.html");
@@ -126,4 +141,15 @@ esp_err_t http_auth_login_handler(httpd_req_t *request)
     httpd_resp_set_hdr(request, "Set-Cookie", cookie);
     session_last_activity_tick = xTaskGetTickCount();
     return http_auth_send_redirect(request, "/");
+}
+
+esp_err_t http_auth_logout_handler(httpd_req_t *request)
+{
+    if (!*auth_context.configured) return http_auth_send_redirect(request, "/setup");
+    uint32_t a = esp_random();
+    uint32_t b = esp_random();
+    snprintf(session_token, sizeof(session_token), "%08lX%08lX", (unsigned long)a, (unsigned long)b);
+    session_last_activity_tick = 0;
+    httpd_resp_set_hdr(request, "Set-Cookie", "BMESH_SESSION=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax");
+    return http_auth_send_redirect(request, "/login-page");
 }

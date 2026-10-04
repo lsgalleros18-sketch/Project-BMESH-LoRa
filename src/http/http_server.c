@@ -21,13 +21,16 @@ void http_server_start(const http_messages_context_t *messages_context,
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = HTTP_PORT;
-    config.max_uri_handlers = 16;
+    config.max_uri_handlers = 20;
     config.uri_match_fn = httpd_uri_match_wildcard;
     config.stack_size = 20480;
 
     const httpd_uri_t routes[] = {
         {.uri = "/", .method = HTTP_GET, .handler = http_portal_index_handler},
+        {.uri = "/login-page", .method = HTTP_GET, .handler = http_portal_login_page_handler},
         {.uri = "/login", .method = HTTP_POST, .handler = http_auth_login_handler},
+        {.uri = "/logout", .method = HTTP_POST, .handler = http_auth_logout_handler},
+        {.uri = "/setup", .method = HTTP_GET, .handler = http_setup_get_handler, .user_ctx = (void *)setup_context},
         {.uri = "/setup", .method = HTTP_POST, .handler = http_setup_handler, .user_ctx = (void *)setup_context},
         {.uri = "/reset", .method = HTTP_POST, .handler = http_reset_handler, .user_ctx = (void *)reset_context},
         {.uri = "/settime", .method = HTTP_POST, .handler = http_time_handler, .user_ctx = (void *)time_context},

@@ -30,16 +30,11 @@ static void forward_worker_task(void *parameter)
         uint32_t delay_ms = 100 + (esp_random() % 500);
         vTaskDelay(pdMS_TO_TICKS(delay_ms));
 
-        if (packet_seen(job.packet.source, job.packet.id)) {
-            ESP_LOGI(TAG, "Suppressed duplicate forward for %s/%lu after %u ms", job.packet.source, (unsigned long)job.packet.id, (unsigned int)delay_ms);
-            continue;
-        }
-
         if (!app_runtime_should_forward_packet(&job.packet, job.route_known ? &job.route : NULL, job.local_node_id)) {
             continue;
         }
 
-        if (!mesh_packet_consume_hop(&job.packet)) {
+        if (job.packet.hops <= 0 || !mesh_packet_consume_hop(&job.packet)) {
             ESP_LOGI(TAG, "Dropped packet %s/%lu because hop budget was exhausted before forwarding",
                      job.packet.source,
                      (unsigned long)job.packet.id);
@@ -58,7 +53,10 @@ static void forward_worker_task(void *parameter)
             ESP_LOGI(TAG, "Flood fallback forward for %s -> %s", job.packet.source, job.packet.destination);
         }
 
-        copy_field(job.packet.relay, sizeof(job.packet.relay), job.packet.source);
+        copy_field(job.packet.relay, sizeof(job.packet.relay), job.local_node_id);
+        if (job.packet.path_hops < 255) {
+            job.packet.path_hops++;
+        }
         if (job.route_known) {
             copy_field(job.packet.next_hop, sizeof(job.packet.next_hop), job.route.next_hop);
         } else {
@@ -73,7 +71,11 @@ static void forward_worker_task(void *parameter)
         }
 
         ESP_LOGI(TAG, "Forwarding packet %s/%lu after %u ms delay", job.packet.source, (unsigned long)job.packet.id, (unsigned int)delay_ms);
-        (void)lora_transmit_bytes(forward_packet, forward_packet_len);
+        lora_tx_priority_t tx_priority = strcmp(job.packet.type, "ACK") == 0 ? LORA_TX_PRIORITY_HIGH :
+                                        strcmp(job.packet.priority, "HIGH") == 0 ? LORA_TX_PRIORITY_HIGH :
+                                        strcmp(job.packet.priority, "LOW") == 0 ? LORA_TX_PRIORITY_LOW :
+                                        LORA_TX_PRIORITY_NORMAL;
+        (void)lora_transmit_bytes_priority(forward_packet, forward_packet_len, tx_priority);
     }
 }
 

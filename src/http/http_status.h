@@ -17,6 +17,8 @@ typedef struct {
     const char *node_role;
     const char *location;
     const char *ssid;
+    const char *storage_status;
+    const char *radio_state;
     const bool *configured;
     const bool *duplicate_node_id_warning;
     const bool *time_synced;

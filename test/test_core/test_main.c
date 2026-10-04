@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include <unity.h>
+#include "esp_err.h"
 
 #include "lwip/inet.h"
 
@@ -19,6 +20,7 @@
 #include "route_table.h"
 #include "roster.h"
 #include "utils/string_utils.h"
+#include "utils/json_utils.h"
 
 static uint32_t fake_tick;
 static uint32_t fake_roster_now_ms;
@@ -112,6 +114,18 @@ static void test_packet_seen_expires_after_ttl(void)
     deduplication_debug_set_seen_tick_for_test("NODE01", 10, 0);
     TEST_ASSERT_FALSE(packet_seen("NODE01", 10));
     (void)fake_tick;
+}
+
+static void test_dedup_entry_remains_attached_until_ttl_horizon(void)
+{
+    fake_tick = 100000;
+    deduplication_debug_reset_for_test();
+    remember_packet("TTL_NODE", 177);
+    TEST_ASSERT_TRUE(packet_seen("TTL_NODE", 177));
+    fake_tick += 1000; /* 1 second elapsed; do not detach its wheel entry. */
+    TEST_ASSERT_TRUE(packet_seen("TTL_NODE", 177));
+    fake_tick += 59000;
+    TEST_ASSERT_FALSE(packet_seen("TTL_NODE", 177));
 }
 
 static void test_replay_accepts_first_and_sequential_packets(void)
@@ -360,6 +374,21 @@ static void test_route_guided_forwarding_falls_back_without_route(void)
     packet.hops = 3;
 
     TEST_ASSERT_TRUE(app_runtime_should_forward_packet(&packet, NULL, "NODE_C"));
+}
+
+static void test_route_guided_forwarding_requires_selected_next_hop(void)
+{
+    mesh_packet_t packet = {0};
+    route_entry_t route = {0};
+    copy_field(packet.destination, sizeof(packet.destination), "NODE_D");
+    copy_field(packet.type, sizeof(packet.type), "FLOOD");
+    packet.hops = 2;
+    copy_field(route.destination, sizeof(route.destination), "NODE_D");
+    copy_field(route.next_hop, sizeof(route.next_hop), "NODE_B");
+    route.hop_count = 1;
+    TEST_ASSERT_FALSE(app_runtime_should_forward_packet(&packet, &route, "NODE_C"));
+    copy_field(packet.next_hop, sizeof(packet.next_hop), "NODE_B");
+    TEST_ASSERT_TRUE(app_runtime_should_forward_packet(&packet, &route, "NODE_B"));
 }
 
 static void test_forwarded_packet_preserves_source_and_id(void)
@@ -758,7 +787,15 @@ static void test_string_utils_form_value_uses_production_parser(void)
     TEST_ASSERT_EQUAL_STRING("Purok 3, Hall", output);
 }
 
-static void test_message_store_add_find_remove(void)
+static void test_json_escape_control_and_non_ascii_bytes(void)
+{
+    const char input[] = "quote\" slash\\ line\n tab\t return\r byte\x01 high\xFF";
+    char escaped[256];
+    json_escape_string(escaped, sizeof(escaped), input);
+    TEST_ASSERT_EQUAL_STRING("quote\\\" slash\\\\ line\\n tab\\t return\\r byte\\u0001 high\\u00FF", escaped);
+}
+
+static void test_message_store_allocate_write_find_remove(void)
 {
     emergency_message_t message = {0};
     emergency_message_t found = {0};
@@ -772,7 +809,8 @@ static void test_message_store_add_find_remove(void)
     copy_field(message.status, sizeof(message.status), "PENDING");
     message.id = 5001;
 
-    TEST_ASSERT_TRUE(message_store_add(&message, &slot));
+    TEST_ASSERT_TRUE(message_store_allocate(&slot));
+    TEST_ASSERT_EQUAL(ESP_OK, message_store_write(slot, &message));
     TEST_ASSERT_TRUE(slot >= 0);
     TEST_ASSERT_TRUE(message_store_find(5001, "NODE01", &found));
     TEST_ASSERT_EQUAL_UINT32(5001, found.id);
@@ -807,6 +845,7 @@ int main(void)
     RUN_TEST(test_parse_mesh_packet_sets_thread_key_for_direct_messages);
     RUN_TEST(test_packet_seen_uses_source_and_id);
     RUN_TEST(test_packet_seen_expires_after_ttl);
+    RUN_TEST(test_dedup_entry_remains_attached_until_ttl_horizon);
     RUN_TEST(test_dedup_tracks_same_source_and_id);
     RUN_TEST(test_dedup_distinguishes_different_sources);
     RUN_TEST(test_dedup_handles_full_cache_and_bursts);
@@ -832,6 +871,7 @@ int main(void)
     RUN_TEST(test_route_guided_forwarding_allows_preferred_previous_hop);
     RUN_TEST(test_route_guided_forwarding_suppresses_non_preferred_previous_hop);
     RUN_TEST(test_route_guided_forwarding_falls_back_without_route);
+    RUN_TEST(test_route_guided_forwarding_requires_selected_next_hop);
     RUN_TEST(test_forwarded_packet_preserves_source_and_id);
     RUN_TEST(test_parse_mesh_packet_with_next_hop);
     RUN_TEST(test_parse_mesh_packet_without_next_hop_remains_legacy_compatible);
@@ -858,7 +898,8 @@ int main(void)
     RUN_TEST(test_dns_parse_rejects_invalid_compression_pointer);
     RUN_TEST(test_dns_response_rejects_multiple_questions);
     RUN_TEST(test_string_utils_form_value_uses_production_parser);
-    RUN_TEST(test_message_store_add_find_remove);
+    RUN_TEST(test_json_escape_control_and_non_ascii_bytes);
+    RUN_TEST(test_message_store_allocate_write_find_remove);
     RUN_TEST(test_roster_touch_inserts_and_updates);
     return UNITY_END();
 }

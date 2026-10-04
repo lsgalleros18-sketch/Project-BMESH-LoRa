@@ -75,7 +75,8 @@ esp_err_t http_status_handler(httpd_req_t *request)
     char escaped_role[FIELD_LEN * 2];
     char escaped_location[FIELD_LEN * 2];
     char escaped_ssid[FIELD_LEN * 2];
-    char escaped_relay[8];
+    char escaped_storage[FIELD_LEN * 2];
+    char escaped_radio[FIELD_LEN * 2];
     size_t current_message_count;
     size_t roster_count;
     size_t route_count;
@@ -96,7 +97,8 @@ esp_err_t http_status_handler(httpd_req_t *request)
     json_escape_string(escaped_role, sizeof(escaped_role), context->node_role);
     json_escape_string(escaped_location, sizeof(escaped_location), context->location);
     json_escape_string(escaped_ssid, sizeof(escaped_ssid), context->ssid);
-    json_escape_string(escaped_relay, sizeof(escaped_relay), "true");
+    json_escape_string(escaped_storage, sizeof(escaped_storage), context->storage_status);
+    json_escape_string(escaped_radio, sizeof(escaped_radio), context->radio_state);
 
     httpd_resp_set_type(request, "application/json");
     httpd_resp_send_chunk(request, "{", 1);
@@ -110,6 +112,10 @@ esp_err_t http_status_handler(httpd_req_t *request)
     httpd_resp_send_chunk(request, escaped_location, HTTPD_RESP_USE_STRLEN);
     httpd_resp_send_chunk(request, "\",\"ssid\":\"", HTTPD_RESP_USE_STRLEN);
     httpd_resp_send_chunk(request, escaped_ssid, HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(request, "\",\"storage_status\":\"", HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(request, escaped_storage, HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(request, "\",\"radio_state\":\"", HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(request, escaped_radio, HTTPD_RESP_USE_STRLEN);
     char clients_chunk[24];
     snprintf(clients_chunk, sizeof(clients_chunk), "%u", clients.num);
     httpd_resp_send_chunk(request, "\",\"clients\":", HTTPD_RESP_USE_STRLEN);
@@ -120,9 +126,7 @@ esp_err_t http_status_handler(httpd_req_t *request)
     httpd_resp_send_chunk(request, messages_chunk, HTTPD_RESP_USE_STRLEN);
     httpd_resp_send_chunk(request, ",\"configured\":", HTTPD_RESP_USE_STRLEN);
     httpd_resp_send_chunk(request, *context->configured ? "true" : "false", HTTPD_RESP_USE_STRLEN);
-    httpd_resp_send_chunk(request, ",\"relay\":\"", HTTPD_RESP_USE_STRLEN);
-    httpd_resp_send_chunk(request, escaped_relay, HTTPD_RESP_USE_STRLEN);
-    httpd_resp_send_chunk(request, "\",\"duplicate_warning\":", HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(request, ",\"duplicate_warning\":", HTTPD_RESP_USE_STRLEN);
     httpd_resp_send_chunk(request, *context->duplicate_node_id_warning ? "true" : "false", HTTPD_RESP_USE_STRLEN);
     httpd_resp_send_chunk(request, ",\"time_synced\":", HTTPD_RESP_USE_STRLEN);
     httpd_resp_send_chunk(request, *context->time_synced ? "true" : "false", HTTPD_RESP_USE_STRLEN);

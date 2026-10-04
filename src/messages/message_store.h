@@ -20,6 +20,7 @@ typedef enum {
     MESSAGE_SLOT_SENT = 2,
     MESSAGE_SLOT_ACKED = 3,
     MESSAGE_SLOT_FAILED = 4,
+    MESSAGE_SLOT_RECEIVED = 5,
 } message_slot_state_t;
 
 typedef struct {
@@ -60,10 +61,7 @@ bool message_store_read(int slot, emergency_message_t *message);
 bool message_store_get(size_t index, emergency_message_t *out);
 bool message_store_find(uint32_t id, const char *source, emergency_message_t *out);
 bool message_store_remove(uint32_t id, const char *source);
-emergency_message_t *message_store_begin_write(int *nvs_slot);
-emergency_message_t *message_store_begin_update(uint32_t id, const char *source);
-void message_store_end_update(void);
 void message_store_update_status(uint32_t id, const char *source, const char *status);
 size_t message_store_copy_all(emergency_message_t *snapshot, size_t max_messages);
-const emergency_message_t *message_store_snapshot(size_t *snapshot_count);
 size_t message_store_count(void);
+size_t message_store_copy_pending_tx(emergency_message_t *messages, int *slots, size_t capacity);

@@ -220,6 +220,16 @@ body{background:#f5f7f6;color:#16231e}
         <div class="feed" id="messageFeed">
           <div class="empty">Loading messages...</div>
         </div>
+        <form id="composeForm" class="settings" style="border-top:1px solid #dfe6e2">
+          <h3>Compose Message</h3>
+          <div class="row">
+            <label>Destination <input name="destination" maxlength="31" placeholder="Node ID or ALL" required></label>
+            <label>Type <select name="type"><option>EMERGENCY</option><option>FLOOD</option><option>MEDICAL</option><option>INFO</option></select></label>
+            <label>Priority <select name="priority"><option>HIGH</option><option selected>NORMAL</option><option>LOW</option></select></label>
+          </div>
+          <label>Message <textarea name="payload" maxlength="138" required rows="3" style="width:100%;margin-top:7px;padding:10px;border:1px solid #bcc9c2;border-radius:9px;font:inherit"></textarea></label>
+          <button class="primary" type="submit">Send Message</button><p id="sendResult" class="meta" aria-live="polite"></p>
+        </form>
       </section>
 
       <section class="panel">
@@ -230,7 +240,7 @@ body{background:#f5f7f6;color:#16231e}
         <div class="settings">
           <div class="row">
             <a class="primary" href="/setup">Open Setup</a>
-            <a href="/login">Open Login</a>
+            <form method="post" action="/logout" style="display:inline"><button type="submit">Log out</button></form>
             <a href="/api/status">View Raw Status</a>
             <a href="/api/messages">View Raw Messages</a>
           </div>
@@ -383,7 +393,7 @@ function renderMessages(status,messages){
       'Hops: '+asText(m.hops),
       'Time: '+time
     ];
-    return '<div class="event '+(String(m.direction||'').toUpperCase().indexOf('OUT')>=0?'outgoing':'incoming')+'">'+
+    return '<div class="event '+(String(m.direction||'').toUpperCase()==='TX'?'outgoing':'incoming')+'">'+
       '<div class="eventhead">'+
         '<b>'+esc(asText(m.thread_key||'Message'))+'</b>'+
         '<span class="badge '+level.cls+'">'+esc(level.text)+'</span>'+
@@ -397,6 +407,7 @@ function renderMessages(status,messages){
 async function refresh(){
   try{
     const statusResponse=await fetch('/api/status',{cache:'no-store',credentials:'same-origin'});
+    if(statusResponse.status===401){location.href='/login-page?expired=1';return;}
     if(!statusResponse.ok)throw new Error('status '+statusResponse.status);
     latestStatus=await statusResponse.json();
     renderSystem(latestStatus);
@@ -411,6 +422,7 @@ async function refresh(){
   }
   try{
     const messagesResponse=await fetch('/api/messages',{cache:'no-store',credentials:'same-origin'});
+    if(messagesResponse.status===401){location.href='/login-page?expired=1';return;}
     if(!messagesResponse.ok)throw new Error('messages '+messagesResponse.status);
     latestMessages=await messagesResponse.json();
     renderOverview(latestStatus,latestMessages);
@@ -420,6 +432,16 @@ async function refresh(){
     document.getElementById('messageFeed').innerHTML='<div class="empty">Unable to load /api/messages.</div>';
   }
 }
+document.getElementById('composeForm').addEventListener('submit',async function(event){
+  event.preventDefault();
+  const result=document.getElementById('sendResult');
+  try{
+    const response=await fetch('/send',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams(new FormData(event.currentTarget))});
+    if(response.status===401){location.href='/login-page?expired=1';return;}
+    if(!response.ok)throw new Error((await response.text())||('HTTP '+response.status));
+    result.textContent='Message queued.';event.currentTarget.reset();await refresh();
+  }catch(error){result.textContent='Unable to send: '+error.message;}
+});
 refresh();
 setInterval(refresh,4000);
 </script>

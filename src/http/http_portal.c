@@ -1,6 +1,7 @@
 #include "http/http_portal.h"
 
 #include <stdio.h>
+#include <string.h>
 
 #include "esp_log.h"
 
@@ -55,14 +56,22 @@ esp_err_t http_portal_send_file(httpd_req_t *request, const char *filename)
 
 esp_err_t http_portal_index_handler(httpd_req_t *request)
 {
+    if (strcmp(request->uri, "/") != 0) return http_auth_send_redirect(request, "/login-page");
     if (!*portal_context.configured) {
         return http_portal_send_file(request, "setup.html");
     }
     if (!http_auth_request_has_session(request)) {
-        return http_portal_send_file(request, "login.html");
+        return http_auth_send_redirect(request, "/login-page");
     }
 
     return http_portal_send_file(request, "index.html");
+}
+
+esp_err_t http_portal_login_page_handler(httpd_req_t *request)
+{
+    if (!*portal_context.configured) return http_auth_send_redirect(request, "/setup");
+    if (http_auth_request_has_session(request)) return http_auth_send_redirect(request, "/");
+    return http_portal_send_file(request, "login.html");
 }
 
 esp_err_t http_portal_captive_handler(httpd_req_t *request)
