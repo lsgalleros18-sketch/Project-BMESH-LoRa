@@ -12,6 +12,7 @@
 
 static const char *MESSAGE_NAMESPACE = "bems_config";
 static const uint32_t MESSAGE_STORE_MAGIC_VALUE = MESSAGE_STORE_MAGIC;
+static StaticSemaphore_t message_mutex_buffer;
 static SemaphoreHandle_t message_mutex;
 static persisted_message_t persisted_slots[MAX_MESSAGES];
 static emergency_message_t message_snapshot_buffer[MAX_MESSAGES];
@@ -19,19 +20,14 @@ static size_t active_count;
 
 static void lock(void)
 {
-    if (message_mutex == NULL) {
-        message_mutex = xSemaphoreCreateMutex();
-    }
-    if (message_mutex != NULL) {
-        xSemaphoreTake(message_mutex, portMAX_DELAY);
-    }
+    configASSERT(message_mutex != NULL);
+    xSemaphoreTake(message_mutex, portMAX_DELAY);
 }
 
 static void unlock(void)
 {
-    if (message_mutex != NULL) {
-        xSemaphoreGive(message_mutex);
-    }
+    configASSERT(message_mutex != NULL);
+    xSemaphoreGive(message_mutex);
 }
 
 static uint32_t crc32_bytes(const uint8_t *data, size_t length)
@@ -123,6 +119,46 @@ static void recalculate_active_count(void)
     active_count = count;
 }
 
+static esp_err_t delete_record_nvs(int slot)
+{
+    nvs_handle_t handle;
+    char key[16];
+    esp_err_t result;
+
+    if (slot < 0 || slot >= MAX_MESSAGES) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    result = nvs_open(MESSAGE_NAMESPACE, NVS_READWRITE, &handle);
+    if (result != ESP_OK) {
+        return result;
+    }
+
+    if (slot_key(slot, key, sizeof(key)) == NULL) {
+        nvs_close(handle);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    result = nvs_erase_key(handle, key);
+    if (result == ESP_OK || result == ESP_ERR_NVS_NOT_FOUND) {
+        result = nvs_commit(handle);
+    }
+    nvs_close(handle);
+    return result;
+}
+
+static esp_err_t delete_record_locked(int slot)
+{
+    esp_err_t result = delete_record_nvs(slot);
+
+    if (result == ESP_OK || result == ESP_ERR_NVS_NOT_FOUND) {
+        clear_slot((size_t)slot);
+        recalculate_active_count();
+        return ESP_OK;
+    }
+    return result;
+}
+
 static bool message_matches(const emergency_message_t *message, uint32_t id, const char *source)
 {
     return message != NULL && source != NULL && source[0] != '\0' &&
@@ -188,6 +224,12 @@ void message_store_load_messages_from_nvs(const char *node_id)
 
 esp_err_t message_store_init(void)
 {
+    if (message_mutex == NULL) {
+        message_mutex = xSemaphoreCreateMutexStatic(&message_mutex_buffer);
+        if (message_mutex == NULL) {
+            return ESP_FAIL;
+        }
+    }
     message_store_load_messages_from_nvs(NULL);
     return ESP_OK;
 }
@@ -210,7 +252,7 @@ bool message_store_allocate(int *slot)
     return false;
 }
 
-static esp_err_t write_record(int slot, const emergency_message_t *message, message_slot_state_t state)
+static esp_err_t write_record_locked(int slot, const emergency_message_t *message, message_slot_state_t state)
 {
     persisted_message_t record = {0};
     nvs_handle_t handle;
@@ -242,13 +284,22 @@ static esp_err_t write_record(int slot, const emergency_message_t *message, mess
         result = nvs_commit(handle);
     }
     if (result == ESP_OK) {
-        lock();
         persisted_slots[slot] = record;
         sync_snapshot_from_slot((size_t)slot);
         recalculate_active_count();
-        unlock();
     }
     nvs_close(handle);
+    return result;
+}
+
+static esp_err_t write_record(int slot, const emergency_message_t *message, message_slot_state_t state)
+{
+    esp_err_t result;
+
+    lock();
+    result = write_record_locked(slot, message, state);
+    unlock();
+
     return result;
 }
 
@@ -260,45 +311,32 @@ esp_err_t message_store_write(int slot, const emergency_message_t *message)
 esp_err_t message_store_update(int slot, const emergency_message_t *message)
 {
     message_slot_state_t state = MESSAGE_SLOT_QUEUED;
+    esp_err_t result;
 
-    if (slot >= 0 && slot < MAX_MESSAGES && persisted_slots[slot].state != MESSAGE_SLOT_EMPTY) {
+    if (message == NULL || slot < 0 || slot >= MAX_MESSAGES) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    lock();
+    if (persisted_slots[slot].state != MESSAGE_SLOT_EMPTY) {
         state = (message_slot_state_t)persisted_slots[slot].state;
     }
-    return write_record(slot, message, state);
+    result = write_record_locked(slot, message, state);
+    unlock();
+    return result;
 }
 
 esp_err_t message_store_delete(int slot)
 {
-    nvs_handle_t handle;
-    char key[16];
     esp_err_t result;
 
     if (slot < 0 || slot >= MAX_MESSAGES) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    result = nvs_open(MESSAGE_NAMESPACE, NVS_READWRITE, &handle);
-    if (result != ESP_OK) {
-        return result;
-    }
-
-    if (slot_key(slot, key, sizeof(key)) == NULL) {
-        nvs_close(handle);
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    result = nvs_erase_key(handle, key);
-    if (result == ESP_OK || result == ESP_ERR_NVS_NOT_FOUND) {
-        result = nvs_commit(handle);
-    }
-    if (result == ESP_OK || result == ESP_ERR_NVS_NOT_FOUND) {
-        lock();
-        clear_slot((size_t)slot);
-        recalculate_active_count();
-        unlock();
-        result = ESP_OK;
-    }
-    nvs_close(handle);
+    lock();
+    result = delete_record_locked(slot);
+    unlock();
     return result;
 }
 
@@ -365,6 +403,7 @@ bool message_store_find(uint32_t id, const char *source, emergency_message_t *ou
 bool message_store_remove(uint32_t id, const char *source)
 {
     int slot;
+    esp_err_t result;
 
     if (source == NULL || source[0] == '\0') {
         return false;
@@ -372,12 +411,9 @@ bool message_store_remove(uint32_t id, const char *source)
 
     lock();
     slot = find_message_slot(id, source);
+    result = slot >= 0 ? delete_record_locked(slot) : ESP_ERR_NVS_NOT_FOUND;
     unlock();
-    if (slot < 0) {
-        return false;
-    }
-
-    return message_store_delete(slot) == ESP_OK;
+    return result == ESP_OK;
 }
 
 emergency_message_t *message_store_begin_write(int *nvs_slot)
@@ -439,10 +475,11 @@ void message_store_update_status(uint32_t id, const char *source, const char *st
         return;
     }
     message = persisted_slots[slot].message;
-    unlock();
-
     copy_field(message.status, sizeof(message.status), status);
-    (void)message_store_update(slot, &message);
+    // Keep the lock held across the whole read-modify-write so a concurrent
+    // caller cannot modify the same slot between our read and our write.
+    (void)write_record_locked(slot, &message, (message_slot_state_t)persisted_slots[slot].state);
+    unlock();
 }
 
 size_t message_store_copy_all(emergency_message_t *snapshot, size_t max_messages)

@@ -23,6 +23,7 @@ typedef enum {
     TX_STATE_EMPTY = 0,
     TX_STATE_CREATED,
     TX_STATE_QUEUED,
+    TX_STATE_SUBMITTING,
     TX_STATE_WAITING_RADIO,
     TX_STATE_TRANSMITTING,
     TX_STATE_WAITING_ACK,
@@ -51,31 +52,30 @@ typedef struct {
     tx_state_t state;
     tx_error_t error;
     uint8_t attempts;
+    int remaining_hops;
     uint32_t radio_request_id;
+    uint32_t generation;
     TickType_t next_action_tick;
     bool active;
 } tx_entry_t;
 
 static const char *TAG = "tx_scheduler";
+static StaticSemaphore_t tx_mutex_buffer;
 static SemaphoreHandle_t tx_mutex;
 static tx_entry_t tx_entries[MAX_MESSAGES];
 static TaskHandle_t tx_task_handle;
+static uint32_t next_generation;
 
 static void lock(void)
 {
-    if (tx_mutex == NULL) {
-        tx_mutex = xSemaphoreCreateMutex();
-    }
-    if (tx_mutex != NULL) {
-        xSemaphoreTake(tx_mutex, portMAX_DELAY);
-    }
+    configASSERT(tx_mutex != NULL);
+    xSemaphoreTake(tx_mutex, portMAX_DELAY);
 }
 
 static void unlock(void)
 {
-    if (tx_mutex != NULL) {
-        xSemaphoreGive(tx_mutex);
-    }
+    configASSERT(tx_mutex != NULL);
+    xSemaphoreGive(tx_mutex);
 }
 
 static const char *state_label(tx_state_t state, tx_error_t error)
@@ -134,9 +134,28 @@ static tx_entry_t *next_slot(void)
     return NULL;
 }
 
+/* Must be called while tx_mutex is held. */
+static tx_entry_t *find_entry_by_generation(uint32_t message_id, uint32_t generation, uint32_t request_id)
+{
+    for (size_t i = 0; i < MAX_MESSAGES; i++) {
+        tx_entry_t *entry = &tx_entries[i];
+        if (entry->active &&
+            entry->message.id == message_id &&
+            entry->generation == generation &&
+            entry->radio_request_id == request_id) {
+            return entry;
+        }
+    }
+    return NULL;
+}
+
 static void set_status(tx_entry_t *entry, const char *status)
 {
     copy_field(entry->message.status, sizeof(entry->message.status), status);
+    // Update the hops field in the message to reflect the current remaining TTL.
+    // This ensures that if we persist the message (e.g., on status change) and later
+    // reload after a reboot, we start with the correct remaining hops.
+    entry->message.hops = entry->remaining_hops < 0 ? 0 : entry->remaining_hops;
     if (entry->nvs_slot >= 0) {
         (void)message_store_update(entry->nvs_slot, &entry->message);
     }
@@ -152,18 +171,22 @@ static void handle_radio_result(const lora_tx_result_t *result)
     }
 
     lock();
+    /* The radio result carries message/request IDs; generation is read from
+     * the active matching entry and guards later slot reuse at submit-return. */
     for (size_t i = 0; i < MAX_MESSAGES; i++) {
-        if (tx_entries[i].active &&
-            tx_entries[i].radio_request_id == result->request_id &&
-            tx_entries[i].state != TX_STATE_DELIVERED &&
-            tx_entries[i].state != TX_STATE_FAILED &&
-            tx_entries[i].state != TX_STATE_EXPIRED) {
-            entry = &tx_entries[i];
+        tx_entry_t *candidate = &tx_entries[i];
+        if (candidate->active &&
+            candidate->state == TX_STATE_WAITING_RADIO &&
+            candidate->message.id == result->message_id &&
+            candidate->radio_request_id == result->request_id) {
+            entry = find_entry_by_generation(candidate->message.id,
+                                             candidate->generation,
+                                             result->request_id);
             break;
         }
     }
 
-    if (entry == NULL) {
+    if (entry == NULL || entry->state != TX_STATE_WAITING_RADIO) {
         unlock();
         return;
     }
@@ -208,7 +231,7 @@ static bool prepare_current_packet(tx_entry_t *entry, uint8_t *route_packet, siz
     }
     packet.valid = true;
     packet.id = entry->message.id;
-    packet.hops = entry->message.hops;
+    packet.hops = entry->remaining_hops;
     copy_field(packet.source, sizeof(packet.source), entry->message.source);
     copy_field(packet.destination, sizeof(packet.destination), entry->message.destination);
     copy_field(packet.type, sizeof(packet.type), entry->message.type);
@@ -218,6 +241,7 @@ static bool prepare_current_packet(tx_entry_t *entry, uint8_t *route_packet, siz
     if (!build_forward_packet_v2(&packet, route_packet, route_packet_size, route_packet_len)) {
         return false;
     }
+    entry->remaining_hops = packet.hops;
     return true;
 }
 
@@ -226,6 +250,10 @@ static void send_current_packet(tx_entry_t *entry)
     lora_tx_request_t request = {0};
     uint8_t route_packet[PACKET_LEN];
     size_t route_packet_len = 0;
+    uint32_t message_id;
+    uint32_t generation;
+    uint32_t request_id;
+    esp_err_t submit_result;
 
     entry->state = TX_STATE_TRANSMITTING;
     if (!prepare_current_packet(entry, route_packet, sizeof(route_packet), &route_packet_len)) {
@@ -236,8 +264,10 @@ static void send_current_packet(tx_entry_t *entry)
         entry->next_action_tick = xTaskGetTickCount() + pdMS_TO_TICKS(TX_ACK_TIMEOUT_MS);
         return;
     }
-    entry->state = TX_STATE_WAITING_RADIO;
     request.request_id = (uint32_t)esp_random();
+    if (request.request_id == 0) {
+        request.request_id = 1;
+    }
     request.message_id = entry->message.id;
     request.packet_len = route_packet_len;
     request.priority = LORA_TX_PRIORITY_NORMAL;
@@ -245,18 +275,24 @@ static void send_current_packet(tx_entry_t *entry)
     request.require_result = true;
     memcpy(request.packet, route_packet, route_packet_len);
     entry->radio_request_id = request.request_id;
+    message_id = entry->message.id;
+    generation = entry->generation;
+    request_id = request.request_id;
+    entry->state = TX_STATE_SUBMITTING;
     unlock();
-    if (lora_tx_submit(&request) != ESP_OK) {
-        lock();
-        entry->state = TX_STATE_RETRY_BACKOFF;
-        entry->error = TX_ERROR_QUEUE_FULL;
-        entry->next_action_tick = xTaskGetTickCount() + pdMS_TO_TICKS(2000);
-        unlock();
-        return;
-    }
+    submit_result = lora_tx_submit(&request);
     lock();
-    entry->attempts++;
-    entry->state = TX_STATE_WAITING_RADIO;
+    entry = find_entry_by_generation(message_id, generation, request_id);
+    if (entry != NULL && entry->state == TX_STATE_SUBMITTING) {
+        if (submit_result != ESP_OK) {
+            entry->state = TX_STATE_RETRY_BACKOFF;
+            entry->error = TX_ERROR_QUEUE_FULL;
+            entry->next_action_tick = xTaskGetTickCount() + pdMS_TO_TICKS(2000);
+        } else {
+            entry->attempts++;
+            entry->state = TX_STATE_WAITING_RADIO;
+        }
+    }
     unlock();
 }
 
@@ -315,7 +351,11 @@ static void scheduler_task(void *parameter)
 void tx_scheduler_init(void)
 {
     if (tx_mutex == NULL) {
-        tx_mutex = xSemaphoreCreateMutex();
+        tx_mutex = xSemaphoreCreateMutexStatic(&tx_mutex_buffer);
+        if (tx_mutex == NULL) {
+            ESP_LOGE(TAG, "Failed to initialize TX scheduler mutex");
+            return;
+        }
     }
     if (tx_task_handle == NULL) {
         xTaskCreate(scheduler_task, "tx_scheduler", 4096, NULL, 4, &tx_task_handle);
@@ -338,12 +378,18 @@ bool tx_scheduler_submit(const emergency_message_t *message, int nvs_slot)
         return false;
     }
 
+    uint32_t generation = ++next_generation;
+    if (generation == 0) {
+        generation = ++next_generation;
+    }
     memset(entry, 0, sizeof(*entry));
+    entry->generation = generation;
     entry->message = *message;
     entry->nvs_slot = nvs_slot;
     entry->state = TX_STATE_CREATED;
     entry->error = TX_ERROR_NONE;
     entry->attempts = 0;
+    entry->remaining_hops = message->hops;
     entry->next_action_tick = xTaskGetTickCount();
     entry->active = true;
     entry->state = TX_STATE_QUEUED;
@@ -397,5 +443,6 @@ void tx_scheduler_debug_reset_for_test(void)
 {
     lock();
     memset(tx_entries, 0, sizeof(tx_entries));
+    next_generation = 0;
     unlock();
 }
